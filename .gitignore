@@ -2,3 +2,6 @@
 __pycache__/
 *.pyc
 trade_history.csv
+.venv/
+bot_state.db
+logs/
