@@ -32,6 +32,22 @@ def _atr(df: pd.DataFrame, period: int = 14) -> pd.Series:
     return tr.rolling(period).mean()
 
 
+def _bollinger(series: pd.Series, period: int = 20, num_std: float = 2.0) -> tuple[pd.Series, pd.Series, pd.Series]:
+    mid = series.rolling(period).mean()
+    std = series.rolling(period).std()
+    upper = mid + (std * num_std)
+    lower = mid - (std * num_std)
+    return mid, upper, lower
+
+
+def _stochastic(df: pd.DataFrame, period: int = 14, smooth: int = 3) -> tuple[pd.Series, pd.Series]:
+    lowest_low = df["low"].rolling(period).min()
+    highest_high = df["high"].rolling(period).max()
+    k = ((df["close"] - lowest_low) / (highest_high - lowest_low).replace(0, float("nan"))) * 100
+    d = k.rolling(smooth).mean()
+    return k, d
+
+
 def _vwap(df: pd.DataFrame) -> pd.Series:
     typical_price = (df["high"] + df["low"] + df["close"]) / 3
     cumulative_value = (typical_price * df["volume"]).cumsum()
@@ -46,7 +62,10 @@ def _enrich(df: pd.DataFrame, breakout_lookback: int) -> pd.DataFrame:
     enriched["rsi_14"] = _rsi(enriched["close"], 14)
     enriched["atr_14"] = _atr(enriched, 14)
     enriched["vwap"] = _vwap(enriched)
+    enriched["bb_mid"], enriched["bb_upper"], enriched["bb_lower"] = _bollinger(enriched["close"], 20, 2.0)
+    enriched["stoch_k"], enriched["stoch_d"] = _stochastic(enriched, 14, 3)
     enriched["volume_sma_20"] = enriched["volume"].rolling(20).mean()
+    enriched["atr_sma_20"] = enriched["atr_14"].rolling(20).mean()
     enriched["breakout_high"] = enriched["high"].shift(1).rolling(breakout_lookback).max()
     enriched["breakdown_low"] = enriched["low"].shift(1).rolling(breakout_lookback).min()
     return enriched
@@ -79,7 +98,13 @@ def scan_market(
         current["rsi_14"],
         current["atr_14"],
         current["vwap"],
+        current["bb_mid"],
+        current["bb_upper"],
+        current["bb_lower"],
+        current["stoch_k"],
+        current["stoch_d"],
         current["volume_sma_20"],
+        current["atr_sma_20"],
         higher["ema_20"],
         higher["ema_50"],
     ]
@@ -95,16 +120,38 @@ def scan_market(
     bearish_trend = higher["ema_20"] < higher["ema_50"] and current["ema_20"] < current["ema_50"]
     volume_ratio = current["volume"] / current["volume_sma_20"] if float(current["volume_sma_20"]) > 0 else 0.0
     atr_value = float(current["atr_14"]) if not math.isnan(float(current["atr_14"])) else 0.0
+    candle_is_bullish = float(current["close"]) > float(current["open"])
+    candle_is_bearish = float(current["close"]) < float(current["open"])
+    short_stoch_aligned = (
+        config.short_stoch_min <= float(current["stoch_k"]) <= config.short_stoch_max
+        and float(current["stoch_k"]) < float(current["stoch_d"])
+    )
+    long_stoch_aligned = (
+        config.long_stoch_min <= float(current["stoch_k"]) <= config.long_stoch_max
+        and float(current["stoch_k"]) > float(current["stoch_d"])
+    )
     metrics = {
         "close": round(float(current["close"]), 6),
+        "open": round(float(current["open"]), 6),
         "ema_20": round(float(current["ema_20"]), 6),
         "ema_50": round(float(current["ema_50"]), 6),
         "higher_ema_20": round(float(higher["ema_20"]), 6),
         "higher_ema_50": round(float(higher["ema_50"]), 6),
         "vwap": round(float(current["vwap"]), 6),
+        "bb_mid": round(float(current["bb_mid"]), 6),
+        "bb_upper": round(float(current["bb_upper"]), 6),
+        "bb_lower": round(float(current["bb_lower"]), 6),
+        "stoch_k": round(float(current["stoch_k"]), 2),
+        "stoch_d": round(float(current["stoch_d"]), 2),
         "rsi_14": round(float(current["rsi_14"]), 2),
         "atr_14": round(float(atr_value), 6),
+        "atr_regime_ratio": round(
+            float(current["atr_14"] / current["atr_sma_20"]) if float(current["atr_sma_20"]) > 0 else 0.0,
+            2,
+        ),
         "volume_ratio": round(float(volume_ratio), 2),
+        "candle_is_bullish": candle_is_bullish,
+        "candle_is_bearish": candle_is_bearish,
     }
 
     pullback_recovery_long = (
@@ -118,10 +165,18 @@ def scan_market(
         reasons.append("Long rejected: price is below VWAP.")
     if not (config.long_rsi_min <= current["rsi_14"] <= config.long_rsi_max):
         reasons.append("Long rejected: RSI is outside the long trend zone.")
+    if not long_stoch_aligned:
+        reasons.append("Long rejected: stochastic is not aligned for a profitable long entry.")
+    if config.require_signal_candle_confirmation and not candle_is_bullish:
+        reasons.append("Long rejected: signal candle does not confirm bullish continuation.")
     if not (pullback_recovery_long or breakout_long):
         reasons.append("Long rejected: no pullback recovery or breakout confirmation.")
     if bullish_trend and current["close"] > current["vwap"] and config.long_rsi_min <= current["rsi_14"] <= config.long_rsi_max:
         if pullback_recovery_long or breakout_long:
+            if not long_stoch_aligned:
+                return MarketScan(symbol=symbol, signal=None, reasons=reasons, metrics=metrics)
+            if config.require_signal_candle_confirmation and not candle_is_bullish:
+                return MarketScan(symbol=symbol, signal=None, reasons=reasons, metrics=metrics)
             entry = float(current["close"])
             swing_stop = float(low_df["low"].tail(5).min())
             stop = min(swing_stop, entry - atr_value * config.atr_stop_multiplier) if atr_value > 0 else swing_stop
@@ -151,7 +206,15 @@ def scan_market(
             and current["close"] < current["ema_20"]
         )
         breakdown_short = current["close"] < current["breakdown_low"] and volume_ratio > config.min_volume_ratio
+        if not short_stoch_aligned:
+            reasons.append("Short rejected: stochastic is not aligned for a profitable short entry.")
+        if config.require_signal_candle_confirmation and not candle_is_bearish:
+            reasons.append("Short rejected: signal candle does not confirm bearish continuation.")
         if pullback_recovery_short or breakdown_short:
+            if not short_stoch_aligned:
+                return MarketScan(symbol=symbol, signal=None, reasons=reasons, metrics=metrics)
+            if config.require_signal_candle_confirmation and not candle_is_bearish:
+                return MarketScan(symbol=symbol, signal=None, reasons=reasons, metrics=metrics)
             entry = float(current["close"])
             swing_stop = float(low_df["high"].tail(5).max())
             stop = max(swing_stop, entry + atr_value * config.atr_stop_multiplier) if atr_value > 0 else swing_stop

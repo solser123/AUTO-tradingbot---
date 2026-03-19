@@ -72,7 +72,16 @@ def run_doctor() -> int:
     checks.append(("market", True, f"BOT_MARKET_TYPE={config.market_type}"))
     if config.is_futures:
         checks.append(("futures-risk", True, f"margin={config.futures_margin_mode}, leverage={config.futures_leverage}x"))
+        checks.append(("core-tier", True, f"core={config.core_leverage}x liquid={config.liquid_leverage}x"))
+        checks.append(("experimental-live", True, f"enabled={config.enable_experimental_live}"))
+        checks.append(("entry-windows", True, ",".join(config.allowed_entry_windows) or "always"))
+        checks.append(("cooldown", True, f"{config.symbol_cooldown_minutes}m"))
+        checks.append(("loss-guard", True, f"daily={config.max_daily_loss_pct:.0%} weekly={config.max_weekly_loss_pct:.0%}"))
     checks.append(("symbols", bool(config.symbols), f"symbols={', '.join(config.symbols)}"))
+    if config.main_symbols:
+        checks.append(("main-symbols", True, f"main={', '.join(config.main_symbols)}"))
+    if config.research_symbols:
+        checks.append(("research-symbols", True, f"research={', '.join(config.research_symbols)}"))
     checks.append(("database", True, f"db={config.database_path}"))
     checks.append(("ccxt", importlib.util.find_spec("ccxt") is not None, "required exchange library"))
     checks.append(("python-dotenv", importlib.util.find_spec("dotenv") is not None, "env loader"))
@@ -159,6 +168,7 @@ def run_summary() -> int:
     config = BotConfig.from_env()
     store = StateStore(config.database_path)
     summary = store.get_summary()
+    emergency_active, emergency_reason = store.is_emergency_stop()
     if config.mode == "paper":
         open_exposure = store.get_open_exposure(config.mode)
         paper_balance = config.paper_start_balance + float(summary["realized_pnl"]) - open_exposure
@@ -167,6 +177,9 @@ def run_summary() -> int:
         summary["open_exposure"] = open_exposure
         summary["paper_balance"] = paper_balance
         summary["paper_equity"] = paper_equity
+    summary["emergency_stop"] = emergency_active
+    if emergency_reason:
+        summary["emergency_reason"] = emergency_reason
     for key, value in summary.items():
         print(f"{key}: {value}")
     return 0
@@ -345,9 +358,27 @@ def run_optimize() -> int:
     return 0
 
 
+def run_universe_backtest() -> int:
+    from pathlib import Path
+
+    from .exchange import BinanceExchange
+    from .research import run_universe_backtest as execute_universe_backtest
+
+    _configure_logging()
+    config = BotConfig.from_env()
+    exchange = BinanceExchange(config)
+    csv_path, report_path, summary = execute_universe_backtest(config, exchange, Path("logs"))
+    for key, value in summary.items():
+        print(f"{key}: {value}")
+    print(f"csv_path: {csv_path}")
+    print(f"report_path: {report_path}")
+    return 0
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description="Binance Bot V2 foundation")
     parser.add_argument("--once", action="store_true", help="Run one bot cycle and exit")
+    parser.add_argument("--duration-minutes", type=int, default=0, help="Run the bot for a fixed number of minutes")
     parser.add_argument("--doctor", action="store_true", help="Validate config and dependency readiness")
     parser.add_argument("--preflight", action="store_true", help="Run live readiness checks against external services")
     parser.add_argument("--balance", action="store_true", help="Show exchange balance for the configured market")
@@ -357,6 +388,7 @@ def main() -> int:
     parser.add_argument("--scan", action="store_true", help="Scan current markets and explain signal decisions")
     parser.add_argument("--backtest", action="store_true", help="Run a simple historical strategy check")
     parser.add_argument("--optimize", action="store_true", help="Search a few strategy parameter combinations")
+    parser.add_argument("--universe-backtest", action="store_true", help="Run a large backtest across the futures universe")
     args = parser.parse_args()
 
     if args.doctor:
@@ -386,6 +418,9 @@ def main() -> int:
     if args.optimize:
         return run_optimize()
 
+    if args.universe_backtest:
+        return run_universe_backtest()
+
     _configure_logging()
     engine = build_engine()
     if engine.config.mode == "live":
@@ -393,6 +428,10 @@ def main() -> int:
         if preflight_status != 0:
             logging.error("Live mode blocked because preflight checks failed.")
             return preflight_status
+
+    if args.duration_minutes and args.duration_minutes > 0:
+        engine.run_for_duration(args.duration_minutes * 60)
+        return 0
 
     if args.once:
         engine.run_once()

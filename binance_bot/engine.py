@@ -3,6 +3,7 @@ from __future__ import annotations
 import logging
 import time
 from datetime import datetime, timezone
+from zoneinfo import ZoneInfo
 
 from .ai_validator import AIValidator
 from .config import BotConfig
@@ -10,8 +11,11 @@ from .exchange import BinanceExchange
 from .models import Position
 from .notifier import TelegramNotifier
 from .risk import RiskManager
-from .storage import StateStore
+from .storage import StateStore, trading_day_anchor, trading_week_anchor
 from .strategy import scan_market, should_exit
+
+
+KST = ZoneInfo("Asia/Seoul")
 
 
 class TradingEngine:
@@ -34,7 +38,7 @@ class TradingEngine:
 
     def _scan_symbols(self) -> list[str]:
         if self._scan_symbols_cache is None:
-            configured_symbols = self.exchange.resolve_symbols(self.config.symbols)
+            configured_symbols = self.exchange.resolve_symbols(self.config.active_symbols())
             managed_symbols = self.store.get_open_symbols(self.config.mode)
             merged = configured_symbols[:]
             for symbol in managed_symbols:
@@ -58,18 +62,63 @@ class TradingEngine:
             self.run_once()
             time.sleep(self.config.loop_seconds)
 
+    def run_for_duration(self, duration_seconds: int) -> None:
+        end_time = time.time() + max(duration_seconds, 0)
+        symbols = self._scan_symbols()
+        preview = ", ".join(symbols[:5])
+        if len(symbols) > 5:
+            preview = f"{preview} ... (+{len(symbols) - 5} more)"
+        logging.info(
+            "Starting bounded bot loop in %s mode for %s seconds",
+            self.config.mode,
+            duration_seconds,
+        )
+        self.notifier.send(
+            f"[BOT START] mode={self.config.mode} "
+            f"market={'USDT-M futures' if self.config.is_futures else 'spot'} "
+            f"duration_seconds={duration_seconds} symbols={preview}"
+        )
+        while time.time() < end_time:
+            self.run_once()
+            if time.time() >= end_time:
+                break
+            time.sleep(self.config.loop_seconds)
+        logging.info("Bounded bot loop finished.")
+        self.notifier.send(f"[BOT STOP] mode={self.config.mode} duration_seconds={duration_seconds}")
+
     def run_once(self) -> None:
+        reference_time = datetime.now(KST)
+        account_equity = self._account_equity(reference_time)
+        self._refresh_reference_equity(account_equity, reference_time)
+        self._reconcile_live_positions()
+        emergency_active, emergency_reason = self.store.is_emergency_stop()
+        if emergency_active:
+            logging.warning("Emergency stop active: %s", emergency_reason)
+            return
+
         for symbol in self._scan_symbols():
             try:
-                self._process_symbol(symbol)
+                self._process_symbol(symbol, account_equity, reference_time)
             except Exception as exc:
                 logging.exception("Symbol loop failed for %s: %s", symbol, exc)
+                self.store.log_decision(
+                    symbol=symbol,
+                    mode=self.config.mode,
+                    stage="runtime_exception",
+                    outcome="error",
+                    detail=str(exc),
+                    payload={},
+                )
+                streak = self.store.increment_state_counter("exchange_failure_streak")
+                if streak >= self.config.exchange_failure_limit:
+                    self.store.set_emergency_stop(f"Exchange/runtime failure streak reached {streak}.")
+                    self.notifier.send(f"[EMERGENCY STOP] Exchange/runtime failure streak reached {streak}.")
                 self.notifier.send(f"[{symbol}] loop failed: {exc}")
 
-    def _process_symbol(self, symbol: str) -> None:
+    def _process_symbol(self, symbol: str, account_equity: float, reference_time: datetime) -> None:
         position = self.store.get_open_position(symbol, self.config.mode)
         if position is not None:
-            self._manage_position(position)
+            self._manage_position(position, reference_time)
             return
 
         execution_df = self.exchange.fetch_ohlcv(symbol, self.config.timeframe)
@@ -77,60 +126,238 @@ class TradingEngine:
         scan = scan_market(symbol, execution_df, higher_df, self.config)
         signal = scan.signal
         if signal is None:
-            logging.info("%s: no rule-based setup. %s", symbol, " | ".join(scan.reasons[:3]))
+            detail = " | ".join(scan.reasons[:3]) if scan.reasons else "No rule-based setup."
+            logging.info("%s: no rule-based setup. %s", symbol, detail)
+            self.store.log_decision(
+                symbol=symbol,
+                mode=self.config.mode,
+                stage="scan",
+                outcome="no_entry",
+                detail=detail,
+                payload={"metrics": scan.metrics, "reasons": scan.reasons[:8]},
+            )
             return
 
         review = self.ai_validator.review(signal)
         self.store.log_signal(signal, review.approved, review.confidence, review.reason)
+        if review.reason.startswith("AI validation failed"):
+            streak = self.store.increment_state_counter("ai_failure_streak")
+            if streak >= self.config.ai_failure_limit:
+                self.store.set_emergency_stop(f"AI validation failure streak reached {streak}.")
+                self.notifier.send(f"[EMERGENCY STOP] AI validation failure streak reached {streak}.")
+            self.store.log_decision(
+                symbol=symbol,
+                mode=self.config.mode,
+                stage="ai_review",
+                outcome="error",
+                detail=review.reason,
+                payload={"signal": signal.strategy_data},
+            )
+            return
+        self.store.reset_state_counter("ai_failure_streak")
+
         if not review.approved:
             logging.info("%s: AI rejected signal. %s", symbol, review.reason)
+            self.store.log_decision(
+                symbol=symbol,
+                mode=self.config.mode,
+                stage="ai_review",
+                outcome="rejected",
+                detail=review.reason,
+                payload={"signal": signal.strategy_data, "confidence": review.confidence},
+            )
             return
 
-        decision = self.risk_manager.can_open_trade(signal, review)
+        decision = self.risk_manager.can_open_trade(signal, review, account_equity, reference_time)
         if not decision.allowed:
             logging.info("%s: risk manager rejected signal. %s", symbol, decision.reason)
+            self.store.log_decision(
+                symbol=symbol,
+                mode=self.config.mode,
+                stage="risk_gate",
+                outcome="rejected",
+                detail=decision.reason,
+                payload={"signal": signal.strategy_data, "confidence": review.confidence},
+            )
+            return
+
+        if self.config.mode == "live" and self.config.is_experimental_symbol(symbol) and not self.config.enable_experimental_live:
+            logging.info("%s: live execution blocked for experimental x10/x20 tier.", symbol)
+            self.store.log_decision(
+                symbol=symbol,
+                mode=self.config.mode,
+                stage="tier_gate",
+                outcome="blocked",
+                detail="Experimental tier is blocked in live mode.",
+                payload={"signal": signal.strategy_data},
+            )
             return
 
         quantity = self.exchange.amount_to_precision(symbol, self.config.notional_per_trade / signal.entry_price)
         if quantity <= 0:
             logging.info("%s: quantity below exchange minimum.", symbol)
+            self.store.log_decision(
+                symbol=symbol,
+                mode=self.config.mode,
+                stage="sizing",
+                outcome="rejected",
+                detail="Quantity below exchange minimum.",
+                payload={"entry_price": signal.entry_price},
+            )
             return
+
+        entry_price = signal.entry_price
+        if self.config.mode == "live":
+            live_side = "buy" if signal.side == "long" else "sell"
+            order = self.exchange.create_market_order(symbol, live_side, quantity)
+            self.store.reset_state_counter("exchange_failure_streak")
+            entry_price = self._resolved_fill_price(order, signal.entry_price)
+            slippage_pct = abs(entry_price - signal.entry_price) / signal.entry_price if signal.entry_price else 0.0
+            if slippage_pct > self.config.max_slippage_pct:
+                self.store.set_emergency_stop(
+                    f"Abnormal slippage detected on {symbol}: {slippage_pct * 100:.2f}%."
+                )
+                self.notifier.send(
+                    f"[EMERGENCY STOP] {symbol} slippage {slippage_pct * 100:.2f}% exceeded limit."
+                )
 
         position = Position(
             symbol=symbol,
             side=signal.side,
             quantity=quantity,
-            entry_price=signal.entry_price,
+            entry_price=entry_price,
             stop_price=signal.stop_price,
             target_price=signal.target_price,
             opened_at=datetime.now(timezone.utc),
             mode=self.config.mode,
         )
 
-        if self.config.mode == "live":
-            live_side = "buy" if signal.side == "long" else "sell"
-            self.exchange.create_market_order(symbol, live_side, quantity)
-
         self.store.open_position(position)
-        logging.info("%s: opened %s position at %.4f", symbol, signal.side, signal.entry_price)
+        self.store.log_decision(
+            symbol=symbol,
+            mode=self.config.mode,
+            stage="entry",
+            outcome="opened",
+            detail=f"Opened {signal.side} position.",
+            payload={
+                "entry_price": entry_price,
+                "stop_price": signal.stop_price,
+                "target_price": signal.target_price,
+                "quantity": quantity,
+                "ai_confidence": review.confidence,
+                "signal": signal.strategy_data,
+            },
+        )
+        logging.info("%s: opened %s position at %.4f", symbol, signal.side, entry_price)
         self.notifier.send(
-            f"[OPEN] {symbol} {signal.side} entry={signal.entry_price:.4f} "
+            f"[OPEN] {symbol} {signal.side} entry={entry_price:.4f} "
             f"stop={signal.stop_price:.4f} target={signal.target_price:.4f} ai={review.confidence:.2f}"
         )
 
-    def _manage_position(self, position: Position) -> None:
+    def _manage_position(self, position: Position, reference_time: datetime) -> None:
         current_price = self.exchange.fetch_last_price(position.symbol)
-        exit_reason = should_exit(position, current_price, self.config.max_hold_minutes)
+        exit_reason = should_exit(position, current_price, self.config.max_hold_minutes, reference_time.astimezone(timezone.utc))
         if exit_reason is None:
             logging.info("%s: position open, no exit. price=%.4f", position.symbol, current_price)
+            self.store.log_decision(
+                symbol=position.symbol,
+                mode=self.config.mode,
+                stage="position_manage",
+                outcome="hold",
+                detail="Position remains open.",
+                payload={"current_price": current_price},
+            )
             return
 
         if self.config.mode == "live":
             live_side = "sell" if position.side == "long" else "buy"
             self.exchange.create_market_order(position.symbol, live_side, position.quantity, reduce_only=self.config.is_futures)
+            self.store.reset_state_counter("exchange_failure_streak")
 
         self.store.close_position(position.id or 0, current_price, exit_reason)
         logging.info("%s: closed position at %.4f (%s)", position.symbol, current_price, exit_reason)
         self.notifier.send(
             f"[CLOSE] {position.symbol} {position.side} exit={current_price:.4f} reason={exit_reason}"
         )
+
+        if exit_reason == "stop_loss":
+            symbol_streak = self.store.get_symbol_stoploss_streak(position.symbol, self.config.mode)
+            global_streak = self.store.get_global_stoploss_streak(self.config.mode)
+            if symbol_streak >= self.config.same_symbol_stoploss_limit:
+                self.notifier.send(f"[SYMBOL STOP] {position.symbol} stop-loss streak={symbol_streak}")
+            if global_streak >= self.config.global_stoploss_limit:
+                self.notifier.send(f"[REVIEW MODE] global stop-loss streak={global_streak}")
+
+    def _account_equity(self, reference_time: datetime) -> float:
+        if self.config.mode == "paper":
+            realized = float(self.store.get_summary()["realized_pnl"])
+            return self.config.paper_start_balance + realized
+
+        try:
+            equity = self.exchange.fetch_account_equity()
+            self.store.reset_state_counter("exchange_failure_streak")
+            self.store.set_state("last_known_equity", f"{equity}")
+            return equity
+        except Exception as exc:
+            streak = self.store.increment_state_counter("exchange_failure_streak")
+            self.store.log_decision(
+                symbol="SYSTEM",
+                mode=self.config.mode,
+                stage="balance_check",
+                outcome="error",
+                detail=str(exc),
+                payload={"streak": streak},
+            )
+            if streak >= self.config.exchange_failure_limit:
+                self.store.set_emergency_stop(f"Balance check failure streak reached {streak}.")
+            fallback = self.store.get_state("last_known_equity")
+            if fallback is not None:
+                return float(fallback)
+            return 0.0
+
+    def _refresh_reference_equity(self, account_equity: float, reference_time: datetime) -> None:
+        self.store.set_state("last_known_equity", f"{account_equity}")
+        daily_anchor = trading_day_anchor(reference_time)
+        weekly_anchor = trading_week_anchor(reference_time)
+        self._ensure_reference_state(f"daily_reference:{daily_anchor.date().isoformat()}", account_equity)
+        self._ensure_reference_state(f"weekly_reference:{weekly_anchor.date().isoformat()}", account_equity)
+
+    def _reconcile_live_positions(self) -> None:
+        if self.config.mode != "live" or not self.config.is_futures:
+            return
+        emergency_active, _ = self.store.is_emergency_stop()
+        if emergency_active:
+            return
+        try:
+            db_symbols = sorted(self.store.get_open_symbols(self.config.mode))
+            exchange_symbols = self.exchange.fetch_open_position_symbols()
+        except Exception as exc:
+            self.store.log_decision(
+                symbol="SYSTEM",
+                mode=self.config.mode,
+                stage="position_reconcile",
+                outcome="error",
+                detail=str(exc),
+                payload={},
+            )
+            return
+        if db_symbols != exchange_symbols:
+            reason = (
+                "Live/open position mismatch detected. "
+                f"db={','.join(db_symbols) or 'none'} exchange={','.join(exchange_symbols) or 'none'}"
+            )
+            self.store.set_emergency_stop(reason)
+            self.notifier.send(f"[EMERGENCY STOP] {reason}")
+
+    def _ensure_reference_state(self, key: str, account_equity: float) -> None:
+        if self.store.get_state(key) is None:
+            self.store.set_state(key, f"{account_equity}")
+
+    def _resolved_fill_price(self, order: dict, fallback_price: float) -> float:
+        average = order.get("average")
+        price = order.get("price")
+        if average is not None and float(average or 0.0) > 0:
+            return float(average)
+        if price is not None and float(price or 0.0) > 0:
+            return float(price)
+        return fallback_price

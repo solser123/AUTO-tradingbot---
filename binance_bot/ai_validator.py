@@ -26,9 +26,10 @@ class AIValidator:
             return AIReview(approved=True, confidence=0.0, reason="AI validation disabled.")
 
         prompt = (
-            "You are validating a crypto trade candidate. "
-            "Approve only if the setup is clean, trend aligned, and the risk/reward is sensible. "
-            "Reject noisy or weak setups. "
+            "You are validating a crypto trade candidate with a profit-first mindset. "
+            "Approve only if the entry location has clear edge, the signal candle confirms continuation, "
+            "the stochastic direction agrees with the trade, and the setup is not late, stretched, or noisy. "
+            "Reject trades that look like mid-move chasing, reversal traps, weak pullbacks, or low-quality continuation. "
             'Return strict JSON with keys: approved, confidence, reason.'
         )
         payload = {

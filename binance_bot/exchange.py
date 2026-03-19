@@ -74,17 +74,18 @@ class BinanceExchange:
             self._configure_symbol_risk_profile(symbol)
 
     def _configure_symbol_risk_profile(self, symbol: str) -> None:
+        leverage = self.config.leverage_for_symbol(symbol)
         try:
             self.client.set_margin_mode(
                 self.config.futures_margin_mode,
                 symbol,
-                {"leverage": self.config.futures_leverage},
+                {"leverage": leverage},
             )
         except Exception:
             # Binance returns an error if the margin mode is already set.
             pass
         try:
-            self.client.set_leverage(self.config.futures_leverage, symbol)
+            self.client.set_leverage(leverage, symbol)
         except Exception:
             # Some symbols or account states can reject leverage updates; the order path will surface issues later.
             pass
@@ -93,6 +94,17 @@ class BinanceExchange:
         if self.config.is_futures:
             return self.client.fetch_balance({"type": "swap"})
         return self.client.fetch_balance()
+
+    def fetch_account_equity(self) -> float:
+        balance = self.fetch_balance()
+        if self.config.is_futures:
+            info = balance.get("info", {}) or {}
+            if info.get("totalMarginBalance") is not None:
+                return float(info.get("totalMarginBalance") or 0.0)
+            return float(balance.get("total", {}).get("USDT", 0.0) or 0.0)
+        totals = balance.get("total", {}) or {}
+        usdt_total = float(totals.get("USDT", 0.0) or 0.0)
+        return usdt_total
 
     def validate_connection(self) -> tuple[bool, str]:
         try:
@@ -113,6 +125,20 @@ class BinanceExchange:
 
     def fetch_last_price(self, symbol: str) -> float:
         return float(self.client.fetch_ticker(symbol)["last"])
+
+    def fetch_open_position_symbols(self) -> list[str]:
+        if not self.config.is_futures:
+            return []
+        positions = self.client.fetch_positions()
+        open_symbols: list[str] = []
+        for position in positions:
+            contracts = float(position.get("contracts") or 0.0)
+            if abs(contracts) <= 0:
+                continue
+            symbol = position.get("symbol")
+            if symbol:
+                open_symbols.append(str(symbol))
+        return sorted(set(open_symbols))
 
     def amount_to_precision(self, symbol: str, amount: float) -> float:
         return float(self.client.amount_to_precision(symbol, amount))
