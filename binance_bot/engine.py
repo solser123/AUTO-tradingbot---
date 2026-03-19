@@ -11,7 +11,7 @@ from .exchange import BinanceExchange
 from .models import Position
 from .notifier import TelegramNotifier
 from .risk import RiskManager
-from .selector import rank_scan
+from .selector import build_exit_roadmap, default_candidate_symbols, rank_scan
 from .storage import StateStore, trading_day_anchor, trading_week_anchor
 from .strategy import scan_market, should_exit
 
@@ -49,6 +49,8 @@ class TradingEngine:
         return self._scan_symbols_cache
 
     def run_forever(self) -> None:
+        self.store.set_state("runtime_stop_requested", "0")
+        self._prime_telegram_offset()
         symbols = self._scan_symbols()
         preview = ", ".join(symbols[:5])
         if len(symbols) > 5:
@@ -57,13 +59,22 @@ class TradingEngine:
         self.notifier.send(
             f"[BOT START] mode={self.config.mode} "
             f"market={'USDT-M futures' if self.config.is_futures else 'spot'} "
-            f"symbols={preview}"
+            f"symbols={preview}\n"
+            f"cmd=/help /status /positions /pause /resume /rank /scan BTC /summary /closeall /stopbot"
         )
         while True:
+            if self._process_telegram_commands():
+                break
             self.run_once()
+            if self._stop_requested():
+                break
             time.sleep(self.config.loop_seconds)
+        logging.info("Bot loop finished.")
+        self.notifier.send(f"[BOT STOP] mode={self.config.mode} reason=telegram_or_runtime_stop")
 
     def run_for_duration(self, duration_seconds: int) -> None:
+        self.store.set_state("runtime_stop_requested", "0")
+        self._prime_telegram_offset()
         end_time = time.time() + max(duration_seconds, 0)
         symbols = self._scan_symbols()
         preview = ", ".join(symbols[:5])
@@ -77,11 +88,16 @@ class TradingEngine:
         self.notifier.send(
             f"[BOT START] mode={self.config.mode} "
             f"market={'USDT-M futures' if self.config.is_futures else 'spot'} "
-            f"duration_seconds={duration_seconds} symbols={preview}"
+            f"duration_seconds={duration_seconds} symbols={preview}\n"
+            f"cmd=/help /status /positions /pause /resume /rank /scan BTC /summary /closeall /stopbot"
         )
         while time.time() < end_time:
+            if self._process_telegram_commands():
+                break
             self.run_once()
             if time.time() >= end_time:
+                break
+            if self._stop_requested():
                 break
             time.sleep(self.config.loop_seconds)
         logging.info("Bounded bot loop finished.")
@@ -121,6 +137,13 @@ class TradingEngine:
         position = self.store.get_open_position(symbol, self.config.mode)
         if position is not None:
             self._manage_position(position, reference_time)
+            return
+
+        if self._entries_paused():
+            return
+
+        emergency_active, _ = self.store.is_emergency_stop()
+        if emergency_active:
             return
 
         execution_df = self.exchange.fetch_ohlcv(symbol, self.config.timeframe)
@@ -419,6 +442,279 @@ class TradingEngine:
             )
             self.store.set_emergency_stop(reason)
             self.notifier.send(f"[EMERGENCY STOP] {reason}")
+
+    def _entries_paused(self) -> bool:
+        return self.store.get_state("entry_pause") == "1"
+
+    def _stop_requested(self) -> bool:
+        return self.store.get_state("runtime_stop_requested") == "1"
+
+    def _process_telegram_commands(self) -> bool:
+        if not self.config.telegram_token or not self.config.telegram_chat_id:
+            return False
+
+        offset_text = self.store.get_state("telegram_update_offset") or "0"
+        try:
+            offset = int(offset_text)
+        except ValueError:
+            offset = 0
+
+        stop_requested = False
+        for update in self.notifier.fetch_updates(offset=offset, timeout_seconds=0):
+            update_id = int(update.get("update_id") or 0)
+            self.store.set_state("telegram_update_offset", str(update_id + 1))
+            message = update.get("message") or update.get("edited_message")
+            if not isinstance(message, dict):
+                continue
+            chat = message.get("chat") or {}
+            if not self._authorized_chat(chat):
+                continue
+            text = str(message.get("text") or "").strip()
+            if not text.startswith("/"):
+                continue
+            response, requested_stop = self._handle_telegram_command(text)
+            if response:
+                self.notifier.send(response)
+            stop_requested = stop_requested or requested_stop
+        return stop_requested
+
+    def _prime_telegram_offset(self) -> None:
+        if not self.config.telegram_token or not self.config.telegram_chat_id:
+            return
+        if self.store.get_state("telegram_update_offset") is not None:
+            return
+        updates = self.notifier.fetch_updates(offset=None, timeout_seconds=0)
+        if not updates:
+            return
+        last_update_id = max(int(item.get("update_id") or 0) for item in updates)
+        self.store.set_state("telegram_update_offset", str(last_update_id + 1))
+
+    def _authorized_chat(self, chat: dict) -> bool:
+        configured = self.config.telegram_chat_id.strip()
+        chat_id = str(chat.get("id") or "").strip()
+        username = str(chat.get("username") or "").strip().lower()
+        if configured == chat_id:
+            return True
+        if configured.startswith("@") and username and configured.lower() == f"@{username}":
+            return True
+        return False
+
+    def _handle_telegram_command(self, raw_text: str) -> tuple[str, bool]:
+        text = raw_text.strip()
+        command_text = text.split()[0]
+        command = command_text.split("@", 1)[0].lower()
+        args = text.split()[1:]
+        now_text = datetime.now(KST).strftime("%Y-%m-%d %H:%M:%S KST")
+
+        if command == "/help":
+            return (
+                "명령어\n"
+                "/status 현재 상태\n"
+                "/summary 누적 요약\n"
+                "/positions 열린 포지션\n"
+                "/rank 후보 상위 5개\n"
+                "/scan BTC 특정 심볼 스캔\n"
+                "/pause 신규 진입 정지\n"
+                "/resume 신규 진입 재개\n"
+                "/emergency 긴급정지\n"
+                "/clearstop 긴급정지 해제\n"
+                "/closeall 전체 포지션 정리\n"
+                "/stopbot 프로세스 종료\n"
+                f"updated={now_text}",
+                False,
+            )
+
+        if command == "/ping":
+            return f"pong {now_text}", False
+
+        if command == "/status":
+            return self._format_status(), False
+
+        if command == "/summary":
+            return self._format_summary(), False
+
+        if command == "/positions":
+            return self._format_positions(), False
+
+        if command == "/rank":
+            return self._format_rank(), False
+
+        if command == "/scan":
+            if not args:
+                return "사용법: /scan BTC 또는 /scan AVAX", False
+            return self._format_scan(args[0]), False
+
+        if command == "/pause":
+            self.store.set_state("entry_pause", "1")
+            self.store.log_decision("SYSTEM", self.config.mode, "telegram", "pause", "New entries paused by Telegram.", {})
+            return f"신규 진입 정지됨 mode={self.config.mode}", False
+
+        if command == "/resume":
+            self.store.set_state("entry_pause", "0")
+            self.store.log_decision("SYSTEM", self.config.mode, "telegram", "resume", "New entries resumed by Telegram.", {})
+            return f"신규 진입 재개됨 mode={self.config.mode}", False
+
+        if command == "/emergency":
+            self.store.set_emergency_stop("Manual emergency stop from Telegram.")
+            return "긴급정지 활성화됨. 기존 포지션 관리는 유지되고 신규 진입은 막힙니다.", False
+
+        if command == "/clearstop":
+            self.store.clear_emergency_stop()
+            return "긴급정지 해제됨.", False
+
+        if command == "/closeall":
+            return self._close_all_positions(), False
+
+        if command == "/stopbot":
+            self.store.set_state("runtime_stop_requested", "1")
+            return "봇 종료 요청을 받았습니다. 현재 사이클 후 종료합니다.", True
+
+        return f"알 수 없는 명령입니다: {command}. /help 를 사용하세요.", False
+
+    def _format_status(self) -> str:
+        summary = self.store.get_summary()
+        emergency_active, emergency_reason = self.store.is_emergency_stop()
+        equity = self.store.get_state("last_known_equity") or "0"
+        paused = "on" if self._entries_paused() else "off"
+        return (
+            f"status mode={self.config.mode}\n"
+            f"paused={paused} emergency={emergency_active}\n"
+            f"equity={equity}\n"
+            f"open={summary['open_positions']} closed={summary['closed_positions']}\n"
+            f"signals={summary['total_signals']} approved={summary['approved_signals']}\n"
+            f"realized_pnl={summary['realized_pnl']:.4f} win_rate={summary['win_rate']:.2f}%\n"
+            f"reason={emergency_reason or 'none'}"
+        )
+
+    def _format_summary(self) -> str:
+        summary = self.store.get_summary()
+        return (
+            f"summary\n"
+            f"signals={summary['total_signals']} approved={summary['approved_signals']}\n"
+            f"open={summary['open_positions']} closed={summary['closed_positions']}\n"
+            f"realized_pnl={summary['realized_pnl']:.4f}\n"
+            f"win_rate={summary['win_rate']:.2f}%\n"
+            f"decision_events={summary['decision_events']}"
+        )
+
+    def _format_positions(self) -> str:
+        positions = self.store.get_open_positions(self.config.mode)
+        if not positions:
+            return "열린 포지션이 없습니다."
+
+        lines = ["open positions"]
+        for position in positions[:5]:
+            try:
+                current_price = self.exchange.fetch_last_price(position.symbol)
+                if position.side == "long":
+                    pnl = (current_price - position.entry_price) * position.quantity
+                else:
+                    pnl = (position.entry_price - current_price) * position.quantity
+                lines.append(
+                    f"{position.symbol} {position.side} qty={position.quantity:.6f} "
+                    f"entry={position.entry_price:.4f} now={current_price:.4f} pnl={pnl:.4f} "
+                    f"stage={position.profile_stage}"
+                )
+            except Exception as exc:
+                lines.append(
+                    f"{position.symbol} {position.side} qty={position.quantity:.6f} "
+                    f"entry={position.entry_price:.4f} stage={position.profile_stage} err={exc}"
+                )
+        return "\n".join(lines)
+
+    def _format_rank(self) -> str:
+        rows = self._rank_rows()[:5]
+        if not rows:
+            return "후보가 없습니다."
+        lines = ["top candidates"]
+        for row in rows:
+            scan = row["scan"]
+            if scan.signal is not None:
+                signal = scan.signal
+                roadmap = build_exit_roadmap(signal.entry_price, signal.stop_price, signal.target_price, self.config.max_hold_minutes)
+                lines.append(
+                    f"{row['symbol']} signal {signal.side} {signal.entry_profile} "
+                    f"entry={signal.entry_price:.4f} stop={roadmap['stop_pct']}% target={roadmap['target_pct']}%"
+                )
+            else:
+                lines.append(
+                    f"{row['symbol']} watch score={row['score']:.2f} "
+                    f"rsi={scan.metrics.get('rsi_14')} vol={scan.metrics.get('volume_ratio')}"
+                )
+        return "\n".join(lines)
+
+    def _format_scan(self, symbol_text: str) -> str:
+        target = symbol_text.strip().upper()
+        if "/" not in target:
+            target = f"{target}/USDT"
+        resolved = self.exchange.resolve_symbols([target])[0]
+        execution_df = self.exchange.fetch_ohlcv(resolved, self.config.timeframe)
+        higher_df = self.exchange.fetch_ohlcv(resolved, self.config.higher_timeframe)
+        scan = scan_market(resolved, execution_df, higher_df, self.config)
+        if scan.signal is None:
+            return f"{resolved}\nno signal\n" + "\n".join(scan.reasons[:5])
+        signal = scan.signal
+        roadmap = build_exit_roadmap(signal.entry_price, signal.stop_price, signal.target_price, self.config.max_hold_minutes)
+        return (
+            f"{resolved}\n"
+            f"signal={signal.side} profile={signal.entry_profile} setup={signal.setup_type}\n"
+            f"entry={signal.entry_price:.6f} stop={signal.stop_price:.6f} target={signal.target_price:.6f}\n"
+            f"stop_pct={roadmap['stop_pct']} target_pct={roadmap['target_pct']} rr={signal.rr:.2f}"
+        )
+
+    def _rank_rows(self) -> list[dict[str, object]]:
+        volume_map: dict[str, float] = {}
+        if self.config.is_futures:
+            try:
+                for item in self.exchange.client.fapiPublicGetTicker24hr():
+                    symbol_id = item.get("symbol", "")
+                    if not symbol_id.endswith("USDT"):
+                        continue
+                    volume_map[f"{symbol_id[:-4]}/USDT:USDT"] = float(item.get("quoteVolume") or 0.0)
+            except Exception:
+                volume_map = {}
+
+        ranked_rows: list[dict[str, object]] = []
+        for symbol in default_candidate_symbols(self.config):
+            execution_df = self.exchange.fetch_ohlcv(symbol, self.config.timeframe)
+            higher_df = self.exchange.fetch_ohlcv(symbol, self.config.higher_timeframe)
+            scan = scan_market(symbol, execution_df, higher_df, self.config)
+            status, score = rank_scan(scan, volume_map.get(symbol, 0.0))
+            if status == "ignore":
+                continue
+            ranked_rows.append(
+                {
+                    "symbol": symbol,
+                    "status": status,
+                    "score": float(score),
+                    "scan": scan,
+                }
+            )
+        ranked_rows.sort(key=lambda item: (item["status"] != "signal", -float(item["score"])))
+        return ranked_rows
+
+    def _close_all_positions(self) -> str:
+        positions = self.store.get_open_positions(self.config.mode)
+        if not positions:
+            return "정리할 열린 포지션이 없습니다."
+
+        closed = 0
+        errors: list[str] = []
+        for position in positions:
+            try:
+                current_price = self.exchange.fetch_last_price(position.symbol)
+                if self.config.mode == "live":
+                    live_side = "sell" if position.side == "long" else "buy"
+                    self.exchange.create_market_order(position.symbol, live_side, position.quantity, reduce_only=self.config.is_futures)
+                    self.store.reset_state_counter("exchange_failure_streak")
+                self.store.close_position(position.id or 0, current_price, "telegram_closeall")
+                closed += 1
+            except Exception as exc:
+                errors.append(f"{position.symbol}:{exc}")
+        message = f"closeall 완료 closed={closed}"
+        if errors:
+            message += f"\nerrors={' | '.join(errors[:3])}"
+        return message
 
     def _ensure_reference_state(self, key: str, account_equity: float) -> None:
         if self.store.get_state(key) is None:
