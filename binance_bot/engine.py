@@ -34,7 +34,13 @@ class TradingEngine:
 
     def _scan_symbols(self) -> list[str]:
         if self._scan_symbols_cache is None:
-            self._scan_symbols_cache = self.exchange.resolve_symbols(self.config.symbols)
+            configured_symbols = self.exchange.resolve_symbols(self.config.symbols)
+            managed_symbols = self.store.get_open_symbols(self.config.mode)
+            merged = configured_symbols[:]
+            for symbol in managed_symbols:
+                if symbol not in merged:
+                    merged.append(symbol)
+            self._scan_symbols_cache = merged
         return self._scan_symbols_cache
 
     def run_forever(self) -> None:
@@ -61,7 +67,7 @@ class TradingEngine:
                 self.notifier.send(f"[{symbol}] loop failed: {exc}")
 
     def _process_symbol(self, symbol: str) -> None:
-        position = self.store.get_open_position(symbol)
+        position = self.store.get_open_position(symbol, self.config.mode)
         if position is not None:
             self._manage_position(position)
             return

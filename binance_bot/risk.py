@@ -11,10 +11,10 @@ class RiskManager:
         self.store = store
 
     def can_open_trade(self, signal: TradeSignal, review: AIReview) -> RiskDecision:
-        if self.store.get_open_position(signal.symbol) is not None:
+        if self.store.get_open_position(signal.symbol, self.config.mode) is not None:
             return RiskDecision(False, "There is already an open position for this symbol.")
 
-        if self.store.count_open_positions() >= self.config.max_open_positions:
+        if self.store.count_open_positions(self.config.mode) >= self.config.max_open_positions:
             return RiskDecision(False, "Maximum number of open positions reached.")
 
         stop_pct = abs(signal.entry_price - signal.stop_price) / signal.entry_price
@@ -27,12 +27,12 @@ class RiskManager:
         if self.config.ai_validation and review.confidence < self.config.min_ai_confidence:
             return RiskDecision(False, "AI confidence is below the configured minimum.")
 
-        daily_pnl = self.store.get_today_realized_pnl()
+        daily_pnl = self.store.get_today_realized_pnl(self.config.mode)
         if daily_pnl <= (-1 * self.config.max_daily_loss):
             return RiskDecision(False, "Daily loss limit reached.")
 
         if self.config.mode == "paper":
-            open_exposure = self.store.get_open_exposure()
+            open_exposure = self.store.get_open_exposure(self.config.mode)
             free_capital = self.config.paper_start_balance + self.store.get_summary()["realized_pnl"] - open_exposure
             if free_capital < self.config.notional_per_trade:
                 return RiskDecision(False, "Paper balance is not large enough for another trade.")

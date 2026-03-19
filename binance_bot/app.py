@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import importlib.util
 import logging
+from datetime import datetime
 
 from .ai_validator import AIValidator
 from .config import BotConfig
@@ -30,6 +31,36 @@ def build_engine():
     ai_validator = AIValidator(config)
     risk_manager = RiskManager(config, store)
     return TradingEngine(config, exchange, store, notifier, ai_validator, risk_manager)
+
+
+def run_preflight() -> int:
+    from .exchange import BinanceExchange
+
+    _configure_logging()
+    config = BotConfig.from_env()
+    exchange = BinanceExchange(config)
+    notifier = TelegramNotifier(config.telegram_token, config.telegram_chat_id)
+    ai_validator = AIValidator(config)
+
+    checks: list[tuple[str, bool, str]] = []
+    exchange_ok, exchange_message = exchange.validate_connection()
+    checks.append(("binance", exchange_ok, exchange_message))
+
+    if config.ai_validation:
+        ai_ok, ai_message = ai_validator.healthcheck()
+        checks.append(("openai", ai_ok, ai_message))
+
+    if config.telegram_token and config.telegram_chat_id:
+        telegram_ok, telegram_message = notifier.validate_chat()
+        checks.append(("telegram", telegram_ok, telegram_message))
+
+    failed = False
+    for name, ok, detail in checks:
+        state = "OK" if ok else "FAIL"
+        print(f"{state:<4} | {name:<10} | {detail}")
+        failed = failed or (not ok)
+
+    return 1 if failed else 0
 
 
 def run_doctor() -> int:
@@ -106,11 +137,12 @@ def run_demo() -> int:
     _configure_logging()
     config = BotConfig.from_env()
     notifier = TelegramNotifier(config.telegram_token, config.telegram_chat_id)
+    today = datetime.now().date().isoformat()
 
     watchlist = ", ".join(config.symbols)
     message = (
         f"[DEMO START] {config.mode.upper()} {('USDT-M FUTURES' if config.is_futures else 'SPOT')}\n"
-        f"date=2026-03-18\n"
+        f"date={today}\n"
         f"paper_balance={config.paper_start_balance:.2f} USDT\n"
         f"notional_per_trade={config.notional_per_trade:.2f} USDT\n"
         f"max_open_positions={config.max_open_positions}\n"
@@ -128,7 +160,7 @@ def run_summary() -> int:
     store = StateStore(config.database_path)
     summary = store.get_summary()
     if config.mode == "paper":
-        open_exposure = store.get_open_exposure()
+        open_exposure = store.get_open_exposure(config.mode)
         paper_balance = config.paper_start_balance + float(summary["realized_pnl"]) - open_exposure
         paper_equity = config.paper_start_balance + float(summary["realized_pnl"])
         summary["paper_start_balance"] = config.paper_start_balance
@@ -185,6 +217,7 @@ def run_rank() -> int:
     _configure_logging()
     config = BotConfig.from_env()
     exchange = BinanceExchange(config)
+    today = datetime.now().date().isoformat()
 
     volume_map: dict[str, float] = {}
     if config.is_futures:
@@ -215,7 +248,7 @@ def run_rank() -> int:
 
     ranked_rows.sort(key=lambda item: (item["status"] != "signal", -float(item["score"])))
 
-    print("today_date: 2026-03-18")
+    print(f"today_date: {today}")
     print(f"market_type: {'usdt-m-futures' if config.is_futures else 'spot'}")
     print("candidates:")
     for row in ranked_rows[:10]:
@@ -316,6 +349,7 @@ def main() -> int:
     parser = argparse.ArgumentParser(description="Binance Bot V2 foundation")
     parser.add_argument("--once", action="store_true", help="Run one bot cycle and exit")
     parser.add_argument("--doctor", action="store_true", help="Validate config and dependency readiness")
+    parser.add_argument("--preflight", action="store_true", help="Run live readiness checks against external services")
     parser.add_argument("--balance", action="store_true", help="Show exchange balance for the configured market")
     parser.add_argument("--demo", action="store_true", help="Send a Telegram demo startup message for the current configuration")
     parser.add_argument("--rank", action="store_true", help="Rank today's candidate symbols for the configured strategy")
@@ -327,6 +361,9 @@ def main() -> int:
 
     if args.doctor:
         return run_doctor()
+
+    if args.preflight:
+        return run_preflight()
 
     if args.balance:
         return run_balance()
@@ -351,6 +388,11 @@ def main() -> int:
 
     _configure_logging()
     engine = build_engine()
+    if engine.config.mode == "live":
+        preflight_status = run_preflight()
+        if preflight_status != 0:
+            logging.error("Live mode blocked because preflight checks failed.")
+            return preflight_status
 
     if args.once:
         engine.run_once()

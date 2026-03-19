@@ -32,3 +32,18 @@ class TelegramNotifier:
                 )
         except Exception as exc:
             logging.warning("Telegram send failed: %s", exc)
+
+    def validate_chat(self) -> tuple[bool, str]:
+        if not self.token or not self.chat_id:
+            return False, "Telegram token/chat id is missing."
+        if requests is None:
+            return False, "requests dependency is missing."
+
+        url = f"https://api.telegram.org/bot{self.token}/getChat"
+        try:
+            response = requests.get(url, params={"chat_id": self.chat_id}, timeout=10)
+            if response.ok:
+                return True, "Telegram chat is reachable."
+            return False, f"Telegram getChat failed: {response.status_code} {response.text[:200]}"
+        except Exception as exc:
+            return False, f"Telegram validation failed: {exc}"

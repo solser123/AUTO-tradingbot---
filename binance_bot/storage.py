@@ -87,17 +87,21 @@ class StateStore:
                 ),
             )
 
-    def get_open_position(self, symbol: str) -> Position | None:
-        with self._connect() as conn:
-            row = conn.execute(
-                """
+    def get_open_position(self, symbol: str, mode: str | None = None) -> Position | None:
+        query = """
                 SELECT * FROM positions
                 WHERE symbol = ? AND status = 'OPEN'
+                """
+        params: list[object] = [symbol]
+        if mode is not None:
+            query += " AND mode = ?"
+            params.append(mode)
+        query += """
                 ORDER BY id DESC
                 LIMIT 1
-                """,
-                (symbol,),
-            ).fetchone()
+                """
+        with self._connect() as conn:
+            row = conn.execute(query, tuple(params)).fetchone()
 
         if row is None:
             return None
@@ -115,10 +119,27 @@ class StateStore:
             status=row["status"],
         )
 
-    def count_open_positions(self) -> int:
+    def count_open_positions(self, mode: str | None = None) -> int:
         with self._connect() as conn:
-            row = conn.execute("SELECT COUNT(*) AS count FROM positions WHERE status = 'OPEN'").fetchone()
+            if mode is None:
+                row = conn.execute("SELECT COUNT(*) AS count FROM positions WHERE status = 'OPEN'").fetchone()
+            else:
+                row = conn.execute(
+                    "SELECT COUNT(*) AS count FROM positions WHERE status = 'OPEN' AND mode = ?",
+                    (mode,),
+                ).fetchone()
         return int(row["count"])
+
+    def get_open_symbols(self, mode: str | None = None) -> list[str]:
+        with self._connect() as conn:
+            if mode is None:
+                rows = conn.execute("SELECT DISTINCT symbol FROM positions WHERE status = 'OPEN'").fetchall()
+            else:
+                rows = conn.execute(
+                    "SELECT DISTINCT symbol FROM positions WHERE status = 'OPEN' AND mode = ?",
+                    (mode,),
+                ).fetchall()
+        return [str(row["symbol"]) for row in rows]
 
     def open_position(self, position: Position) -> Position:
         with self._connect() as conn:
@@ -176,30 +197,35 @@ class StateStore:
                 (exit_price, datetime.utcnow().isoformat(), exit_reason, realized_pnl, position_id),
             )
 
-    def get_today_realized_pnl(self) -> float:
+    def get_today_realized_pnl(self, mode: str | None = None) -> float:
         today = datetime.utcnow().date().isoformat()
-        with self._connect() as conn:
-            row = conn.execute(
-                """
+        query = """
                 SELECT COALESCE(SUM(realized_pnl), 0) AS pnl
                 FROM positions
                 WHERE status = 'CLOSED'
                   AND closed_at IS NOT NULL
                   AND substr(closed_at, 1, 10) = ?
-                """,
-                (today,),
-            ).fetchone()
+                """
+        params: list[object] = [today]
+        if mode is not None:
+            query += " AND mode = ?"
+            params.append(mode)
+        with self._connect() as conn:
+            row = conn.execute(query, tuple(params)).fetchone()
         return float(row["pnl"])
 
-    def get_open_exposure(self) -> float:
-        with self._connect() as conn:
-            row = conn.execute(
-                """
+    def get_open_exposure(self, mode: str | None = None) -> float:
+        query = """
                 SELECT COALESCE(SUM(entry_price * quantity), 0) AS exposure
                 FROM positions
                 WHERE status = 'OPEN'
                 """
-            ).fetchone()
+        params: list[object] = []
+        if mode is not None:
+            query += " AND mode = ?"
+            params.append(mode)
+        with self._connect() as conn:
+            row = conn.execute(query, tuple(params)).fetchone()
         return float(row["exposure"])
 
     def get_summary(self) -> dict[str, float | int]:

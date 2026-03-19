@@ -94,6 +94,17 @@ class BinanceExchange:
             return self.client.fetch_balance({"type": "swap"})
         return self.client.fetch_balance()
 
+    def validate_connection(self) -> tuple[bool, str]:
+        try:
+            balance = self.fetch_balance()
+            if self.config.is_futures:
+                available = float(balance.get("free", {}).get("USDT", 0.0) or 0.0)
+                return True, f"Binance futures reachable. Available USDT: {available}"
+            assets = sum(1 for _, value in balance.get("total", {}).items() if float(value or 0.0) > 0.0)
+            return True, f"Binance spot reachable. Nonzero assets: {assets}"
+        except Exception as exc:
+            return False, f"Binance validation failed: {exc}"
+
     def fetch_ohlcv(self, symbol: str, timeframe: str, limit: int = 250) -> pd.DataFrame:
         candles = self.client.fetch_ohlcv(symbol, timeframe=timeframe, limit=limit)
         df = pd.DataFrame(candles, columns=["timestamp", "open", "high", "low", "close", "volume"])

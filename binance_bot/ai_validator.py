@@ -66,3 +66,20 @@ class AIValidator:
                 confidence=0.0,
                 reason=f"AI validation failed: {exc}",
             )
+
+    def healthcheck(self) -> tuple[bool, str]:
+        if not self.enabled:
+            return True, "AI validation disabled."
+        if self.client is None:
+            return False, "OpenAI client is not available."
+
+        try:
+            response = self.client.chat.completions.create(
+                model=self.model,
+                messages=[{"role": "user", "content": "reply exactly OK"}],
+                max_tokens=5,
+            )
+            text = (response.choices[0].message.content or "").strip()
+            return True, f"OpenAI responded: {text}"
+        except Exception as exc:
+            return False, f"OpenAI validation failed: {exc}"
