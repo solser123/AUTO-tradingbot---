@@ -26,6 +26,34 @@ def _as_int(name: str, default: int) -> int:
     return int(value) if value else default
 
 
+def _normalize_market_type(value: str | None) -> str:
+    raw = (value or "spot").strip().lower()
+    aliases = {
+        "spot": "spot",
+        "swap": "swap",
+        "future": "swap",
+        "futures": "swap",
+        "usdm": "swap",
+        "usdt-m": "swap",
+        "usdtm": "swap",
+        "usdm_futures": "swap",
+        "usdtm_futures": "swap",
+    }
+    normalized = aliases.get(raw)
+    if normalized is None:
+        raise ValueError("BOT_MARKET_TYPE must be one of: spot, swap, future, futures, usdm, usdt-m.")
+    return normalized
+
+
+def _normalize_symbol(symbol: str, market_type: str) -> str:
+    cleaned = symbol.strip()
+    if market_type != "swap" or ":" in cleaned or "/" not in cleaned:
+        return cleaned
+
+    base, quote = cleaned.split("/", 1)
+    return f"{base}/{quote}:{quote}"
+
+
 @dataclass(frozen=True)
 class BotConfig:
     api_key: str
@@ -36,11 +64,14 @@ class BotConfig:
     mode: str
     market_type: str
     symbols: list[str]
+    candidate_symbols: list[str]
     timeframe: str
     higher_timeframe: str
     loop_seconds: int
     notional_per_trade: float
     max_open_positions: int
+    futures_leverage: int
+    futures_margin_mode: str
     allow_short: bool
     min_rr: float
     max_stop_pct: float
@@ -61,6 +92,10 @@ class BotConfig:
     database_path: str
     ai_model: str
 
+    @property
+    def is_futures(self) -> bool:
+        return self.market_type == "swap"
+
     @classmethod
     def from_env(cls) -> "BotConfig":
         load_dotenv()
@@ -68,7 +103,17 @@ class BotConfig:
         if mode not in {"paper", "live"}:
             raise ValueError("BOT_MODE must be either 'paper' or 'live'.")
 
-        symbols = [item.strip() for item in os.getenv("BOT_SYMBOLS", "BTC/USDT").split(",") if item.strip()]
+        market_type = _normalize_market_type(os.getenv("BOT_MARKET_TYPE", "spot"))
+        symbols = [
+            _normalize_symbol(item, market_type)
+            for item in os.getenv("BOT_SYMBOLS", "BTC/USDT").split(",")
+            if item.strip()
+        ]
+        candidate_symbols = [
+            _normalize_symbol(item, market_type)
+            for item in os.getenv("BOT_CANDIDATE_SYMBOLS", "").split(",")
+            if item.strip()
+        ]
         if not symbols:
             raise ValueError("BOT_SYMBOLS must include at least one symbol.")
 
@@ -79,13 +124,16 @@ class BotConfig:
             telegram_token=os.getenv("TELEGRAM_TOKEN", "").strip(),
             telegram_chat_id=os.getenv("TELEGRAM_CHAT_ID", "").strip(),
             mode=mode,
-            market_type=os.getenv("BOT_MARKET_TYPE", "spot").strip().lower(),
+            market_type=market_type,
             symbols=symbols,
+            candidate_symbols=candidate_symbols,
             timeframe=os.getenv("BOT_TIMEFRAME", "15m").strip(),
             higher_timeframe=os.getenv("BOT_HIGHER_TIMEFRAME", "1h").strip(),
             loop_seconds=_as_int("BOT_LOOP_SECONDS", 60),
             notional_per_trade=_as_float("BOT_NOTIONAL_PER_TRADE", 100.0),
             max_open_positions=_as_int("BOT_MAX_OPEN_POSITIONS", 2),
+            futures_leverage=_as_int("BOT_FUTURES_LEVERAGE", 1),
+            futures_margin_mode=os.getenv("BOT_FUTURES_MARGIN_MODE", "isolated").strip().lower(),
             allow_short=_as_bool(os.getenv("BOT_ALLOW_SHORT"), False),
             min_rr=_as_float("BOT_MIN_RR", 1.8),
             max_stop_pct=_as_float("BOT_MAX_STOP_PCT", 0.025),
@@ -111,5 +159,9 @@ class BotConfig:
             raise ValueError("Live mode requires BINANCE_API_KEY and BINANCE_SECRET_KEY.")
         if config.mode == "live" and config.market_type == "spot" and config.allow_short:
             raise ValueError("Spot live mode does not support BOT_ALLOW_SHORT=true in this foundation.")
+        if config.is_futures and config.futures_margin_mode not in {"isolated", "cross"}:
+            raise ValueError("BOT_FUTURES_MARGIN_MODE must be either 'isolated' or 'cross'.")
+        if config.is_futures and config.futures_leverage < 1:
+            raise ValueError("BOT_FUTURES_LEVERAGE must be at least 1.")
 
         return config

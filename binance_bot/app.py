@@ -8,6 +8,7 @@ from .ai_validator import AIValidator
 from .config import BotConfig
 from .notifier import TelegramNotifier
 from .risk import RiskManager
+from .selector import build_exit_roadmap, default_candidate_symbols, rank_scan
 from .storage import StateStore
 
 
@@ -37,6 +38,9 @@ def run_doctor() -> int:
     checks: list[tuple[str, bool, str]] = []
 
     checks.append(("mode", True, f"BOT_MODE={config.mode}"))
+    checks.append(("market", True, f"BOT_MARKET_TYPE={config.market_type}"))
+    if config.is_futures:
+        checks.append(("futures-risk", True, f"margin={config.futures_margin_mode}, leverage={config.futures_leverage}x"))
     checks.append(("symbols", bool(config.symbols), f"symbols={', '.join(config.symbols)}"))
     checks.append(("database", True, f"db={config.database_path}"))
     checks.append(("ccxt", importlib.util.find_spec("ccxt") is not None, "required exchange library"))
@@ -57,6 +61,65 @@ def run_doctor() -> int:
         failed = failed or (not ok)
 
     return 1 if failed else 0
+
+
+def run_balance() -> int:
+    from .exchange import BinanceExchange
+
+    _configure_logging()
+    config = BotConfig.from_env()
+    exchange = BinanceExchange(config)
+    balance = exchange.fetch_balance()
+    info = balance.get("info", {}) or {}
+    account_type = "usdt-m-futures" if config.is_futures else "spot"
+    print(f"account_type: {account_type}")
+
+    if config.is_futures:
+        usdt_total = float(balance.get("total", {}).get("USDT", 0.0) or 0.0)
+        usdt_free = float(balance.get("free", {}).get("USDT", 0.0) or 0.0)
+        usdt_used = float(balance.get("used", {}).get("USDT", 0.0) or 0.0)
+        print(f"usdt_wallet_balance: {usdt_total}")
+        print(f"usdt_available_balance: {usdt_free}")
+        print(f"usdt_used_balance: {usdt_used}")
+        if info:
+            print(f"total_wallet_balance: {info.get('totalWalletBalance', '0')}")
+            print(f"available_balance: {info.get('availableBalance', '0')}")
+            print(f"total_unrealized_profit: {info.get('totalUnrealizedProfit', '0')}")
+            print(f"total_margin_balance: {info.get('totalMarginBalance', '0')}")
+    else:
+        nonzero_assets = []
+        for asset, total in balance.get("total", {}).items():
+            total_value = float(total or 0.0)
+            if total_value > 0:
+                free_value = float(balance.get("free", {}).get(asset, 0.0) or 0.0)
+                used_value = float(balance.get("used", {}).get(asset, 0.0) or 0.0)
+                nonzero_assets.append((asset, free_value, used_value, total_value))
+        nonzero_assets.sort(key=lambda item: item[0])
+        print(f"nonzero_assets: {len(nonzero_assets)}")
+        for asset, free_value, used_value, total_value in nonzero_assets:
+            print(f"{asset}: free={free_value} used={used_value} total={total_value}")
+
+    return 0
+
+
+def run_demo() -> int:
+    _configure_logging()
+    config = BotConfig.from_env()
+    notifier = TelegramNotifier(config.telegram_token, config.telegram_chat_id)
+
+    watchlist = ", ".join(config.symbols)
+    message = (
+        f"[DEMO START] {config.mode.upper()} {('USDT-M FUTURES' if config.is_futures else 'SPOT')}\n"
+        f"date=2026-03-18\n"
+        f"paper_balance={config.paper_start_balance:.2f} USDT\n"
+        f"notional_per_trade={config.notional_per_trade:.2f} USDT\n"
+        f"max_open_positions={config.max_open_positions}\n"
+        f"watchlist={watchlist}"
+    )
+    notifier.send(message)
+    print("demo_notification_sent: true")
+    print(message)
+    return 0
 
 
 def run_summary() -> int:
@@ -90,11 +153,103 @@ def run_scan() -> int:
         scan = scan_market(symbol, execution_df, higher_df, config)
         print(f"symbol: {symbol}")
         print(f"signal_found: {scan.signal is not None}")
+        if scan.signal is not None:
+            signal = scan.signal
+            roadmap = build_exit_roadmap(
+                signal.entry_price,
+                signal.stop_price,
+                signal.target_price,
+                config.max_hold_minutes,
+            )
+            print(f"  side: {signal.side}")
+            print(f"  setup_type: {signal.setup_type}")
+            print(f"  entry_price: {signal.entry_price:.6f}")
+            print(f"  stop_price: {signal.stop_price:.6f}")
+            print(f"  target_price: {signal.target_price:.6f}")
+            print(f"  rr: {signal.rr:.2f}")
+            print(f"  exit_stop_pct: {roadmap['stop_pct']}")
+            print(f"  exit_target_pct: {roadmap['target_pct']}")
+            print(f"  exit_max_hold_minutes: {roadmap['max_hold_minutes']}")
         for key, value in scan.metrics.items():
             print(f"  {key}: {value}")
         for reason in scan.reasons:
             print(f"  reason: {reason}")
         print("")
+    return 0
+
+
+def run_rank() -> int:
+    from .exchange import BinanceExchange
+    from .strategy import scan_market
+
+    _configure_logging()
+    config = BotConfig.from_env()
+    exchange = BinanceExchange(config)
+
+    volume_map: dict[str, float] = {}
+    if config.is_futures:
+        for item in exchange.client.fapiPublicGetTicker24hr():
+            symbol_id = item.get("symbol", "")
+            if not symbol_id.endswith("USDT"):
+                continue
+            futures_symbol = f"{symbol_id[:-4]}/USDT:USDT"
+            volume_map[futures_symbol] = float(item.get("quoteVolume") or 0.0)
+
+    ranked_rows: list[dict[str, object]] = []
+    for symbol in default_candidate_symbols(config):
+        execution_df = exchange.fetch_ohlcv(symbol, config.timeframe)
+        higher_df = exchange.fetch_ohlcv(symbol, config.higher_timeframe)
+        scan = scan_market(symbol, execution_df, higher_df, config)
+        status, score = rank_scan(scan, volume_map.get(symbol, 0.0))
+        if status == "ignore":
+            continue
+
+        row: dict[str, object] = {
+            "symbol": symbol,
+            "status": status,
+            "score": round(score, 2),
+            "quote_volume": round(volume_map.get(symbol, 0.0), 2),
+            "scan": scan,
+        }
+        ranked_rows.append(row)
+
+    ranked_rows.sort(key=lambda item: (item["status"] != "signal", -float(item["score"])))
+
+    print("today_date: 2026-03-18")
+    print(f"market_type: {'usdt-m-futures' if config.is_futures else 'spot'}")
+    print("candidates:")
+    for row in ranked_rows[:10]:
+        scan = row["scan"]
+        symbol = row["symbol"]
+        status = row["status"]
+        score = row["score"]
+        quote_volume = row["quote_volume"]
+        print(f"  {symbol} | status={status} | score={score} | quote_volume={quote_volume}")
+        if scan.signal is not None:
+            signal = scan.signal
+            roadmap = build_exit_roadmap(
+                signal.entry_price,
+                signal.stop_price,
+                signal.target_price,
+                config.max_hold_minutes,
+            )
+            print(
+                f"    side={signal.side} entry={signal.entry_price:.6f} "
+                f"stop={signal.stop_price:.6f} target={signal.target_price:.6f} "
+                f"stop_pct={roadmap['stop_pct']} target_pct={roadmap['target_pct']}"
+            )
+        else:
+            metrics = scan.metrics
+            print(
+                f"    close={metrics.get('close')} rsi={metrics.get('rsi_14')} "
+                f"volume_ratio={metrics.get('volume_ratio')}"
+            )
+            print(f"    note={' | '.join(scan.reasons[:2])}")
+
+    recommended = [str(row["symbol"]) for row in ranked_rows[:5]]
+    print("")
+    print("recommended_watchlist:")
+    print(",".join(recommended))
     return 0
 
 
@@ -161,6 +316,9 @@ def main() -> int:
     parser = argparse.ArgumentParser(description="Binance Bot V2 foundation")
     parser.add_argument("--once", action="store_true", help="Run one bot cycle and exit")
     parser.add_argument("--doctor", action="store_true", help="Validate config and dependency readiness")
+    parser.add_argument("--balance", action="store_true", help="Show exchange balance for the configured market")
+    parser.add_argument("--demo", action="store_true", help="Send a Telegram demo startup message for the current configuration")
+    parser.add_argument("--rank", action="store_true", help="Rank today's candidate symbols for the configured strategy")
     parser.add_argument("--summary", action="store_true", help="Print stored bot statistics")
     parser.add_argument("--scan", action="store_true", help="Scan current markets and explain signal decisions")
     parser.add_argument("--backtest", action="store_true", help="Run a simple historical strategy check")
@@ -170,8 +328,17 @@ def main() -> int:
     if args.doctor:
         return run_doctor()
 
+    if args.balance:
+        return run_balance()
+
+    if args.demo:
+        return run_demo()
+
     if args.summary:
         return run_summary()
+
+    if args.rank:
+        return run_rank()
 
     if args.scan:
         return run_scan()

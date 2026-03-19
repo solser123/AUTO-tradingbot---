@@ -30,15 +30,30 @@ class TradingEngine:
         self.notifier = notifier
         self.ai_validator = ai_validator
         self.risk_manager = risk_manager
+        self._scan_symbols_cache: list[str] | None = None
+
+    def _scan_symbols(self) -> list[str]:
+        if self._scan_symbols_cache is None:
+            self._scan_symbols_cache = self.exchange.resolve_symbols(self.config.symbols)
+        return self._scan_symbols_cache
 
     def run_forever(self) -> None:
+        symbols = self._scan_symbols()
+        preview = ", ".join(symbols[:5])
+        if len(symbols) > 5:
+            preview = f"{preview} ... (+{len(symbols) - 5} more)"
         logging.info("Starting bot loop in %s mode", self.config.mode)
+        self.notifier.send(
+            f"[BOT START] mode={self.config.mode} "
+            f"market={'USDT-M futures' if self.config.is_futures else 'spot'} "
+            f"symbols={preview}"
+        )
         while True:
             self.run_once()
             time.sleep(self.config.loop_seconds)
 
     def run_once(self) -> None:
-        for symbol in self.config.symbols:
+        for symbol in self._scan_symbols():
             try:
                 self._process_symbol(symbol)
             except Exception as exc:
@@ -106,7 +121,7 @@ class TradingEngine:
 
         if self.config.mode == "live":
             live_side = "sell" if position.side == "long" else "buy"
-            self.exchange.create_market_order(position.symbol, live_side, position.quantity)
+            self.exchange.create_market_order(position.symbol, live_side, position.quantity, reduce_only=self.config.is_futures)
 
         self.store.close_position(position.id or 0, current_price, exit_reason)
         logging.info("%s: closed position at %.4f (%s)", position.symbol, current_price, exit_reason)

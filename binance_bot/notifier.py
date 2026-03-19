@@ -19,10 +19,16 @@ class TelegramNotifier:
 
         url = f"https://api.telegram.org/bot{self.token}/sendMessage"
         try:
-            requests.post(
+            response = requests.post(
                 url,
                 json={"chat_id": self.chat_id, "text": message},
                 timeout=10,
             )
+            if not response.ok:
+                logging.warning(
+                    "Telegram send failed: status=%s body=%s",
+                    response.status_code,
+                    response.text[:300],
+                )
         except Exception as exc:
             logging.warning("Telegram send failed: %s", exc)

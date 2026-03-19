@@ -52,9 +52,15 @@ python main.py --once
 
 `BOT_MODE=paper` is the default and is the recommended starting mode.
 
+For Binance USDT-M perpetuals, use `BOT_MARKET_TYPE=usdm`. Symbols can stay in the simple form like `BTC/USDT`; the bot will normalize them to the futures symbol format internally.
+For safer live tests, you can pin futures risk with `BOT_FUTURES_MARGIN_MODE=isolated` and `BOT_FUTURES_LEVERAGE=1`.
+
 ## Commands
 
 - `python main.py --doctor`: validate config and dependency readiness
+- `python main.py --balance`: show the configured exchange balance (`spot` or `USDT-M futures`)
+- `python main.py --demo`: send a Telegram startup message for the current paper/live configuration
+- `python main.py --rank`: rank today's candidate symbols and print a recommended watchlist
 - `python main.py --once`: run one cycle
 - `python main.py --summary`: show stored signal and position stats
 - `python main.py --scan`: inspect current market metrics and why a signal was rejected
