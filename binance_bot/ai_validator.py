@@ -21,18 +21,28 @@ class AIValidator:
             except Exception:
                 self.enabled = False
 
-    def review(self, signal: TradeSignal) -> AIReview:
+    def review(self, signal: TradeSignal, advisory: bool = False) -> AIReview:
         if not self.enabled or self.client is None:
-            return AIReview(approved=True, confidence=0.0, reason="AI validation disabled.")
+            return AIReview(
+                approved=True,
+                confidence=0.0,
+                reason="AI validation disabled.",
+                committee={},
+            )
 
         prompt = (
-            "You are validating a crypto trade candidate with a profit-first mindset. "
-            "Approve only if the entry location has clear edge, the signal candle confirms continuation, "
-            "the stochastic direction agrees with the trade, and the setup is not late, stretched, or noisy. "
-            "Reject trades that look like mid-move chasing, reversal traps, weak pullbacks, or low-quality continuation. "
-            'Return strict JSON with keys: approved, confidence, reason.'
+            "You are a three-person crypto trade review committee. "
+            "Reviewer 1 is Trend, Reviewer 2 is Risk, Reviewer 3 is Execution Timing. "
+            "Each reviewer must independently score the candidate from 0.0 to 1.0 and explain briefly. "
+            "Approve only if the setup has clear edge, not just a signal. "
+            "Reject trades that are late, stretched, noisy, reversal-prone, weak on follow-through, "
+            "or structurally poor after fees and slippage. "
+            "If advisory mode is true, treat this as a promotion candidate review for a non-core symbol and be stricter. "
+            "Return strict JSON with keys: approved, confidence, reason, trend_score, trend_reason, "
+            "risk_score, risk_reason, execution_score, execution_reason."
         )
         payload = {
+            "advisory_mode": advisory,
             "symbol": signal.symbol,
             "side": signal.side,
             "entry_price": signal.entry_price,
@@ -56,16 +66,27 @@ class AIValidator:
             raw = response.choices[0].message.content or "{}"
             parsed = json.loads(raw)
             confidence = float(parsed.get("confidence", 0.0))
+            committee = {
+                "trend_score": max(0.0, min(float(parsed.get("trend_score", 0.0)), 1.0)),
+                "trend_reason": str(parsed.get("trend_reason", "")),
+                "risk_score": max(0.0, min(float(parsed.get("risk_score", 0.0)), 1.0)),
+                "risk_reason": str(parsed.get("risk_reason", "")),
+                "execution_score": max(0.0, min(float(parsed.get("execution_score", 0.0)), 1.0)),
+                "execution_reason": str(parsed.get("execution_reason", "")),
+                "advisory_mode": advisory,
+            }
             return AIReview(
                 approved=bool(parsed.get("approved", False)),
                 confidence=max(0.0, min(confidence, 1.0)),
                 reason=str(parsed.get("reason", "No reason provided.")),
+                committee=committee,
             )
         except Exception as exc:
             return AIReview(
                 approved=False,
                 confidence=0.0,
                 reason=f"AI validation failed: {exc}",
+                committee={},
             )
 
     def healthcheck(self) -> tuple[bool, str]:

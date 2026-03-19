@@ -71,6 +71,7 @@ class BotConfig:
     symbols: list[str]
     main_symbols: list[str]
     research_symbols: list[str]
+    overflow_symbols: list[str]
     candidate_symbols: list[str]
     timeframe: str
     higher_timeframe: str
@@ -84,6 +85,9 @@ class BotConfig:
     experimental_x10_symbols: list[str]
     experimental_x20_symbols: list[str]
     enable_experimental_live: bool
+    enable_overflow_review: bool
+    overflow_scan_limit: int
+    overflow_min_score: float
     futures_margin_mode: str
     allow_short: bool
     min_rr: float
@@ -167,6 +171,10 @@ class BotConfig:
             _normalize_symbol(item, market_type)
             for item in _as_list("BOT_RESEARCH_SYMBOLS")
         ]
+        overflow_symbols = [
+            _normalize_symbol(item, market_type)
+            for item in _as_list("BOT_OVERFLOW_SYMBOLS")
+        ]
         candidate_symbols = [
             _normalize_symbol(item, market_type)
             for item in os.getenv("BOT_CANDIDATE_SYMBOLS", "").split(",")
@@ -198,6 +206,7 @@ class BotConfig:
             symbols=symbols,
             main_symbols=main_symbols,
             research_symbols=research_symbols,
+            overflow_symbols=overflow_symbols,
             candidate_symbols=candidate_symbols,
             timeframe=os.getenv("BOT_TIMEFRAME", "15m").strip(),
             higher_timeframe=os.getenv("BOT_HIGHER_TIMEFRAME", "1h").strip(),
@@ -211,6 +220,9 @@ class BotConfig:
             experimental_x10_symbols=experimental_x10_symbols,
             experimental_x20_symbols=experimental_x20_symbols,
             enable_experimental_live=_as_bool(os.getenv("BOT_ENABLE_EXPERIMENTAL_LIVE"), False),
+            enable_overflow_review=_as_bool(os.getenv("BOT_ENABLE_OVERFLOW_REVIEW"), True),
+            overflow_scan_limit=_as_int("BOT_OVERFLOW_SCAN_LIMIT", 5),
+            overflow_min_score=_as_float("BOT_OVERFLOW_MIN_SCORE", 7.5),
             futures_margin_mode=os.getenv("BOT_FUTURES_MARGIN_MODE", "isolated").strip().lower(),
             allow_short=_as_bool(os.getenv("BOT_ALLOW_SHORT"), False),
             min_rr=_as_float("BOT_MIN_RR", 1.8),
@@ -265,6 +277,8 @@ class BotConfig:
             raise ValueError("Leverage values must be at least 1.")
         if config.max_open_positions < 1 or config.max_open_positions > 3:
             raise ValueError("BOT_MAX_OPEN_POSITIONS must be between 1 and 3.")
+        if config.overflow_scan_limit < 0:
+            raise ValueError("BOT_OVERFLOW_SCAN_LIMIT must not be negative.")
         if config.max_daily_loss_pct <= 0 or config.max_weekly_loss_pct <= 0:
             raise ValueError("Loss percentage limits must be positive.")
         if config.mode == "live" and not config.enable_experimental_live:

@@ -11,6 +11,7 @@ from .exchange import BinanceExchange
 from .models import Position
 from .notifier import TelegramNotifier
 from .risk import RiskManager
+from .selector import rank_scan
 from .storage import StateStore, trading_day_anchor, trading_week_anchor
 from .strategy import scan_market, should_exit
 
@@ -114,6 +115,7 @@ class TradingEngine:
                     self.store.set_emergency_stop(f"Exchange/runtime failure streak reached {streak}.")
                     self.notifier.send(f"[EMERGENCY STOP] Exchange/runtime failure streak reached {streak}.")
                 self.notifier.send(f"[{symbol}] loop failed: {exc}")
+        self._review_overflow_candidates(reference_time)
 
     def _process_symbol(self, symbol: str, account_equity: float, reference_time: datetime) -> None:
         position = self.store.get_open_position(symbol, self.config.mode)
@@ -151,7 +153,7 @@ class TradingEngine:
                 stage="ai_review",
                 outcome="error",
                 detail=review.reason,
-                payload={"signal": signal.strategy_data},
+                payload={"signal": signal.strategy_data, "committee": review.committee},
             )
             return
         self.store.reset_state_counter("ai_failure_streak")
@@ -164,7 +166,7 @@ class TradingEngine:
                 stage="ai_review",
                 outcome="rejected",
                 detail=review.reason,
-                payload={"signal": signal.strategy_data, "confidence": review.confidence},
+                payload={"signal": signal.strategy_data, "confidence": review.confidence, "committee": review.committee},
             )
             return
 
@@ -177,7 +179,7 @@ class TradingEngine:
                 stage="risk_gate",
                 outcome="rejected",
                 detail=decision.reason,
-                payload={"signal": signal.strategy_data, "confidence": review.confidence},
+                payload={"signal": signal.strategy_data, "confidence": review.confidence, "committee": review.committee},
             )
             return
 
@@ -245,6 +247,7 @@ class TradingEngine:
                 "target_price": signal.target_price,
                 "quantity": quantity,
                 "ai_confidence": review.confidence,
+                "committee": review.committee,
                 "signal": signal.strategy_data,
             },
         )
@@ -352,6 +355,71 @@ class TradingEngine:
     def _ensure_reference_state(self, key: str, account_equity: float) -> None:
         if self.store.get_state(key) is None:
             self.store.set_state(key, f"{account_equity}")
+
+    def _review_overflow_candidates(self, reference_time: datetime) -> None:
+        if not self.config.enable_overflow_review or not self.config.overflow_symbols:
+            return
+        emergency_active, _ = self.store.is_emergency_stop()
+        if emergency_active:
+            return
+
+        active_set = set(self._scan_symbols())
+        overflow_symbols = [symbol for symbol in self.exchange.resolve_symbols(self.config.overflow_symbols) if symbol not in active_set]
+        if not overflow_symbols:
+            return
+
+        reviewed = 0
+        for symbol in overflow_symbols:
+            if reviewed >= self.config.overflow_scan_limit:
+                break
+            try:
+                execution_df = self.exchange.fetch_ohlcv(symbol, self.config.timeframe)
+                higher_df = self.exchange.fetch_ohlcv(symbol, self.config.higher_timeframe)
+                scan = scan_market(symbol, execution_df, higher_df, self.config)
+                status, score = rank_scan(scan, 0.0)
+                if score < self.config.overflow_min_score:
+                    continue
+                reviewed += 1
+                if scan.signal is None:
+                    self.store.log_decision(
+                        symbol=symbol,
+                        mode=self.config.mode,
+                        stage="overflow_review",
+                        outcome="watch_only",
+                        detail=f"Overflow candidate scored {score:.2f} but no valid entry signal.",
+                        payload={"metrics": scan.metrics, "reasons": scan.reasons[:8], "score": score, "status": status},
+                    )
+                    continue
+
+                review = self.ai_validator.review(scan.signal, advisory=True)
+                self.store.log_decision(
+                    symbol=symbol,
+                    mode=self.config.mode,
+                    stage="overflow_committee",
+                    outcome="promotion_candidate" if review.approved else "rejected",
+                    detail=review.reason,
+                    payload={
+                        "score": score,
+                        "status": status,
+                        "signal": scan.signal.strategy_data,
+                        "committee": review.committee,
+                        "confidence": review.confidence,
+                    },
+                )
+                if review.approved:
+                    self.notifier.send(
+                        f"[OVERFLOW CANDIDATE] {symbol} looks promotable "
+                        f"score={score:.2f} ai={review.confidence:.2f} reason={review.reason}"
+                    )
+            except Exception as exc:
+                self.store.log_decision(
+                    symbol=symbol,
+                    mode=self.config.mode,
+                    stage="overflow_review",
+                    outcome="error",
+                    detail=str(exc),
+                    payload={},
+                )
 
     def _resolved_fill_price(self, order: dict, fallback_price: float) -> float:
         average = order.get("average")

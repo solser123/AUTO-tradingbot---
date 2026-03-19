@@ -74,6 +74,7 @@ def run_doctor() -> int:
         checks.append(("futures-risk", True, f"margin={config.futures_margin_mode}, leverage={config.futures_leverage}x"))
         checks.append(("core-tier", True, f"core={config.core_leverage}x liquid={config.liquid_leverage}x"))
         checks.append(("experimental-live", True, f"enabled={config.enable_experimental_live}"))
+        checks.append(("overflow-review", True, f"enabled={config.enable_overflow_review} limit={config.overflow_scan_limit}"))
         checks.append(("entry-windows", True, ",".join(config.allowed_entry_windows) or "always"))
         checks.append(("cooldown", True, f"{config.symbol_cooldown_minutes}m"))
         checks.append(("loss-guard", True, f"daily={config.max_daily_loss_pct:.0%} weekly={config.max_weekly_loss_pct:.0%}"))

@@ -22,6 +22,7 @@ class AIReview:
     approved: bool
     confidence: float
     reason: str
+    committee: dict[str, float | str | bool]
 
 
 @dataclass
