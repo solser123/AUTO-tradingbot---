@@ -209,6 +209,7 @@ def run_scan() -> int:
             )
             print(f"  side: {signal.side}")
             print(f"  setup_type: {signal.setup_type}")
+            print(f"  entry_profile: {signal.entry_profile}")
             print(f"  entry_price: {signal.entry_price:.6f}")
             print(f"  stop_price: {signal.stop_price:.6f}")
             print(f"  target_price: {signal.target_price:.6f}")

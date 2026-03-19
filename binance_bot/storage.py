@@ -46,6 +46,10 @@ class StateStore:
                     entry_price REAL NOT NULL,
                     stop_price REAL NOT NULL,
                     target_price REAL NOT NULL,
+                    entry_profile TEXT NOT NULL DEFAULT 'conservative',
+                    profile_stage TEXT NOT NULL DEFAULT 'conservative',
+                    half_defense_trigger REAL NOT NULL DEFAULT 0,
+                    full_defense_trigger REAL NOT NULL DEFAULT 0,
                     opened_at TEXT NOT NULL,
                     mode TEXT NOT NULL,
                     status TEXT NOT NULL,
@@ -100,6 +104,15 @@ class StateStore:
             columns = {row["name"] for row in conn.execute("PRAGMA table_info(positions)").fetchall()}
             if columns and "realized_pnl" not in columns:
                 conn.execute("ALTER TABLE positions ADD COLUMN realized_pnl REAL")
+            migrations = {
+                "entry_profile": "ALTER TABLE positions ADD COLUMN entry_profile TEXT NOT NULL DEFAULT 'conservative'",
+                "profile_stage": "ALTER TABLE positions ADD COLUMN profile_stage TEXT NOT NULL DEFAULT 'conservative'",
+                "half_defense_trigger": "ALTER TABLE positions ADD COLUMN half_defense_trigger REAL NOT NULL DEFAULT 0",
+                "full_defense_trigger": "ALTER TABLE positions ADD COLUMN full_defense_trigger REAL NOT NULL DEFAULT 0",
+            }
+            for column, sql in migrations.items():
+                if column not in columns:
+                    conn.execute(sql)
 
     def log_signal(self, signal: TradeSignal, approved: bool, ai_confidence: float, reason: str) -> None:
         with self._connect() as conn:
@@ -179,6 +192,10 @@ class StateStore:
             entry_price=row["entry_price"],
             stop_price=row["stop_price"],
             target_price=row["target_price"],
+            entry_profile=row["entry_profile"],
+            profile_stage=row["profile_stage"],
+            half_defense_trigger=row["half_defense_trigger"],
+            full_defense_trigger=row["full_defense_trigger"],
             opened_at=datetime.fromisoformat(row["opened_at"]),
             mode=row["mode"],
             status=row["status"],
@@ -202,6 +219,10 @@ class StateStore:
                 entry_price=row["entry_price"],
                 stop_price=row["stop_price"],
                 target_price=row["target_price"],
+                entry_profile=row["entry_profile"],
+                profile_stage=row["profile_stage"],
+                half_defense_trigger=row["half_defense_trigger"],
+                full_defense_trigger=row["full_defense_trigger"],
                 opened_at=datetime.fromisoformat(row["opened_at"]),
                 mode=row["mode"],
                 status=row["status"],
@@ -237,8 +258,9 @@ class StateStore:
                 """
                 INSERT INTO positions (
                     symbol, side, quantity, entry_price, stop_price, target_price,
+                    entry_profile, profile_stage, half_defense_trigger, full_defense_trigger,
                     opened_at, mode, status
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     position.symbol,
@@ -247,6 +269,10 @@ class StateStore:
                     position.entry_price,
                     position.stop_price,
                     position.target_price,
+                    position.entry_profile,
+                    position.profile_stage,
+                    position.half_defense_trigger,
+                    position.full_defense_trigger,
                     position.opened_at.isoformat(),
                     position.mode,
                     position.status,
@@ -254,6 +280,17 @@ class StateStore:
             )
             position.id = int(cursor.lastrowid)
         return position
+
+    def update_position_stage(self, position_id: int, quantity: float, profile_stage: str) -> None:
+        with self._connect() as conn:
+            conn.execute(
+                """
+                UPDATE positions
+                SET quantity = ?, profile_stage = ?
+                WHERE id = ?
+                """,
+                (quantity, profile_stage, position_id),
+            )
 
     def close_position(self, position_id: int, exit_price: float, exit_reason: str) -> None:
         with self._connect() as conn:

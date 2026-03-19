@@ -154,6 +154,13 @@ def scan_market(
         "candle_is_bearish": candle_is_bearish,
     }
 
+    def classify_entry_profile(base_score: float) -> str:
+        if base_score >= config.aggressive_entry_score:
+            return "aggressive"
+        if base_score >= config.balanced_entry_score:
+            return "balanced"
+        return "conservative"
+
     pullback_recovery_long = (
         previous["low"] <= previous["ema_20"] * (1 + config.pullback_tolerance)
         and current["close"] > current["ema_20"]
@@ -183,6 +190,15 @@ def scan_market(
             risk = entry - stop
             if risk > 0 and (risk / entry) <= config.max_stop_pct:
                 target = entry + (risk * config.min_rr)
+                base_score = 0.0
+                base_score += 0.20 if bullish_trend else 0.0
+                base_score += 0.10 if current["close"] > current["vwap"] else 0.0
+                base_score += min(max((float(current["rsi_14"]) - config.long_rsi_min) / max(config.long_rsi_max - config.long_rsi_min, 1.0), 0.0), 1.0) * 0.15
+                base_score += min(max(volume_ratio / max(config.min_volume_ratio, 0.1), 0.0), 2.0) / 2.0 * 0.20
+                base_score += 0.15 if long_stoch_aligned else 0.0
+                base_score += 0.10 if candle_is_bullish else 0.0
+                base_score += 0.10 if breakout_long or pullback_recovery_long else 0.0
+                entry_profile = classify_entry_profile(base_score)
                 signal = TradeSignal(
                     symbol=symbol,
                     side="long",
@@ -191,10 +207,13 @@ def scan_market(
                     target_price=target,
                     rr=config.min_rr,
                     setup_type="pullback_recovery" if pullback_recovery_long else "breakout_confirmation",
+                    entry_profile=entry_profile,
                     reason="Bullish trend alignment with VWAP support and momentum confirmation.",
                     strategy_data={
                         **metrics,
                         "higher_trend": "bullish",
+                        "entry_profile_score": round(base_score, 4),
+                        "entry_profile": entry_profile,
                     },
                 )
                 return MarketScan(symbol=symbol, signal=signal, reasons=["Long setup found."], metrics=metrics)
@@ -221,6 +240,15 @@ def scan_market(
             risk = stop - entry
             if risk > 0 and (risk / entry) <= config.max_stop_pct:
                 target = entry - (risk * config.min_rr)
+                base_score = 0.0
+                base_score += 0.20 if bearish_trend else 0.0
+                base_score += 0.10 if current["close"] < current["vwap"] else 0.0
+                base_score += min(max((config.short_rsi_max - float(current["rsi_14"])) / max(config.short_rsi_max - config.short_rsi_min, 1.0), 0.0), 1.0) * 0.15
+                base_score += min(max(volume_ratio / max(config.min_volume_ratio, 0.1), 0.0), 2.0) / 2.0 * 0.20
+                base_score += 0.15 if short_stoch_aligned else 0.0
+                base_score += 0.10 if candle_is_bearish else 0.0
+                base_score += 0.10 if breakdown_short or pullback_recovery_short else 0.0
+                entry_profile = classify_entry_profile(base_score)
                 signal = TradeSignal(
                     symbol=symbol,
                     side="short",
@@ -229,10 +257,13 @@ def scan_market(
                     target_price=target,
                     rr=config.min_rr,
                     setup_type="pullback_recovery" if pullback_recovery_short else "breakdown_confirmation",
+                    entry_profile=entry_profile,
                     reason="Bearish trend alignment with VWAP resistance and momentum confirmation.",
                     strategy_data={
                         **metrics,
                         "higher_trend": "bearish",
+                        "entry_profile_score": round(base_score, 4),
+                        "entry_profile": entry_profile,
                     },
                 )
                 return MarketScan(symbol=symbol, signal=signal, reasons=["Short setup found."], metrics=metrics)
@@ -263,11 +294,19 @@ def should_exit(
     if position.side == "long":
         if current_price <= position.stop_price:
             return "stop_loss"
+        if position.profile_stage == "aggressive" and current_price <= position.half_defense_trigger:
+            return "rebalance_to_balanced"
+        if position.profile_stage in {"aggressive", "balanced"} and current_price <= position.full_defense_trigger:
+            return "rebalance_to_conservative"
         if current_price >= position.target_price:
             return "take_profit"
     else:
         if current_price >= position.stop_price:
             return "stop_loss"
+        if position.profile_stage == "aggressive" and current_price >= position.half_defense_trigger:
+            return "rebalance_to_balanced"
+        if position.profile_stage in {"aggressive", "balanced"} and current_price >= position.full_defense_trigger:
+            return "rebalance_to_conservative"
         if current_price <= position.target_price:
             return "take_profit"
 

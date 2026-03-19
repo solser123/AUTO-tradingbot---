@@ -13,6 +13,7 @@ class TradeSignal:
     target_price: float
     rr: float
     setup_type: str
+    entry_profile: str
     reason: str
     strategy_data: dict[str, float | str | bool]
 
@@ -33,6 +34,10 @@ class Position:
     entry_price: float
     stop_price: float
     target_price: float
+    entry_profile: str
+    profile_stage: str
+    half_defense_trigger: float
+    full_defense_trigger: float
     opened_at: datetime
     mode: str
     status: str = "OPEN"

@@ -109,6 +109,11 @@ class BotConfig:
     ai_failure_limit: int
     max_slippage_pct: float
     atr_overheat_multiplier: float
+    aggressive_entry_score: float
+    balanced_entry_score: float
+    conservative_entry_score: float
+    balanced_defense_r_multiple: float
+    conservative_defense_r_multiple: float
     paper_start_balance: float
     backtest_limit: int
     long_rsi_min: float
@@ -244,6 +249,11 @@ class BotConfig:
             ai_failure_limit=_as_int("BOT_AI_FAILURE_LIMIT", 3),
             max_slippage_pct=_as_float("BOT_MAX_SLIPPAGE_PCT", 0.0025),
             atr_overheat_multiplier=_as_float("BOT_ATR_OVERHEAT_MULTIPLIER", 2.5),
+            aggressive_entry_score=_as_float("BOT_AGGRESSIVE_ENTRY_SCORE", 0.80),
+            balanced_entry_score=_as_float("BOT_BALANCED_ENTRY_SCORE", 0.65),
+            conservative_entry_score=_as_float("BOT_CONSERVATIVE_ENTRY_SCORE", 0.55),
+            balanced_defense_r_multiple=_as_float("BOT_BALANCED_DEFENSE_R_MULTIPLE", 0.50),
+            conservative_defense_r_multiple=_as_float("BOT_CONSERVATIVE_DEFENSE_R_MULTIPLE", 0.85),
             paper_start_balance=_as_float("BOT_PAPER_START_BALANCE", 1000.0),
             backtest_limit=_as_int("BOT_BACKTEST_LIMIT", 300),
             long_rsi_min=_as_float("BOT_LONG_RSI_MIN", 52.0),
@@ -281,6 +291,10 @@ class BotConfig:
             raise ValueError("BOT_OVERFLOW_SCAN_LIMIT must not be negative.")
         if config.max_daily_loss_pct <= 0 or config.max_weekly_loss_pct <= 0:
             raise ValueError("Loss percentage limits must be positive.")
+        if not (
+            config.aggressive_entry_score >= config.balanced_entry_score >= config.conservative_entry_score >= 0
+        ):
+            raise ValueError("Entry profile scores must descend: aggressive >= balanced >= conservative >= 0.")
         if config.mode == "live" and not config.enable_experimental_live:
             live_experimental = [symbol for symbol in config.main_symbols if config.is_experimental_symbol(symbol)]
             if live_experimental:

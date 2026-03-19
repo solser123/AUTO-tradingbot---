@@ -195,7 +195,8 @@ class TradingEngine:
             )
             return
 
-        quantity = self.exchange.amount_to_precision(symbol, self.config.notional_per_trade / signal.entry_price)
+        initial_notional = self._notional_for_profile(signal.entry_profile)
+        quantity = self.exchange.amount_to_precision(symbol, initial_notional / signal.entry_price)
         if quantity <= 0:
             logging.info("%s: quantity below exchange minimum.", symbol)
             self.store.log_decision(
@@ -223,6 +224,12 @@ class TradingEngine:
                     f"[EMERGENCY STOP] {symbol} slippage {slippage_pct * 100:.2f}% exceeded limit."
                 )
 
+        risk_distance = abs(signal.entry_price - signal.stop_price)
+        half_defense_trigger, full_defense_trigger = self._defense_triggers(
+            signal.side,
+            signal.entry_price,
+            risk_distance,
+        )
         position = Position(
             symbol=symbol,
             side=signal.side,
@@ -230,6 +237,10 @@ class TradingEngine:
             entry_price=entry_price,
             stop_price=signal.stop_price,
             target_price=signal.target_price,
+            entry_profile=signal.entry_profile,
+            profile_stage=signal.entry_profile,
+            half_defense_trigger=half_defense_trigger,
+            full_defense_trigger=full_defense_trigger,
             opened_at=datetime.now(timezone.utc),
             mode=self.config.mode,
         )
@@ -246,6 +257,7 @@ class TradingEngine:
                 "stop_price": signal.stop_price,
                 "target_price": signal.target_price,
                 "quantity": quantity,
+                "entry_profile": signal.entry_profile,
                 "ai_confidence": review.confidence,
                 "committee": review.committee,
                 "signal": signal.strategy_data,
@@ -272,6 +284,11 @@ class TradingEngine:
             )
             return
 
+        if exit_reason in {"rebalance_to_balanced", "rebalance_to_conservative"}:
+            next_stage = "balanced" if exit_reason == "rebalance_to_balanced" else "conservative"
+            self._rebalance_position(position, current_price, next_stage)
+            return
+
         if self.config.mode == "live":
             live_side = "sell" if position.side == "long" else "buy"
             self.exchange.create_market_order(position.symbol, live_side, position.quantity, reduce_only=self.config.is_futures)
@@ -290,6 +307,57 @@ class TradingEngine:
                 self.notifier.send(f"[SYMBOL STOP] {position.symbol} stop-loss streak={symbol_streak}")
             if global_streak >= self.config.global_stoploss_limit:
                 self.notifier.send(f"[REVIEW MODE] global stop-loss streak={global_streak}")
+
+    def _notional_for_profile(self, profile: str) -> float:
+        if profile == "aggressive":
+            return self.config.notional_per_trade
+        if profile == "balanced":
+            return self.config.notional_per_trade * 0.75
+        return self.config.notional_per_trade * 0.5
+
+    def _defense_triggers(self, side: str, entry_price: float, risk_distance: float) -> tuple[float, float]:
+        if side == "long":
+            return (
+                entry_price - (risk_distance * self.config.balanced_defense_r_multiple),
+                entry_price - (risk_distance * self.config.conservative_defense_r_multiple),
+            )
+        return (
+            entry_price + (risk_distance * self.config.balanced_defense_r_multiple),
+            entry_price + (risk_distance * self.config.conservative_defense_r_multiple),
+        )
+
+    def _rebalance_position(self, position: Position, current_price: float, next_stage: str) -> None:
+        if position.profile_stage == next_stage:
+            return
+        stage_fraction = {"aggressive": 1.0, "balanced": 0.5, "conservative": 0.25}
+        current_fraction = stage_fraction.get(position.profile_stage, 0.25)
+        target_fraction = stage_fraction.get(next_stage, 0.25)
+        if target_fraction >= current_fraction:
+            return
+        reduction_ratio = 1.0 - (target_fraction / current_fraction)
+        reduce_qty = round(position.quantity * reduction_ratio, 12)
+        if reduce_qty <= 0:
+            return
+
+        if self.config.mode == "live":
+            live_side = "sell" if position.side == "long" else "buy"
+            self.exchange.create_market_order(position.symbol, live_side, reduce_qty, reduce_only=self.config.is_futures)
+            self.store.reset_state_counter("exchange_failure_streak")
+
+        remaining_qty = max(position.quantity - reduce_qty, 0.0)
+        self.store.update_position_stage(position.id or 0, remaining_qty, next_stage)
+        self.store.log_decision(
+            symbol=position.symbol,
+            mode=self.config.mode,
+            stage="position_rebalance",
+            outcome=next_stage,
+            detail=f"Position rebalanced from {position.profile_stage} to {next_stage}.",
+            payload={"current_price": current_price, "reduced_qty": reduce_qty, "remaining_qty": remaining_qty},
+        )
+        self.notifier.send(
+            f"[REBALANCE] {position.symbol} {position.profile_stage}->{next_stage} "
+            f"reduced={reduce_qty:.6f} remaining={remaining_qty:.6f}"
+        )
 
     def _account_equity(self, reference_time: datetime) -> float:
         if self.config.mode == "paper":
