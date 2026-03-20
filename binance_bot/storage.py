@@ -212,6 +212,36 @@ class StateStore:
                 ),
             )
 
+    def has_recent_decision(
+        self,
+        *,
+        symbol: str,
+        mode: str,
+        stage: str,
+        outcome: str,
+        detail: str,
+        within_minutes: int,
+    ) -> bool:
+        anchor = datetime.now(timezone.utc) - timedelta(minutes=max(within_minutes, 1))
+        query = """
+                SELECT 1
+                FROM decision_log
+                WHERE symbol = ?
+                  AND mode = ?
+                  AND stage = ?
+                  AND outcome = ?
+                  AND detail = ?
+                  AND created_at >= ?
+                ORDER BY id DESC
+                LIMIT 1
+                """
+        with self._connect() as conn:
+            row = conn.execute(
+                query,
+                (symbol, mode, stage, outcome, detail, anchor.isoformat()),
+            ).fetchone()
+        return row is not None
+
     def get_open_position(self, symbol: str, mode: str | None = None) -> Position | None:
         query = """
                 SELECT * FROM positions

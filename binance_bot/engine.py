@@ -23,6 +23,17 @@ from .strategy import scan_market, should_exit
 KST = ZoneInfo("Asia/Seoul")
 
 
+def _timeframe_to_minutes(timeframe: str) -> int:
+    raw = timeframe.strip().lower()
+    if raw.endswith("m"):
+        return int(raw[:-1])
+    if raw.endswith("h"):
+        return int(raw[:-1]) * 60
+    if raw.endswith("d"):
+        return int(raw[:-1]) * 1440
+    return 15
+
+
 class TradingEngine:
     def __init__(
         self,
@@ -174,14 +185,22 @@ class TradingEngine:
             else:
                 detail = " | ".join(scan.reasons[:3]) if scan.reasons else "No rule-based setup."
                 logging.info("%s: no rule-based setup. %s", symbol, detail)
-                self.store.log_decision(
+                if not self.store.has_recent_decision(
                     symbol=symbol,
                     mode=self.config.mode,
                     stage="scan",
                     outcome="no_entry",
                     detail=detail,
-                    payload={"metrics": scan.metrics, "reasons": scan.reasons[:8]},
-                )
+                    within_minutes=_timeframe_to_minutes(self.config.timeframe),
+                ):
+                    self.store.log_decision(
+                        symbol=symbol,
+                        mode=self.config.mode,
+                        stage="scan",
+                        outcome="no_entry",
+                        detail=detail,
+                        payload={"metrics": scan.metrics, "reasons": scan.reasons[:8]},
+                    )
                 return
 
         signal.strategy_data["multi_horizon"] = horizon_context
