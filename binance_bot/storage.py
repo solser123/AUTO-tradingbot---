@@ -11,6 +11,21 @@ from .models import Position, TradeSignal
 KST = ZoneInfo("Asia/Seoul")
 
 
+def _json_safe(value):
+    if value is None or isinstance(value, (str, int, float, bool)):
+        return value
+    if isinstance(value, dict):
+        return {str(key): _json_safe(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple, set)):
+        return [_json_safe(item) for item in value]
+    if hasattr(value, "item"):
+        try:
+            return _json_safe(value.item())
+        except Exception:
+            pass
+    return str(value)
+
+
 def trading_day_anchor(reference: datetime | None = None) -> datetime:
     local_now = (reference or datetime.now(KST)).astimezone(KST)
     anchor = local_now.replace(hour=8, minute=0, second=0, microsecond=0)
@@ -227,7 +242,7 @@ class StateStore:
                     stage,
                     outcome,
                     detail,
-                    json.dumps(payload or {}, ensure_ascii=False),
+                    json.dumps(_json_safe(payload or {}), ensure_ascii=False),
                 ),
             )
 
