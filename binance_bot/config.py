@@ -118,6 +118,9 @@ class BotConfig:
     conservative_entry_score: float
     balanced_defense_r_multiple: float
     conservative_defense_r_multiple: float
+    enable_context_recovery: bool
+    context_recovery_external_min: float
+    context_recovery_external_count_min: int
     paper_start_balance: float
     backtest_limit: int
     long_rsi_min: float
@@ -265,6 +268,9 @@ class BotConfig:
             conservative_entry_score=_as_float("BOT_CONSERVATIVE_ENTRY_SCORE", 0.42),
             balanced_defense_r_multiple=_as_float("BOT_BALANCED_DEFENSE_R_MULTIPLE", 0.50),
             conservative_defense_r_multiple=_as_float("BOT_CONSERVATIVE_DEFENSE_R_MULTIPLE", 0.85),
+            enable_context_recovery=_as_bool(os.getenv("BOT_ENABLE_CONTEXT_RECOVERY"), True),
+            context_recovery_external_min=_as_float("BOT_CONTEXT_RECOVERY_EXTERNAL_MIN", 0.10),
+            context_recovery_external_count_min=_as_int("BOT_CONTEXT_RECOVERY_EXTERNAL_COUNT_MIN", 4),
             paper_start_balance=_as_float("BOT_PAPER_START_BALANCE", 1000.0),
             backtest_limit=_as_int("BOT_BACKTEST_LIMIT", 300),
             long_rsi_min=_as_float("BOT_LONG_RSI_MIN", 46.0),

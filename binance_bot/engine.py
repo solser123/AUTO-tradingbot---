@@ -10,7 +10,7 @@ from .ai_validator import AIValidator
 from .config import BotConfig
 from .exchange import BinanceExchange
 from .external_sources import fetch_blockmedia_news, fetch_tradingview_ideas
-from .models import Position
+from .models import Position, TradeSignal
 from .notifier import TelegramNotifier
 from .opportunity import analyze_pending_opportunities
 from .research import latest_universe_candidates, recent_listing_candidates
@@ -156,20 +156,34 @@ class TradingEngine:
         higher_df = self.exchange.fetch_ohlcv(symbol, self.config.higher_timeframe)
         scan = scan_market(symbol, execution_df, higher_df, self.config)
         signal = scan.signal
-        if signal is None:
-            detail = " | ".join(scan.reasons[:3]) if scan.reasons else "No rule-based setup."
-            logging.info("%s: no rule-based setup. %s", symbol, detail)
-            self.store.log_decision(
-                symbol=symbol,
-                mode=self.config.mode,
-                stage="scan",
-                outcome="no_entry",
-                detail=detail,
-                payload={"metrics": scan.metrics, "reasons": scan.reasons[:8]},
-            )
-            return
-
         horizon_context = self._build_horizon_context(symbol, execution_df, higher_df, scan)
+        if signal is None:
+            recovered_signal = None
+            if self.config.enable_context_recovery:
+                recovered_signal = self._build_context_recovery_signal(symbol, scan, horizon_context)
+            if recovered_signal is not None:
+                signal = recovered_signal
+                self.store.log_decision(
+                    symbol=symbol,
+                    mode=self.config.mode,
+                    stage="context_recovery",
+                    outcome="triggered",
+                    detail=f"Context recovery promoted {signal.side} entry candidate.",
+                    payload={"signal": signal.strategy_data, "reasons": scan.reasons[:8]},
+                )
+            else:
+                detail = " | ".join(scan.reasons[:3]) if scan.reasons else "No rule-based setup."
+                logging.info("%s: no rule-based setup. %s", symbol, detail)
+                self.store.log_decision(
+                    symbol=symbol,
+                    mode=self.config.mode,
+                    stage="scan",
+                    outcome="no_entry",
+                    detail=detail,
+                    payload={"metrics": scan.metrics, "reasons": scan.reasons[:8]},
+                )
+                return
+
         signal.strategy_data["multi_horizon"] = horizon_context
         external_alignment = self.store.get_external_alignment(symbol, signal.side, hours=36)
         signal.strategy_data["external_alignment"] = external_alignment
@@ -923,6 +937,117 @@ class TradingEngine:
         if ema_20 <= ema_50 and higher_ema_20 <= higher_ema_50 and close <= vwap * 1.005:
             return "bearish"
         return "neutral"
+
+    def _build_context_recovery_signal(self, symbol: str, scan, horizon_context: dict[str, object]) -> TradeSignal | None:
+        metrics = scan.metrics
+        reasons = scan.reasons or []
+        if not metrics:
+            return None
+
+        close = float(metrics.get("close", 0.0) or 0.0)
+        ema_20 = float(metrics.get("ema_20", 0.0) or 0.0)
+        ema_50 = float(metrics.get("ema_50", 0.0) or 0.0)
+        atr = float(metrics.get("atr_14", 0.0) or 0.0)
+        rsi = float(metrics.get("rsi_14", 0.0) or 0.0)
+        stoch_k = float(metrics.get("stoch_k", 0.0) or 0.0)
+        stoch_d = float(metrics.get("stoch_d", 0.0) or 0.0)
+        volume_ratio = float(metrics.get("volume_ratio", 0.0) or 0.0)
+        vwap = float(metrics.get("vwap", 0.0) or 0.0)
+        higher_ema_rising = bool(metrics.get("higher_ema_rising", False))
+        higher_ema_falling = bool(metrics.get("higher_ema_falling", False))
+        if min(close, ema_20, ema_50, atr) <= 0:
+            return None
+
+        detail_text = " ".join(reasons).lower()
+        blocked_by_transition = any(token in detail_text for token in ["vwap", "rsi", "higher timeframe bias", "stochastic"])
+        if not blocked_by_transition:
+            return None
+
+        short_bias = str((horizon_context.get("short") or {}).get("bias", "neutral"))
+        medium_bias = str((horizon_context.get("medium") or {}).get("bias", "neutral"))
+        long_bias = str((horizon_context.get("long") or {}).get("bias", "neutral"))
+
+        long_alignment = self.store.get_external_alignment(symbol, "long", hours=36)
+        short_alignment = self.store.get_external_alignment(symbol, "short", hours=36)
+        long_external_good = (
+            int(long_alignment.get("count", 0)) >= self.config.context_recovery_external_count_min
+            and float(long_alignment.get("alignment_score", 0.0)) >= self.config.context_recovery_external_min
+        )
+        short_external_good = (
+            int(short_alignment.get("count", 0)) >= self.config.context_recovery_external_count_min
+            and float(short_alignment.get("alignment_score", 0.0)) >= self.config.context_recovery_external_min
+        )
+
+        long_transition = (
+            close >= ema_20
+            and ema_20 >= ema_50 * 0.995
+            and rsi >= 50
+            and stoch_k >= stoch_d
+            and volume_ratio >= 0.10
+            and higher_ema_rising
+            and (medium_bias == "bullish" or long_bias == "bullish" or short_bias == "bullish" or long_external_good)
+        )
+        if long_transition:
+            stop = min(close - (atr * 1.6), close * (1 - self.config.max_stop_pct))
+            risk = close - stop
+            if risk > 0:
+                target = close + (risk * max(self.config.min_rr, 1.4))
+                return TradeSignal(
+                    symbol=symbol,
+                    side="long",
+                    entry_price=close,
+                    stop_price=stop,
+                    target_price=target,
+                    rr=max(self.config.min_rr, 1.4),
+                    setup_type="context_recovery_long",
+                    entry_profile="conservative",
+                    reason="Context recovery long: trend transition + sentiment/multi-horizon support.",
+                    strategy_data={
+                        **metrics,
+                        "entry_profile_score": 0.44,
+                        "entry_profile": "conservative",
+                        "context_recovery": True,
+                        "context_side": "long",
+                        "external_alignment": long_alignment,
+                        "horizon": {"short": short_bias, "medium": medium_bias, "long": long_bias},
+                    },
+                )
+
+        short_transition = (
+            close <= ema_20
+            and ema_20 <= ema_50 * 1.005
+            and rsi <= 50
+            and stoch_k <= stoch_d
+            and volume_ratio >= 0.10
+            and higher_ema_falling
+            and (medium_bias == "bearish" or long_bias == "bearish" or short_bias == "bearish" or short_external_good)
+        )
+        if short_transition:
+            stop = max(close + (atr * 1.6), close * (1 + self.config.max_stop_pct))
+            risk = stop - close
+            if risk > 0:
+                target = close - (risk * max(self.config.min_rr, 1.4))
+                return TradeSignal(
+                    symbol=symbol,
+                    side="short",
+                    entry_price=close,
+                    stop_price=stop,
+                    target_price=target,
+                    rr=max(self.config.min_rr, 1.4),
+                    setup_type="context_recovery_short",
+                    entry_profile="conservative",
+                    reason="Context recovery short: trend transition + sentiment/multi-horizon support.",
+                    strategy_data={
+                        **metrics,
+                        "entry_profile_score": 0.44,
+                        "entry_profile": "conservative",
+                        "context_recovery": True,
+                        "context_side": "short",
+                        "external_alignment": short_alignment,
+                        "horizon": {"short": short_bias, "medium": medium_bias, "long": long_bias},
+                    },
+                )
+        return None
 
     def _close_all_positions(self) -> str:
         positions = self.store.get_open_positions(self.config.mode)
