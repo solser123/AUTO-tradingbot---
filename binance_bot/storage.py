@@ -407,6 +407,75 @@ class StateStore:
             "decision_events": int(decision_rows[0] if decision_rows else 0),
         }
 
+    def get_closed_positions(self, mode: str | None = None) -> list[sqlite3.Row]:
+        query = """
+                SELECT *
+                FROM positions
+                WHERE status = 'CLOSED' AND closed_at IS NOT NULL
+                """
+        params: list[object] = []
+        if mode is not None:
+            query += " AND mode = ?"
+            params.append(mode)
+        query += " ORDER BY closed_at ASC, id ASC"
+        with self._connect() as conn:
+            return conn.execute(query, tuple(params)).fetchall()
+
+    def get_trade_metrics(self, mode: str | None = None) -> dict[str, float | int]:
+        rows = self.get_closed_positions(mode)
+        pnls = [float(row["realized_pnl"] or 0.0) for row in rows]
+        wins = [pnl for pnl in pnls if pnl > 0]
+        losses = [pnl for pnl in pnls if pnl < 0]
+        gross_profit = sum(wins)
+        gross_loss = abs(sum(losses))
+        profit_factor = gross_profit / gross_loss if gross_loss > 0 else (999.0 if gross_profit > 0 else 0.0)
+        expectancy = sum(pnls) / len(pnls) if pnls else 0.0
+        cumulative = 0.0
+        peak = 0.0
+        max_drawdown = 0.0
+        for pnl in pnls:
+            cumulative += pnl
+            peak = max(peak, cumulative)
+            max_drawdown = max(max_drawdown, peak - cumulative)
+        return {
+            "trades": len(pnls),
+            "wins": len(wins),
+            "losses": len(losses),
+            "gross_profit": gross_profit,
+            "gross_loss": gross_loss,
+            "profit_factor": profit_factor,
+            "expectancy": expectancy,
+            "realized_pnl": sum(pnls),
+            "avg_win": (gross_profit / len(wins)) if wins else 0.0,
+            "avg_loss": (sum(losses) / len(losses)) if losses else 0.0,
+            "max_drawdown_abs": max_drawdown,
+        }
+
+    def count_decisions(
+        self,
+        mode: str | None = None,
+        stage: str | None = None,
+        outcome: str | None = None,
+        detail_contains: str | None = None,
+    ) -> int:
+        query = "SELECT COUNT(*) AS count FROM decision_log WHERE 1=1"
+        params: list[object] = []
+        if mode is not None:
+            query += " AND mode = ?"
+            params.append(mode)
+        if stage is not None:
+            query += " AND stage = ?"
+            params.append(stage)
+        if outcome is not None:
+            query += " AND outcome = ?"
+            params.append(outcome)
+        if detail_contains is not None:
+            query += " AND detail LIKE ?"
+            params.append(f"%{detail_contains}%")
+        with self._connect() as conn:
+            row = conn.execute(query, tuple(params)).fetchone()
+        return int(row["count"] if row else 0)
+
     def get_symbol_stoploss_streak(self, symbol: str, mode: str) -> int:
         query = """
                 SELECT exit_reason

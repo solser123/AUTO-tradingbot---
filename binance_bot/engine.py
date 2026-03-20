@@ -3,6 +3,7 @@ from __future__ import annotations
 import logging
 import time
 from datetime import datetime, timezone
+from pathlib import Path
 from zoneinfo import ZoneInfo
 
 from .ai_validator import AIValidator
@@ -10,6 +11,7 @@ from .config import BotConfig
 from .exchange import BinanceExchange
 from .models import Position
 from .notifier import TelegramNotifier
+from .research import latest_universe_candidates, recent_listing_candidates
 from .risk import RiskManager
 from .selector import build_exit_roadmap, default_candidate_symbols, rank_scan
 from .storage import StateStore, trading_day_anchor, trading_week_anchor
@@ -60,7 +62,7 @@ class TradingEngine:
             f"[BOT START] mode={self.config.mode} "
             f"market={'USDT-M futures' if self.config.is_futures else 'spot'} "
             f"symbols={preview}\n"
-            f"cmd=/help /status /positions /pause /resume /rank /scan BTC /summary /closeall /stopbot"
+            f"cmd=/help /status /positions /pause /resume /rank /stage /research /scan BTC /summary /closeall /stopbot"
         )
         while True:
             if self._process_telegram_commands():
@@ -89,7 +91,7 @@ class TradingEngine:
             f"[BOT START] mode={self.config.mode} "
             f"market={'USDT-M futures' if self.config.is_futures else 'spot'} "
             f"duration_seconds={duration_seconds} symbols={preview}\n"
-            f"cmd=/help /status /positions /pause /resume /rank /scan BTC /summary /closeall /stopbot"
+            f"cmd=/help /status /positions /pause /resume /rank /stage /research /scan BTC /summary /closeall /stopbot"
         )
         while time.time() < end_time:
             if self._process_telegram_commands():
@@ -529,6 +531,8 @@ class TradingEngine:
                 "/summary 누적 요약\n"
                 "/positions 열린 포지션\n"
                 "/rank 후보 상위 5개\n"
+                "/stage 레버리지 단계 보고\n"
+                "/research 연구 후보 스냅샷\n"
                 "/scan BTC 특정 심볼 스캔\n"
                 "/pause 신규 진입 정지\n"
                 "/resume 신규 진입 재개\n"
@@ -554,6 +558,12 @@ class TradingEngine:
 
         if command == "/rank":
             return self._format_rank(), False
+
+        if command == "/stage":
+            return self._format_stage_report(), False
+
+        if command == "/research":
+            return self._format_research_snapshot(), False
 
         if command == "/scan":
             if not args:
@@ -658,6 +668,45 @@ class TradingEngine:
                     f"rsi={scan.metrics.get('rsi_14')} vol={scan.metrics.get('volume_ratio')}"
                 )
         return "\n".join(lines)
+
+    def _format_stage_report(self) -> str:
+        summary = self.store.get_summary()
+        metrics = self.store.get_trade_metrics(self.config.mode)
+        equity_text = self.store.get_state("last_known_equity") or "0"
+        try:
+            equity = float(equity_text)
+        except ValueError:
+            equity = 0.0
+        drawdown_pct = (float(metrics["max_drawdown_abs"]) / equity * 100) if equity > 0 else 0.0
+        slippage_events = self.store.count_decisions(self.config.mode, "emergency_stop", "triggered", "slippage")
+        emergency_events = self.store.count_decisions("system", "emergency_stop", "triggered", None)
+        stage = 1
+        recommendation = "stage1 유지"
+        if int(metrics["trades"]) >= 30 and float(metrics["profit_factor"]) >= 1.30 and drawdown_pct <= 8.0 and slippage_events == 0 and emergency_events == 0:
+            stage = 2
+            recommendation = "stage2 승격 검토 가능"
+        if int(metrics["trades"]) >= 60 and float(metrics["profit_factor"]) >= 1.45 and drawdown_pct <= 7.0 and slippage_events == 0 and emergency_events == 0:
+            stage = 3
+            recommendation = "stage3 승격 검토 가능"
+        if int(metrics["trades"]) >= 100 and float(metrics["profit_factor"]) >= 1.60 and drawdown_pct <= 6.0 and slippage_events == 0 and emergency_events == 0:
+            stage = 4
+            recommendation = "stage4 승격 검토 가능"
+        return (
+            f"stage report\n"
+            f"review_stage={stage} {recommendation}\n"
+            f"signals={summary['total_signals']} approved={summary['approved_signals']}\n"
+            f"trades={metrics['trades']} pf={float(metrics['profit_factor']):.2f} pnl={float(metrics['realized_pnl']):.4f}\n"
+            f"dd={drawdown_pct:.2f}% slippage={slippage_events} emergency={emergency_events}"
+        )
+
+    def _format_research_snapshot(self) -> str:
+        backtest = latest_universe_candidates(Path("logs"), limit=8, min_trades=2)
+        recent = recent_listing_candidates(self.exchange, limit=8, lookback_days=180)
+        return (
+            "research snapshot\n"
+            f"backtest={','.join(backtest) or 'none'}\n"
+            f"recent={','.join(recent) or 'none'}"
+        )
 
     def _format_scan(self, symbol_text: str) -> str:
         target = symbol_text.strip().upper()
@@ -802,7 +851,10 @@ class TradingEngine:
             return
 
         active_set = set(self._scan_symbols())
-        overflow_symbols = [symbol for symbol in self.exchange.resolve_symbols(self.config.overflow_symbols) if symbol not in active_set]
+        dynamic_recent = recent_listing_candidates(self.exchange, limit=10, lookback_days=180)
+        dynamic_backtest = latest_universe_candidates(Path("logs"), limit=10, min_trades=2)
+        merged_overflow = list(dict.fromkeys(self.config.overflow_symbols + dynamic_recent + dynamic_backtest))
+        overflow_symbols = [symbol for symbol in self.exchange.resolve_symbols(merged_overflow) if symbol not in active_set]
         if not overflow_symbols:
             return
 

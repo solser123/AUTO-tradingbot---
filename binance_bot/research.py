@@ -2,12 +2,26 @@ from __future__ import annotations
 
 import csv
 from dataclasses import asdict
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from .backtest import run_backtest_for_symbol
 from .config import BotConfig
 from .exchange import BinanceExchange
+
+
+def _safe_symbol(symbol: str) -> str:
+    try:
+        cleaned = symbol.strip()
+        cleaned.encode("ascii")
+        if not cleaned or cleaned.startswith("/") or cleaned.startswith(":"):
+            return ""
+        return cleaned
+    except UnicodeEncodeError:
+        normalized = symbol.encode("ascii", "ignore").decode("ascii").strip()
+        if not normalized or normalized.startswith("/") or normalized.startswith(":"):
+            return ""
+        return normalized
 
 
 def run_universe_backtest(
@@ -99,3 +113,66 @@ def run_universe_backtest(
         "aggregate_realized_pnl": round(aggregate_pnl, 6),
     }
     return csv_path, report_path, summary
+
+
+def latest_universe_candidates(log_dir: Path, limit: int = 15, min_trades: int = 2) -> list[str]:
+    latest = sorted(log_dir.glob("universe_backtest_*.csv"), key=lambda item: item.stat().st_mtime, reverse=True)
+    if not latest:
+        return []
+    path = latest[0]
+    rows: list[dict[str, str]] = []
+    with path.open("r", encoding="utf-8") as handle:
+        reader = csv.DictReader(handle)
+        for row in reader:
+            try:
+                trades = int(float(row.get("trades", 0) or 0))
+                pnl = float(row.get("realized_pnl", 0) or 0.0)
+                win_rate = float(row.get("win_rate", 0) or 0.0)
+            except Exception:
+                continue
+            if trades < min_trades:
+                continue
+            if pnl <= 0:
+                continue
+            rows.append(
+                {
+                    "symbol": row.get("symbol", ""),
+                    "trades": str(trades),
+                    "realized_pnl": str(pnl),
+                    "win_rate": str(win_rate),
+                }
+            )
+    rows.sort(
+        key=lambda item: (
+            -float(item["realized_pnl"]),
+            -float(item["win_rate"]),
+            -int(item["trades"]),
+        )
+    )
+    return [_safe_symbol(row["symbol"]) for row in rows[:limit] if _safe_symbol(row["symbol"])]
+
+
+def recent_listing_candidates(
+    exchange: BinanceExchange,
+    limit: int = 12,
+    lookback_days: int = 180,
+) -> list[str]:
+    if not exchange.config.is_futures:
+        return []
+    now_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
+    cutoff_ms = int((datetime.now(timezone.utc) - timedelta(days=lookback_days)).timestamp() * 1000)
+    candidates: list[tuple[str, int]] = []
+    for symbol, market in exchange.client.markets.items():
+        if not market.get("swap") or market.get("quote") != "USDT":
+            continue
+        info = market.get("info", {}) or {}
+        onboard_raw = info.get("onboardDate") or info.get("listingDate") or info.get("launchTime")
+        try:
+            onboard_ms = int(onboard_raw)
+        except Exception:
+            continue
+        if onboard_ms < cutoff_ms or onboard_ms > now_ms:
+            continue
+        candidates.append((symbol, onboard_ms))
+    candidates.sort(key=lambda item: item[1], reverse=True)
+    return [_safe_symbol(symbol) for symbol, _ in candidates[:limit] if _safe_symbol(symbol)]

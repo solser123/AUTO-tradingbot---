@@ -4,6 +4,7 @@ import argparse
 import importlib.util
 import logging
 from datetime import datetime
+from pathlib import Path
 
 from .ai_validator import AIValidator
 from .config import BotConfig
@@ -377,6 +378,89 @@ def run_universe_backtest() -> int:
     return 0
 
 
+def run_stage_report() -> int:
+    _configure_logging()
+    config = BotConfig.from_env()
+    store = StateStore(config.database_path)
+    summary = store.get_summary()
+    metrics = store.get_trade_metrics(config.mode)
+    equity_text = store.get_state("last_known_equity") or "0"
+    try:
+        equity = float(equity_text)
+    except ValueError:
+        equity = 0.0
+    drawdown_pct = (float(metrics["max_drawdown_abs"]) / equity * 100) if equity > 0 else 0.0
+    slippage_events = store.count_decisions(config.mode, "emergency_stop", "triggered", "slippage")
+    emergency_events = store.count_decisions("system", "emergency_stop", "triggered", None)
+    stage = 1
+    recommendation = "Stay on stage 1."
+    if (
+        int(metrics["trades"]) >= 30
+        and float(metrics["profit_factor"]) >= 1.30
+        and drawdown_pct <= 8.0
+        and slippage_events == 0
+        and emergency_events == 0
+    ):
+        stage = 2
+        recommendation = "Eligible to review promotion to stage 2."
+    if (
+        int(metrics["trades"]) >= 60
+        and float(metrics["profit_factor"]) >= 1.45
+        and drawdown_pct <= 7.0
+        and slippage_events == 0
+        and emergency_events == 0
+    ):
+        stage = 3
+        recommendation = "Eligible to review promotion to stage 3."
+    if (
+        int(metrics["trades"]) >= 100
+        and float(metrics["profit_factor"]) >= 1.60
+        and drawdown_pct <= 6.0
+        and slippage_events == 0
+        and emergency_events == 0
+    ):
+        stage = 4
+        recommendation = "Eligible to review promotion to stage 4."
+
+    print(f"current_review_stage: {stage}")
+    print(f"recommendation: {recommendation}")
+    print(f"mode: {config.mode}")
+    print(f"equity: {equity}")
+    print(f"total_signals: {summary['total_signals']}")
+    print(f"approved_signals: {summary['approved_signals']}")
+    print(f"trades: {metrics['trades']}")
+    print(f"wins: {metrics['wins']}")
+    print(f"losses: {metrics['losses']}")
+    print(f"realized_pnl: {metrics['realized_pnl']:.6f}")
+    print(f"profit_factor: {metrics['profit_factor']:.4f}")
+    print(f"expectancy: {metrics['expectancy']:.6f}")
+    print(f"max_drawdown_abs: {metrics['max_drawdown_abs']:.6f}")
+    print(f"max_drawdown_pct_of_equity: {drawdown_pct:.2f}")
+    print(f"slippage_events: {slippage_events}")
+    print(f"emergency_events: {emergency_events}")
+    print("stage_rules:")
+    print("  stage1=BTC/ETH x3, main alts x2")
+    print("  stage2=BTC/ETH x5, main alts x3")
+    print("  stage3=selected tactical x5 with overflow review still advisory")
+    print("  stage4=isolated experimental x10 review-only bucket")
+    return 0
+
+
+def run_research_snapshot() -> int:
+    from .exchange import BinanceExchange
+    from .research import latest_universe_candidates, recent_listing_candidates
+
+    _configure_logging()
+    config = BotConfig.from_env()
+    exchange = BinanceExchange(config)
+    latest_backtest = latest_universe_candidates(Path("logs"), limit=15, min_trades=2)
+    recent_listings = recent_listing_candidates(exchange, limit=15, lookback_days=180)
+    print("research_snapshot:")
+    print(f"backtest_winners: {','.join(latest_backtest)}")
+    print(f"recent_listings: {','.join(recent_listings)}")
+    return 0
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description="Binance Bot V2 foundation")
     parser.add_argument("--once", action="store_true", help="Run one bot cycle and exit")
@@ -391,6 +475,8 @@ def main() -> int:
     parser.add_argument("--backtest", action="store_true", help="Run a simple historical strategy check")
     parser.add_argument("--optimize", action="store_true", help="Search a few strategy parameter combinations")
     parser.add_argument("--universe-backtest", action="store_true", help="Run a large backtest across the futures universe")
+    parser.add_argument("--stage-report", action="store_true", help="Summarize readiness for stage-based leverage promotion")
+    parser.add_argument("--research-snapshot", action="store_true", help="Show latest risky/new listing research candidates")
     args = parser.parse_args()
 
     if args.doctor:
@@ -422,6 +508,12 @@ def main() -> int:
 
     if args.universe_backtest:
         return run_universe_backtest()
+
+    if args.stage_report:
+        return run_stage_report()
+
+    if args.research_snapshot:
+        return run_research_snapshot()
 
     _configure_logging()
     engine = build_engine()
