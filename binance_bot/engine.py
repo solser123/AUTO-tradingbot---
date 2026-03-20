@@ -212,6 +212,12 @@ class TradingEngine:
         signal.strategy_data["sector"] = sector_context["sector"]
         signal.strategy_data["sector_label"] = sector_context["label"]
         signal.strategy_data["sector_context"] = sector_context
+        microstructure = self.exchange.fetch_microstructure(
+            symbol,
+            depth=self.config.microstructure_orderbook_depth,
+            trade_limit=self.config.microstructure_trade_limit,
+        )
+        signal.strategy_data["microstructure"] = microstructure
         same_side_horizons = int(horizon_context.get("same_side_count", 0))
         opposite_horizons = int(horizon_context.get("opposite_side_count", 0))
         if opposite_horizons >= 2 and same_side_horizons == 0:
@@ -234,6 +240,17 @@ class TradingEngine:
                 outcome="rejected",
                 detail=detail,
                 payload={"sector_context": sector_context, "signal": signal.strategy_data},
+            )
+            return
+        micro_rejection = self._microstructure_rejection(signal.side, microstructure)
+        if micro_rejection:
+            self.store.log_decision(
+                symbol=symbol,
+                mode=self.config.mode,
+                stage="micro_gate",
+                outcome="rejected",
+                detail=micro_rejection,
+                payload={"microstructure": microstructure, "signal": signal.strategy_data},
             )
             return
         if int(external_alignment.get("count", 0)) >= 4 and float(external_alignment.get("alignment_score", 0.0)) <= -0.25:
@@ -925,6 +942,11 @@ class TradingEngine:
         side = scan.signal.side if scan.signal is not None else "long"
         external = self.store.get_external_alignment(resolved, side, hours=36)
         sector_ctx = self._sector_context(resolved)
+        micro = self.exchange.fetch_microstructure(
+            resolved,
+            depth=self.config.microstructure_orderbook_depth,
+            trade_limit=self.config.microstructure_trade_limit,
+        )
         if scan.signal is None:
             return (
                 f"{resolved}\nno signal\n"
@@ -932,7 +954,8 @@ class TradingEngine:
                 + "\n"
                 + f"bias short={horizons['short']['bias']} mid={horizons['medium']['bias']} long={horizons['long']['bias']}\n"
                 + f"external count={external['count']} align={float(external['alignment_score']):.2f}\n"
-                + f"sector={sector_ctx['label']} flow={float(sector_ctx['flow_score']):.2f} direction={sector_ctx['direction']}"
+                + f"sector={sector_ctx['label']} flow={float(sector_ctx['flow_score']):.2f} direction={sector_ctx['direction']}\n"
+                + f"micro spread={float(micro['spread_pct'])*100:.3f}% depth={float(micro['total_depth_usdt']):.0f} flow={float(micro['trade_flow_score']):.2f} imbalance={float(micro['depth_imbalance']):.2f}"
             )
         signal = scan.signal
         roadmap = build_exit_roadmap(signal.entry_price, signal.stop_price, signal.target_price, self.config.max_hold_minutes)
@@ -944,7 +967,8 @@ class TradingEngine:
             f"bias short={horizons['short']['bias']} mid={horizons['medium']['bias']} long={horizons['long']['bias']}\n"
             f"external count={external['count']} align={float(external['alignment_score']):.2f} "
             f"community={float(external['community_score']):.2f} news={float(external['news_score']):.2f}\n"
-            f"sector={sector_ctx['label']} flow={float(sector_ctx['flow_score']):.2f} direction={sector_ctx['direction']}"
+            f"sector={sector_ctx['label']} flow={float(sector_ctx['flow_score']):.2f} direction={sector_ctx['direction']}\n"
+            f"micro spread={float(micro['spread_pct'])*100:.3f}% depth={float(micro['total_depth_usdt']):.0f} flow={float(micro['trade_flow_score']):.2f} imbalance={float(micro['depth_imbalance']):.2f}"
         )
 
     def _rank_rows(self) -> list[dict[str, object]]:
@@ -1182,6 +1206,30 @@ class TradingEngine:
         if side == "long":
             return flow_score <= (-1.0 * self.config.sector_opposition_gate_threshold)
         return flow_score >= self.config.sector_opposition_gate_threshold
+
+    def _microstructure_rejection(self, side: str, micro: dict[str, object] | None) -> str | None:
+        if not self.config.enable_microstructure_filter or not micro:
+            return None
+        spread_pct = float(micro.get("spread_pct", 0.0) or 0.0)
+        total_depth = float(micro.get("total_depth_usdt", 0.0) or 0.0)
+        trade_flow = float(micro.get("trade_flow_score", 0.0) or 0.0)
+        depth_imbalance = float(micro.get("depth_imbalance", 0.0) or 0.0)
+
+        if spread_pct > self.config.microstructure_max_spread_pct:
+            return "Microstructure rejected: spread is too wide."
+        if total_depth < self.config.microstructure_min_total_depth_usdt:
+            return "Microstructure rejected: order book depth is too thin."
+        if side == "long":
+            if trade_flow <= (-1.0 * self.config.microstructure_flow_gate_threshold):
+                return "Microstructure rejected: recent trade flow is leaning too bearish."
+            if depth_imbalance <= (-1.0 * self.config.microstructure_imbalance_gate_threshold):
+                return "Microstructure rejected: book imbalance is leaning too bearish."
+        else:
+            if trade_flow >= self.config.microstructure_flow_gate_threshold:
+                return "Microstructure rejected: recent trade flow is leaning too bullish."
+            if depth_imbalance >= self.config.microstructure_imbalance_gate_threshold:
+                return "Microstructure rejected: book imbalance is leaning too bullish."
+        return None
 
     def _sync_sector_flows(self, reference_time: datetime) -> None:
         if not self.config.enable_sector_flow:

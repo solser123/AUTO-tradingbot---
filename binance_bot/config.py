@@ -140,6 +140,13 @@ class BotConfig:
     sector_alignment_notional_boost_pct: float
     sector_alignment_ai_relief: float
     sector_min_liquidity_usdt: float
+    enable_microstructure_filter: bool
+    microstructure_orderbook_depth: int
+    microstructure_max_spread_pct: float
+    microstructure_min_total_depth_usdt: float
+    microstructure_flow_gate_threshold: float
+    microstructure_imbalance_gate_threshold: float
+    microstructure_trade_limit: int
     paper_start_balance: float
     backtest_limit: int
     long_rsi_min: float
@@ -393,6 +400,13 @@ class BotConfig:
             sector_alignment_notional_boost_pct=_as_float("BOT_SECTOR_ALIGNMENT_NOTIONAL_BOOST_PCT", 0.15),
             sector_alignment_ai_relief=_as_float("BOT_SECTOR_ALIGNMENT_AI_RELIEF", 0.03),
             sector_min_liquidity_usdt=_as_float("BOT_SECTOR_MIN_LIQUIDITY_USDT", 10000000.0),
+            enable_microstructure_filter=_as_bool(os.getenv("BOT_ENABLE_MICROSTRUCTURE_FILTER"), True),
+            microstructure_orderbook_depth=_as_int("BOT_MICROSTRUCTURE_ORDERBOOK_DEPTH", 15),
+            microstructure_max_spread_pct=_as_float("BOT_MICROSTRUCTURE_MAX_SPREAD_PCT", 0.0015),
+            microstructure_min_total_depth_usdt=_as_float("BOT_MICROSTRUCTURE_MIN_TOTAL_DEPTH_USDT", 15000.0),
+            microstructure_flow_gate_threshold=_as_float("BOT_MICROSTRUCTURE_FLOW_GATE_THRESHOLD", 0.18),
+            microstructure_imbalance_gate_threshold=_as_float("BOT_MICROSTRUCTURE_IMBALANCE_GATE_THRESHOLD", 0.18),
+            microstructure_trade_limit=_as_int("BOT_MICROSTRUCTURE_TRADE_LIMIT", 40),
             paper_start_balance=_as_float("BOT_PAPER_START_BALANCE", 1000.0),
             backtest_limit=_as_int("BOT_BACKTEST_LIMIT", 300),
             long_rsi_min=_as_float("BOT_LONG_RSI_MIN", 46.0),

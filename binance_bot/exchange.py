@@ -127,6 +127,60 @@ class BinanceExchange:
     def fetch_last_price(self, symbol: str) -> float:
         return float(self.client.fetch_ticker(symbol)["last"])
 
+    def fetch_microstructure(self, symbol: str, depth: int = 15, trade_limit: int = 40) -> dict[str, float | int | str]:
+        try:
+            order_book = self.client.fetch_order_book(symbol, limit=depth)
+        except Exception:
+            order_book = {"bids": [], "asks": []}
+        try:
+            trades = self.client.fetch_trades(symbol, limit=trade_limit)
+        except Exception:
+            trades = []
+
+        bids = order_book.get("bids") or []
+        asks = order_book.get("asks") or []
+        best_bid = float(bids[0][0]) if bids else 0.0
+        best_ask = float(asks[0][0]) if asks else 0.0
+        mid_price = ((best_bid + best_ask) / 2.0) if best_bid > 0 and best_ask > 0 else 0.0
+        spread_pct = ((best_ask - best_bid) / mid_price) if mid_price > 0 else 0.0
+
+        bid_notional = sum(float(price) * float(amount) for price, amount in bids[:depth])
+        ask_notional = sum(float(price) * float(amount) for price, amount in asks[:depth])
+        total_depth = bid_notional + ask_notional
+        depth_imbalance = ((bid_notional - ask_notional) / total_depth) if total_depth > 0 else 0.0
+
+        buy_notional = 0.0
+        sell_notional = 0.0
+        for trade in trades[:trade_limit]:
+            price = float(trade.get("price") or 0.0)
+            amount = float(trade.get("amount") or 0.0)
+            notional = price * amount
+            side = str(trade.get("side") or "").lower()
+            if side not in {"buy", "sell"}:
+                is_buyer_maker = bool((trade.get("info") or {}).get("isBuyerMaker"))
+                side = "sell" if is_buyer_maker else "buy"
+            if side == "buy":
+                buy_notional += notional
+            elif side == "sell":
+                sell_notional += notional
+        total_trade_notional = buy_notional + sell_notional
+        trade_flow = ((buy_notional - sell_notional) / total_trade_notional) if total_trade_notional > 0 else 0.0
+
+        return {
+            "best_bid": best_bid,
+            "best_ask": best_ask,
+            "mid_price": mid_price,
+            "spread_pct": spread_pct,
+            "bid_depth_usdt": bid_notional,
+            "ask_depth_usdt": ask_notional,
+            "total_depth_usdt": total_depth,
+            "depth_imbalance": depth_imbalance,
+            "buy_trade_usdt": buy_notional,
+            "sell_trade_usdt": sell_notional,
+            "trade_flow_score": trade_flow,
+            "trade_count": len(trades[:trade_limit]),
+        }
+
     def fetch_open_position_symbols(self) -> list[str]:
         if not self.config.is_futures:
             return []
