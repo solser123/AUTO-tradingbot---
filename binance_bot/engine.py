@@ -16,6 +16,7 @@ from .notifier import TelegramNotifier
 from .opportunity import analyze_pending_opportunities
 from .research import latest_universe_candidates, recent_listing_candidates
 from .risk import RiskManager
+from .runtime_state import set_runtime_flag
 from .sectors import sector_for_symbol, sector_label
 from .selector import build_exit_roadmap, default_candidate_symbols, rank_scan
 from .sizing import build_sizing_decision
@@ -149,9 +150,13 @@ class TradingEngine:
                     detail=str(exc),
                     payload={},
                 )
+                set_runtime_flag(self.store, "last_exchange_error_at", datetime.now(timezone.utc).isoformat())
                 streak = self.store.increment_state_counter("exchange_failure_streak")
                 if streak >= self.config.exchange_failure_limit:
-                    self.store.set_emergency_stop(f"Exchange/runtime failure streak reached {streak}.")
+                    self.store.set_emergency_stop(
+                        f"Exchange/runtime failure streak reached {streak}.",
+                        severity="transient",
+                    )
                     self.notifier.send(f"[EMERGENCY STOP] Exchange/runtime failure streak reached {streak}.")
                 self.notifier.send(f"[{symbol}] loop failed: {exc}")
         self._review_overflow_candidates(reference_time)
@@ -303,9 +308,13 @@ class TradingEngine:
         review = self.ai_validator.review(signal)
         self.store.log_signal(signal, review.approved, review.confidence, review.reason)
         if review.reason.startswith("AI validation failed"):
+            set_runtime_flag(self.store, "last_ai_error_at", datetime.now(timezone.utc).isoformat())
             streak = self.store.increment_state_counter("ai_failure_streak")
             if streak >= self.config.ai_failure_limit:
-                self.store.set_emergency_stop(f"AI validation failure streak reached {streak}.")
+                self.store.set_emergency_stop(
+                    f"AI validation failure streak reached {streak}.",
+                    severity="transient",
+                )
                 self.notifier.send(f"[EMERGENCY STOP] AI validation failure streak reached {streak}.")
             self.store.log_decision(
                 symbol=symbol,
@@ -381,13 +390,13 @@ class TradingEngine:
 
         entry_price = signal.entry_price
         if self.config.mode == "live":
-            execution = self.execution_router.execute_market_order(order_plan)
-            self.store.reset_state_counter("exchange_failure_streak")
+            execution = self._execute_order_plan(order_plan)
             entry_price = execution.average_price or signal.entry_price
             slippage_pct = abs(entry_price - signal.entry_price) / signal.entry_price if signal.entry_price else 0.0
             if slippage_pct > self.config.max_slippage_pct:
                 self.store.set_emergency_stop(
-                    f"Abnormal slippage detected on {symbol}: {slippage_pct * 100:.2f}%."
+                    f"Abnormal slippage detected on {symbol}: {slippage_pct * 100:.2f}%.",
+                    severity="transient",
                 )
                 self.notifier.send(
                     f"[EMERGENCY STOP] {symbol} slippage {slippage_pct * 100:.2f}% exceeded limit."
@@ -488,8 +497,7 @@ class TradingEngine:
                 requested_quantity=position.quantity,
                 reduce_only=self.config.is_futures,
             )
-            execution = self.execution_router.execute_market_order(order_plan)
-            self.store.reset_state_counter("exchange_failure_streak")
+            execution = self._execute_order_plan(order_plan)
             current_price = execution.average_price or current_price
 
         self.store.close_position(position.id or 0, current_price, exit_reason)
@@ -556,8 +564,7 @@ class TradingEngine:
                 requested_quantity=reduce_qty,
                 reduce_only=self.config.is_futures,
             )
-            execution = self.execution_router.execute_market_order(order_plan)
-            self.store.reset_state_counter("exchange_failure_streak")
+            execution = self._execute_order_plan(order_plan)
             reduce_qty = execution.executed_quantity or reduce_qty
 
         remaining_qty = max(position.quantity - reduce_qty, 0.0)
@@ -575,6 +582,16 @@ class TradingEngine:
             f"reduced={reduce_qty:.6f} remaining={remaining_qty:.6f}"
         )
 
+    def _execute_order_plan(self, order_plan):
+        try:
+            execution = self.execution_router.execute_market_order(order_plan)
+            self.store.reset_state_counter("exchange_failure_streak")
+            set_runtime_flag(self.store, "last_exchange_ok_at", datetime.now(timezone.utc).isoformat())
+            return execution
+        except Exception:
+            set_runtime_flag(self.store, "last_order_error_at", datetime.now(timezone.utc).isoformat())
+            raise
+
     def _account_equity(self, reference_time: datetime) -> float:
         if self.config.mode == "paper":
             realized = float(self.store.get_summary()["realized_pnl"])
@@ -583,9 +600,11 @@ class TradingEngine:
         try:
             equity = self.exchange.fetch_account_equity()
             self.store.reset_state_counter("exchange_failure_streak")
+            set_runtime_flag(self.store, "last_exchange_ok_at", datetime.now(timezone.utc).isoformat())
             self.store.set_state("last_known_equity", f"{equity}")
             return equity
         except Exception as exc:
+            set_runtime_flag(self.store, "last_exchange_error_at", datetime.now(timezone.utc).isoformat())
             streak = self.store.increment_state_counter("exchange_failure_streak")
             self.store.log_decision(
                 symbol="SYSTEM",
@@ -596,7 +615,10 @@ class TradingEngine:
                 payload={"streak": streak},
             )
             if streak >= self.config.exchange_failure_limit:
-                self.store.set_emergency_stop(f"Balance check failure streak reached {streak}.")
+                self.store.set_emergency_stop(
+                    f"Balance check failure streak reached {streak}.",
+                    severity="transient",
+                )
             fallback = self.store.get_state("last_known_equity")
             if fallback is not None:
                 return float(fallback)
@@ -633,7 +655,7 @@ class TradingEngine:
                 "Live/open position mismatch detected. "
                 f"db={','.join(db_symbols) or 'none'} exchange={','.join(exchange_symbols) or 'none'}"
             )
-            self.store.set_emergency_stop(reason)
+            self.store.set_emergency_stop(reason, severity="fatal")
             self.notifier.send(f"[EMERGENCY STOP] {reason}")
 
     def _sync_opportunity_reviews(self, reference_time: datetime) -> None:
@@ -805,7 +827,7 @@ class TradingEngine:
             return f"신규 진입 재개됨 mode={self.config.mode}", False
 
         if command == "/emergency":
-            self.store.set_emergency_stop("Manual emergency stop from Telegram.")
+            self.store.set_emergency_stop("Manual emergency stop from Telegram.", severity="fatal")
             return "긴급정지 활성화됨. 기존 포지션 관리는 유지되고 신규 진입은 막힙니다.", False
 
         if command == "/clearstop":
@@ -1445,8 +1467,7 @@ class TradingEngine:
                         requested_quantity=position.quantity,
                         reduce_only=self.config.is_futures,
                     )
-                    execution = self.execution_router.execute_market_order(order_plan)
-                    self.store.reset_state_counter("exchange_failure_streak")
+                    execution = self._execute_order_plan(order_plan)
                     current_price = execution.average_price or current_price
                 self.store.close_position(position.id or 0, current_price, "telegram_closeall")
                 closed += 1

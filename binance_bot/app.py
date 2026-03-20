@@ -3,13 +3,14 @@ from __future__ import annotations
 import argparse
 import importlib.util
 import logging
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 
 from .ai_validator import AIValidator
 from .config import BotConfig
 from .notifier import TelegramNotifier
 from .risk import RiskManager
+from .runtime_state import load_runtime_flags, recover_runtime_state, runtime_recovery_status
 from .selector import build_exit_roadmap, default_candidate_symbols, rank_scan
 from .storage import StateStore
 
@@ -28,6 +29,8 @@ def build_engine():
     config = BotConfig.from_env()
     exchange = BinanceExchange(config)
     store = StateStore(config.database_path)
+    exchange_ok, exchange_message = exchange.validate_connection()
+    recover_runtime_state(store, exchange_ok=exchange_ok, exchange_message=exchange_message)
     notifier = TelegramNotifier(config.telegram_token, config.telegram_chat_id)
     ai_validator = AIValidator(config)
     risk_manager = RiskManager(config, store)
@@ -40,11 +43,16 @@ def run_preflight() -> int:
     _configure_logging()
     config = BotConfig.from_env()
     exchange = BinanceExchange(config)
+    store = StateStore(config.database_path)
     notifier = TelegramNotifier(config.telegram_token, config.telegram_chat_id)
     ai_validator = AIValidator(config)
 
     checks: list[tuple[str, bool, str]] = []
     exchange_ok, exchange_message = exchange.validate_connection()
+    if exchange_ok:
+        store.set_state("last_exchange_ok_at", datetime.now(timezone.utc).isoformat())
+    else:
+        store.set_state("last_exchange_error_at", datetime.now(timezone.utc).isoformat())
     checks.append(("binance", exchange_ok, exchange_message))
 
     if config.ai_validation:
@@ -67,6 +75,22 @@ def run_preflight() -> int:
 def run_doctor() -> int:
     _configure_logging()
     config = BotConfig.from_env()
+    store = StateStore(config.database_path)
+    runtime_flags = load_runtime_flags(store)
+    runtime_recoverable = "unknown"
+    runtime_recovery_message = "doctor skipped exchange healthcheck"
+    if config.mode == "live":
+        from .exchange import BinanceExchange
+
+        exchange = BinanceExchange(config)
+        exchange_ok, exchange_message = exchange.validate_connection()
+        can_recover, recover_message = runtime_recovery_status(
+            store,
+            exchange_ok=exchange_ok,
+            exchange_message=exchange_message,
+        )
+        runtime_recoverable = "yes" if can_recover else "no"
+        runtime_recovery_message = recover_message
     checks: list[tuple[str, bool, str]] = []
 
     checks.append(("mode", True, f"BOT_MODE={config.mode}"))
@@ -91,6 +115,15 @@ def run_doctor() -> int:
     checks.append(("micro-filter", True, f"enabled={config.enable_microstructure_filter} depth={config.microstructure_orderbook_depth} spread={config.microstructure_max_spread_pct:.3%}"))
     checks.append(("sizing", True, f"risk_full={config.sizing_risk_pct_full:.2%} total_open={config.sizing_max_total_open_risk_pct:.2%} sector_cap={config.sizing_max_same_sector_open_risk_pct:.2%}"))
     checks.append(("execution-router", True, "market-order planning with exchange rules and fill estimation"))
+    checks.append(("emergency-stop", True, runtime_flags.get("emergency_stop", "0") or "0"))
+    checks.append(("emergency-severity", True, runtime_flags.get("emergency_severity", "") or "none"))
+    checks.append(("emergency-reason", True, runtime_flags.get("emergency_reason", "") or "none"))
+    checks.append(("exchange-streak", True, runtime_flags.get("exchange_failure_streak", "0") or "0"))
+    checks.append(("ai-streak", True, runtime_flags.get("ai_failure_streak", "0") or "0"))
+    checks.append(("last-exchange-ok", True, runtime_flags.get("last_exchange_ok_at", "") or "none"))
+    checks.append(("last-order-error", True, runtime_flags.get("last_order_error_at", "") or "none"))
+    checks.append(("runtime-recoverable", True, runtime_recoverable))
+    checks.append(("runtime-recovery-note", True, runtime_recovery_message))
     if config.research_symbols:
         checks.append(("research-symbols", True, f"research={', '.join(config.research_symbols)}"))
     checks.append(("database", True, f"db={config.database_path}"))
@@ -312,17 +345,18 @@ def run_rank() -> int:
 
 
 def run_backtest() -> int:
-    from .backtest import run_backtest_for_symbol
+    from .backtest.engine import BacktestEngine
     from .exchange import BinanceExchange
     from .reporting import format_report_lines, summarize_backtest_results
 
     _configure_logging()
     config = BotConfig.from_env()
     exchange = BinanceExchange(config)
-    results = []
-    for symbol in config.symbols:
-        result = run_backtest_for_symbol(symbol, exchange, config)
-        results.append(result)
+    store = StateStore(config.database_path)
+    engine = BacktestEngine(exchange, store=store)
+    batch = engine.run(config.symbols, config, export_dir="logs")
+    results = batch.results
+    for result in results:
         print(f"symbol: {result.symbol}")
         print(f"  trades: {result.trades}")
         print(f"  wins: {result.wins}")
@@ -337,6 +371,11 @@ def run_backtest() -> int:
     report = summarize_backtest_results(results, config.paper_start_balance)
     for line in format_report_lines(report):
         print(line)
+    print(f"run_id: {batch.run_id}")
+    if batch.html_path:
+        print(f"html_path: {batch.html_path}")
+    if batch.csv_paths:
+        print(f"csv_count: {len(batch.csv_paths)}")
     return 0
 
 

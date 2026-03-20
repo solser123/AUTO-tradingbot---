@@ -182,6 +182,41 @@ class StateStore:
                 )
                 """
             )
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS backtest_run (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    run_tag TEXT,
+                    started_at TEXT,
+                    ended_at TEXT,
+                    config_json TEXT,
+                    symbols_json TEXT,
+                    metrics_json TEXT
+                )
+                """
+            )
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS backtest_trade (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    run_id INTEGER,
+                    symbol TEXT,
+                    side TEXT,
+                    entry_time TEXT,
+                    exit_time TEXT,
+                    entry_price REAL,
+                    exit_price REAL,
+                    qty REAL,
+                    fee REAL,
+                    funding REAL,
+                    slippage_bps REAL,
+                    pnl REAL,
+                    mae REAL,
+                    mfe REAL,
+                    reason_json TEXT
+                )
+                """
+            )
             columns = {row["name"] for row in conn.execute("PRAGMA table_info(positions)").fetchall()}
             if columns and "realized_pnl" not in columns:
                 conn.execute("ALTER TABLE positions ADD COLUMN realized_pnl REAL")
@@ -920,6 +955,26 @@ class StateStore:
             row = conn.execute("SELECT value FROM runtime_state WHERE key = ?", (key,)).fetchone()
         return None if row is None else str(row["value"])
 
+    def get_state_record(self, key: str) -> dict[str, str] | None:
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT key, value, updated_at FROM runtime_state WHERE key = ?",
+                (key,),
+            ).fetchone()
+        if row is None:
+            return None
+        return {
+            "key": str(row["key"]),
+            "value": str(row["value"]),
+            "updated_at": str(row["updated_at"]),
+        }
+
+    def get_runtime_snapshot(self, keys: list[str]) -> dict[str, dict[str, str] | None]:
+        snapshot: dict[str, dict[str, str] | None] = {}
+        for key in keys:
+            snapshot[key] = self.get_state_record(key)
+        return snapshot
+
     def set_state(self, key: str, value: str) -> None:
         with self._connect() as conn:
             conn.execute(
@@ -942,20 +997,86 @@ class StateStore:
     def clear_emergency_stop(self) -> None:
         self.set_state("emergency_stop", "0")
         self.set_state("emergency_reason", "")
+        self.set_state("emergency_severity", "none")
+        self.set_state("emergency_set_at", "")
+        self.set_state("emergency_cleared_at", datetime.now(timezone.utc).isoformat())
 
-    def set_emergency_stop(self, reason: str) -> None:
+    def set_emergency_stop(self, reason: str, severity: str = "fatal") -> None:
         self.set_state("emergency_stop", "1")
         self.set_state("emergency_reason", reason)
+        self.set_state("emergency_severity", severity)
+        self.set_state("emergency_set_at", datetime.now(timezone.utc).isoformat())
         self.log_decision(
             symbol="SYSTEM",
             mode="system",
             stage="emergency_stop",
             outcome="triggered",
             detail=reason,
-            payload={},
+            payload={"severity": severity},
         )
 
     def is_emergency_stop(self) -> tuple[bool, str]:
         active = self.get_state("emergency_stop") == "1"
         reason = self.get_state("emergency_reason") or ""
         return active, reason
+
+    def create_backtest_run(
+        self,
+        *,
+        run_tag: str,
+        started_at: str,
+        ended_at: str,
+        config_json: dict,
+        symbols_json: list[str],
+        metrics_json: dict,
+    ) -> int:
+        with self._connect() as conn:
+            cursor = conn.execute(
+                """
+                INSERT INTO backtest_run (
+                    run_tag, started_at, ended_at, config_json, symbols_json, metrics_json
+                ) VALUES (?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    run_tag,
+                    started_at,
+                    ended_at,
+                    json.dumps(_json_safe(config_json), ensure_ascii=False),
+                    json.dumps(_json_safe(symbols_json), ensure_ascii=False),
+                    json.dumps(_json_safe(metrics_json), ensure_ascii=False),
+                ),
+            )
+        return int(cursor.lastrowid)
+
+    def insert_backtest_trades(self, run_id: int, trades: list[dict]) -> None:
+        if not trades:
+            return
+        with self._connect() as conn:
+            conn.executemany(
+                """
+                INSERT INTO backtest_trade (
+                    run_id, symbol, side, entry_time, exit_time, entry_price, exit_price,
+                    qty, fee, funding, slippage_bps, pnl, mae, mfe, reason_json
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                [
+                    (
+                        run_id,
+                        str(item["symbol"]),
+                        str(item["side"]),
+                        str(item["entry_time"]),
+                        str(item["exit_time"]),
+                        float(item["entry_price"]),
+                        float(item["exit_price"]),
+                        float(item["qty"]),
+                        float(item["fee"]),
+                        float(item["funding"]),
+                        float(item["slippage_bps"]),
+                        float(item["pnl"]),
+                        float(item["mae"]),
+                        float(item["mfe"]),
+                        json.dumps(_json_safe(item["reason_json"]), ensure_ascii=False),
+                    )
+                    for item in trades
+                ],
+            )

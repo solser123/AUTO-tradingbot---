@@ -5,6 +5,7 @@ from zoneinfo import ZoneInfo
 
 from .config import BotConfig
 from .models import AIReview, Position, RiskDecision, TradeSignal
+from .runtime_state import load_runtime_flags
 from .sectors import sector_for_symbol
 from .storage import StateStore, trading_day_anchor, trading_week_anchor
 
@@ -31,7 +32,9 @@ class RiskManager:
         reference_time = (now_time or datetime.now(KST)).astimezone(KST)
         emergency_active, emergency_reason = self.store.is_emergency_stop()
         if emergency_active:
-            return RiskDecision(False, f"Emergency stop is active: {emergency_reason}")
+            runtime_flags = load_runtime_flags(self.store)
+            severity = runtime_flags.get("emergency_severity", "") or "unknown"
+            return RiskDecision(False, f"Emergency stop is active ({severity}): {emergency_reason}")
 
         if self.store.get_open_position(signal.symbol, self.config.mode) is not None:
             return RiskDecision(False, "There is already an open position for this symbol.")
