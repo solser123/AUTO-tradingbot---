@@ -90,6 +90,7 @@ def scan_market(
 
     current = low_df.iloc[-1]
     previous = low_df.iloc[-2]
+    previous_2 = low_df.iloc[-3]
     higher = high_df.iloc[-1]
     higher_previous = high_df.iloc[-2]
     reasons: list[str] = []
@@ -133,8 +134,21 @@ def scan_market(
     )
     volume_ratio = current["volume"] / current["volume_sma_20"] if float(current["volume_sma_20"]) > 0 else 0.0
     atr_value = float(current["atr_14"]) if not math.isnan(float(current["atr_14"])) else 0.0
+    close_now = float(current["close"])
+    close_prev = float(previous["close"])
+    close_prev_2 = float(previous_2["close"])
+    open_now = float(current["open"])
+    high_now = float(current["high"])
+    low_now = float(current["low"])
+    high_prev = float(previous["high"])
+    low_prev = float(previous["low"])
     candle_is_bullish = float(current["close"]) > float(current["open"])
     candle_is_bearish = float(current["close"]) < float(current["open"])
+    body_to_atr = abs(close_now - open_now) / atr_value if atr_value > 0 else 0.0
+    close_3_back = float(low_df["close"].iloc[-4])
+    three_bar_return_pct = ((close_now / close_3_back) - 1.0) * 100 if close_3_back > 0 else 0.0
+    recent_resistance = float(low_df["high"].iloc[-13:-1].max())
+    recent_support = float(low_df["low"].iloc[-13:-1].min())
     vwap_gap_pct = abs(float(current["close"]) - float(current["vwap"])) / float(current["vwap"]) if float(current["vwap"]) > 0 else 0.0
     near_vwap_long = (
         float(current["close"]) >= float(current["vwap"]) * 0.988
@@ -179,6 +193,10 @@ def scan_market(
         "near_vwap_long": near_vwap_long,
         "near_vwap_short": near_vwap_short,
         "vwap_gap_pct": round(vwap_gap_pct * 100, 2),
+        "body_to_atr": round(body_to_atr, 2),
+        "three_bar_return_pct": round(three_bar_return_pct, 2),
+        "recent_resistance": round(recent_resistance, 6),
+        "recent_support": round(recent_support, 6),
     }
 
     def classify_entry_profile(base_score: float) -> str:
@@ -198,6 +216,22 @@ def scan_market(
         and float(current["close"]) > float(current["ema_20"])
         and volume_ratio >= (config.min_volume_ratio * 0.6)
     )
+    long_resume_confirmed = (
+        breakout_long
+        or continuation_long
+        or (
+            candle_is_bullish
+            and close_now > close_prev
+            and high_now >= high_prev
+            and close_now >= high_prev * 0.998
+        )
+    )
+    long_impulse_confirmed = (
+        close_now > close_prev >= close_prev_2
+        and three_bar_return_pct >= max((atr_value / close_now) * 100 * 0.75, 0.15)
+        and body_to_atr >= 0.30
+        and volume_ratio >= max(config.min_volume_ratio * 0.75, 0.35)
+    )
     permissive_long_stoch = (
         float(current["stoch_k"]) > float(current["stoch_d"])
         and float(current["stoch_k"]) <= (config.long_stoch_max + 12)
@@ -212,6 +246,10 @@ def scan_market(
     long_stoch_ok = long_stoch_aligned or (higher_long_bias and permissive_long_stoch) or strong_long_continuation
     long_rsi_ok = config.long_rsi_min <= current["rsi_14"] <= config.long_rsi_max or early_reversal_long
     long_setup_ready = pullback_recovery_long or breakout_long or continuation_long or early_reversal_long
+    estimated_long_stop = min(float(low_df["low"].tail(5).min()), close_now - atr_value * config.atr_stop_multiplier) if atr_value > 0 else float(low_df["low"].tail(5).min())
+    estimated_long_risk_pct = max(0.0, (close_now - estimated_long_stop) / close_now) if close_now > 0 else 0.0
+    resistance_room_pct = max(0.0, (recent_resistance - close_now) / close_now) if close_now > 0 else 0.0
+    long_resistance_room_ok = breakout_long or resistance_room_pct >= max(estimated_long_risk_pct * 0.8, 0.0035)
     if not higher_long_bias:
         reasons.append("Long rejected: higher timeframe bias is still too weak.")
     if not near_vwap_long:
@@ -224,11 +262,19 @@ def scan_market(
         reasons.append("Long rejected: signal candle does not confirm bullish continuation.")
     if not long_setup_ready:
         reasons.append("Long rejected: no recovery, continuation, or breakout confirmation.")
+    if not long_resume_confirmed:
+        reasons.append("Long rejected: resume candle confirmation is still weak.")
+    if not long_impulse_confirmed:
+        reasons.append("Long rejected: individual momentum is not strong enough yet.")
+    if not long_resistance_room_ok:
+        reasons.append("Long rejected: nearby resistance is too close for a clean reward path.")
     if higher_long_bias and near_vwap_long and long_rsi_ok:
         if long_setup_ready:
             if not long_stoch_ok:
                 return MarketScan(symbol=symbol, signal=None, reasons=reasons, metrics=metrics)
             if config.require_signal_candle_confirmation and not candle_is_bullish:
+                return MarketScan(symbol=symbol, signal=None, reasons=reasons, metrics=metrics)
+            if not long_resume_confirmed or not long_impulse_confirmed or not long_resistance_room_ok:
                 return MarketScan(symbol=symbol, signal=None, reasons=reasons, metrics=metrics)
             entry = float(current["close"])
             swing_stop = float(low_df["low"].tail(5).min())
@@ -247,6 +293,9 @@ def scan_market(
                 base_score += 0.15 if long_stoch_aligned else 0.08 if long_stoch_ok else 0.0
                 base_score += 0.10 if candle_is_bullish else 0.0
                 base_score += 0.10 if breakout_long or pullback_recovery_long or continuation_long else 0.0
+                base_score += 0.08 if long_resume_confirmed else 0.0
+                base_score += 0.07 if long_impulse_confirmed else 0.0
+                base_score += 0.05 if long_resistance_room_ok else 0.0
                 entry_profile = classify_entry_profile(base_score)
                 if early_reversal_long and not bullish_trend:
                     setup_type = "early_reversal"
@@ -269,6 +318,9 @@ def scan_market(
                         "higher_trend": "bullish" if higher_long_bias else "neutral",
                         "entry_profile_score": round(base_score, 4),
                         "entry_profile": entry_profile,
+                        "resume_confirmed": long_resume_confirmed,
+                        "impulse_confirmed": long_impulse_confirmed,
+                        "resistance_room_pct": round(resistance_room_pct * 100, 2),
                     },
                 )
                 return MarketScan(symbol=symbol, signal=signal, reasons=["Long setup found."], metrics=metrics)
@@ -284,6 +336,22 @@ def scan_market(
         and float(current["close"]) < float(current["ema_20"])
         and volume_ratio >= (config.min_volume_ratio * 0.6)
     )
+    short_resume_confirmed = (
+        breakdown_short
+        or continuation_short
+        or (
+            candle_is_bearish
+            and close_now < close_prev
+            and low_now <= low_prev
+            and close_now <= low_prev * 1.002
+        )
+    )
+    short_impulse_confirmed = (
+        close_now < close_prev <= close_prev_2
+        and three_bar_return_pct <= -max((atr_value / close_now) * 100 * 0.75, 0.15)
+        and body_to_atr >= 0.30
+        and volume_ratio >= max(config.min_volume_ratio * 0.75, 0.35)
+    )
     permissive_short_stoch = (
         float(current["stoch_k"]) < float(current["stoch_d"])
         and float(current["stoch_k"]) >= max(config.short_stoch_min - 12, 5)
@@ -298,16 +366,29 @@ def scan_market(
     short_rsi_ok = config.short_rsi_min <= current["rsi_14"] <= config.short_rsi_max or early_reversal_short
     short_setup_ready = pullback_recovery_short or breakdown_short or continuation_short or early_reversal_short
     short_stoch_ok = short_stoch_aligned or (higher_short_bias and permissive_short_stoch) or strong_short_continuation
+    estimated_short_stop = max(float(low_df["high"].tail(5).max()), close_now + atr_value * config.atr_stop_multiplier) if atr_value > 0 else float(low_df["high"].tail(5).max())
+    estimated_short_risk_pct = max(0.0, (estimated_short_stop - close_now) / close_now) if close_now > 0 else 0.0
+    support_room_pct = max(0.0, (close_now - recent_support) / close_now) if close_now > 0 else 0.0
 
     if config.allow_short and higher_short_bias and near_vwap_short and short_rsi_ok:
         if not short_stoch_ok:
             reasons.append("Short rejected: stochastic is not aligned for a profitable short entry.")
         if config.require_signal_candle_confirmation and not candle_is_bearish:
             reasons.append("Short rejected: signal candle does not confirm bearish continuation.")
+        if not short_resume_confirmed:
+            reasons.append("Short rejected: resume candle confirmation is still weak.")
+        if not short_impulse_confirmed:
+            reasons.append("Short rejected: individual momentum is not strong enough yet.")
+        if not (breakdown_short or support_room_pct >= max(estimated_short_risk_pct * 0.8, 0.0035)):
+            reasons.append("Short rejected: nearby support is too close for a clean reward path.")
         if short_setup_ready:
             if not short_stoch_ok:
                 return MarketScan(symbol=symbol, signal=None, reasons=reasons, metrics=metrics)
             if config.require_signal_candle_confirmation and not candle_is_bearish:
+                return MarketScan(symbol=symbol, signal=None, reasons=reasons, metrics=metrics)
+            if not short_resume_confirmed or not short_impulse_confirmed:
+                return MarketScan(symbol=symbol, signal=None, reasons=reasons, metrics=metrics)
+            if not (breakdown_short or support_room_pct >= max(estimated_short_risk_pct * 0.8, 0.0035)):
                 return MarketScan(symbol=symbol, signal=None, reasons=reasons, metrics=metrics)
             entry = float(current["close"])
             swing_stop = float(low_df["high"].tail(5).max())
@@ -329,6 +410,9 @@ def scan_market(
                 base_score += 0.15 if short_stoch_aligned else 0.08 if short_stoch_ok else 0.0
                 base_score += 0.10 if candle_is_bearish else 0.0
                 base_score += 0.10 if breakdown_short or pullback_recovery_short or continuation_short else 0.0
+                base_score += 0.08 if short_resume_confirmed else 0.0
+                base_score += 0.07 if short_impulse_confirmed else 0.0
+                base_score += 0.05 if (breakdown_short or support_room_pct >= max(estimated_short_risk_pct * 0.8, 0.0035)) else 0.0
                 entry_profile = classify_entry_profile(base_score)
                 if early_reversal_short and not bearish_trend:
                     setup_type = "early_reversal"
@@ -351,6 +435,9 @@ def scan_market(
                         "higher_trend": "bearish" if higher_short_bias else "neutral",
                         "entry_profile_score": round(base_score, 4),
                         "entry_profile": entry_profile,
+                        "resume_confirmed": short_resume_confirmed,
+                        "impulse_confirmed": short_impulse_confirmed,
+                        "support_room_pct": round(support_room_pct * 100, 2),
                     },
                 )
                 return MarketScan(symbol=symbol, signal=signal, reasons=["Short setup found."], metrics=metrics)
