@@ -7,6 +7,7 @@ import pandas as pd
 
 from .config import BotConfig
 from .exchange import BinanceExchange
+from .storage import _json_safe
 from .storage import StateStore
 
 
@@ -123,10 +124,10 @@ def _analyze_decision_row(row, execution_df: pd.DataFrame, config: BotConfig, tf
         "blockers_csv": ",".join(block_tags),
         "detail": detail,
         "payload_json": json.dumps(
-            {
+            _json_safe({
                 "blockers": block_tags,
                 "decision_payload": _safe_json_load(row["payload_json"]),
-            },
+            }),
             ensure_ascii=False,
         ),
     }

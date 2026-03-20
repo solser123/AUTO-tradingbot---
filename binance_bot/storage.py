@@ -680,8 +680,8 @@ class StateStore:
                         str(item.get("published_at", datetime.now(timezone.utc).isoformat())),
                         str(item.get("direction", "neutral")),
                         float(item.get("sentiment_score", 0.0) or 0.0),
-                        json.dumps(item.get("symbols", []), ensure_ascii=False),
-                        json.dumps(item.get("raw_json", {}), ensure_ascii=False),
+                        json.dumps(_json_safe(item.get("symbols", [])), ensure_ascii=False),
+                        json.dumps(_json_safe(item.get("raw_json", {})), ensure_ascii=False),
                     ),
                 )
                 inserted += int(cursor.rowcount > 0)
@@ -755,8 +755,8 @@ class StateStore:
                     float(snapshot["avg_volume_ratio"]),
                     float(snapshot["liquidity_usdt"]),
                     int(snapshot["symbol_count"]),
-                    json.dumps(snapshot.get("leaders", []), ensure_ascii=False),
-                    json.dumps(snapshot.get("payload", {}), ensure_ascii=False),
+                    json.dumps(_json_safe(snapshot.get("leaders", [])), ensure_ascii=False),
+                    json.dumps(_json_safe(snapshot.get("payload", {})), ensure_ascii=False),
                 ),
             )
 

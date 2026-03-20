@@ -7,6 +7,21 @@ from .config import BotConfig
 from .models import AIReview, TradeSignal
 
 
+def _json_safe(value):
+    if value is None or isinstance(value, (str, int, float, bool)):
+        return value
+    if isinstance(value, dict):
+        return {str(key): _json_safe(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple, set)):
+        return [_json_safe(item) for item in value]
+    if hasattr(value, "item"):
+        try:
+            return _json_safe(value.item())
+        except Exception:
+            pass
+    return str(value)
+
+
 class AIValidator:
     def __init__(self, config: BotConfig) -> None:
         self.enabled = config.ai_validation and bool(config.openai_api_key)
@@ -62,7 +77,7 @@ class AIValidator:
                 model=self.model,
                 messages=[
                     {"role": "system", "content": prompt},
-                    {"role": "user", "content": json.dumps(payload)},
+                    {"role": "user", "content": json.dumps(_json_safe(payload), ensure_ascii=False)},
                 ],
                 response_format={"type": "json_object"},
             )
