@@ -9,6 +9,7 @@ from zoneinfo import ZoneInfo
 from .ai_validator import AIValidator
 from .config import BotConfig
 from .exchange import BinanceExchange
+from .external_sources import fetch_blockmedia_news, fetch_tradingview_ideas
 from .models import Position
 from .notifier import TelegramNotifier
 from .research import latest_universe_candidates, recent_listing_candidates
@@ -62,7 +63,7 @@ class TradingEngine:
             f"[BOT START] mode={self.config.mode} "
             f"market={'USDT-M futures' if self.config.is_futures else 'spot'} "
             f"symbols={preview}\n"
-            f"cmd=/help /status /positions /pause /resume /rank /stage /research /scan BTC /summary /closeall /stopbot"
+            f"cmd=/help /status /positions /pause /resume /rank /stage /research /research-news /scan BTC /summary /closeall /stopbot"
         )
         while True:
             if self._process_telegram_commands():
@@ -91,7 +92,7 @@ class TradingEngine:
             f"[BOT START] mode={self.config.mode} "
             f"market={'USDT-M futures' if self.config.is_futures else 'spot'} "
             f"duration_seconds={duration_seconds} symbols={preview}\n"
-            f"cmd=/help /status /positions /pause /resume /rank /stage /research /scan BTC /summary /closeall /stopbot"
+            f"cmd=/help /status /positions /pause /resume /rank /stage /research /research-news /scan BTC /summary /closeall /stopbot"
         )
         while time.time() < end_time:
             if self._process_telegram_commands():
@@ -109,6 +110,7 @@ class TradingEngine:
         reference_time = datetime.now(KST)
         account_equity = self._account_equity(reference_time)
         self._refresh_reference_equity(account_equity, reference_time)
+        self._sync_external_research(reference_time)
         self._reconcile_live_positions()
         emergency_active, emergency_reason = self.store.is_emergency_stop()
         if emergency_active:
@@ -167,6 +169,8 @@ class TradingEngine:
 
         horizon_context = self._build_horizon_context(symbol, execution_df, higher_df, scan)
         signal.strategy_data["multi_horizon"] = horizon_context
+        external_alignment = self.store.get_external_alignment(symbol, signal.side, hours=36)
+        signal.strategy_data["external_alignment"] = external_alignment
         same_side_horizons = int(horizon_context.get("same_side_count", 0))
         opposite_horizons = int(horizon_context.get("opposite_side_count", 0))
         if opposite_horizons >= 2 and same_side_horizons == 0:
@@ -178,6 +182,17 @@ class TradingEngine:
                 outcome="rejected",
                 detail=detail,
                 payload={"multi_horizon": horizon_context, "signal": signal.strategy_data},
+            )
+            return
+        if int(external_alignment.get("count", 0)) >= 4 and float(external_alignment.get("alignment_score", 0.0)) <= -0.25:
+            detail = "External news/community alignment is materially against this trade."
+            self.store.log_decision(
+                symbol=symbol,
+                mode=self.config.mode,
+                stage="external_gate",
+                outcome="rejected",
+                detail=detail,
+                payload={"external_alignment": external_alignment, "signal": signal.strategy_data},
             )
             return
 
@@ -533,6 +548,7 @@ class TradingEngine:
                 "/rank 후보 상위 5개\n"
                 "/stage 레버리지 단계 보고\n"
                 "/research 연구 후보 스냅샷\n"
+                "/research-news 외부 뉴스/아이디어 요약\n"
                 "/scan BTC 특정 심볼 스캔\n"
                 "/pause 신규 진입 정지\n"
                 "/resume 신규 진입 재개\n"
@@ -564,6 +580,9 @@ class TradingEngine:
 
         if command == "/research":
             return self._format_research_snapshot(), False
+
+        if command == "/research-news":
+            return self._format_research_news(), False
 
         if command == "/scan":
             if not args:
@@ -708,6 +727,17 @@ class TradingEngine:
             f"recent={','.join(recent) or 'none'}"
         )
 
+    def _format_research_news(self) -> str:
+        rows = self.store.get_recent_external_items(limit=8, hours=36)
+        if not rows:
+            return "research news\nno external items yet"
+        lines = ["research news"]
+        for row in rows:
+            lines.append(
+                f"{row['source']} {row['direction']} {row['title'][:70]}"
+            )
+        return "\n".join(lines)
+
     def _format_scan(self, symbol_text: str) -> str:
         target = symbol_text.strip().upper()
         if "/" not in target:
@@ -717,12 +747,15 @@ class TradingEngine:
         higher_df = self.exchange.fetch_ohlcv(resolved, self.config.higher_timeframe)
         scan = scan_market(resolved, execution_df, higher_df, self.config)
         horizons = self._build_horizon_context(resolved, execution_df, higher_df, scan)
+        side = scan.signal.side if scan.signal is not None else "long"
+        external = self.store.get_external_alignment(resolved, side, hours=36)
         if scan.signal is None:
             return (
                 f"{resolved}\nno signal\n"
                 + "\n".join(scan.reasons[:5])
                 + "\n"
-                + f"bias short={horizons['short']['bias']} mid={horizons['medium']['bias']} long={horizons['long']['bias']}"
+                + f"bias short={horizons['short']['bias']} mid={horizons['medium']['bias']} long={horizons['long']['bias']}\n"
+                + f"external count={external['count']} align={float(external['alignment_score']):.2f}"
             )
         signal = scan.signal
         roadmap = build_exit_roadmap(signal.entry_price, signal.stop_price, signal.target_price, self.config.max_hold_minutes)
@@ -731,7 +764,9 @@ class TradingEngine:
             f"signal={signal.side} profile={signal.entry_profile} setup={signal.setup_type}\n"
             f"entry={signal.entry_price:.6f} stop={signal.stop_price:.6f} target={signal.target_price:.6f}\n"
             f"stop_pct={roadmap['stop_pct']} target_pct={roadmap['target_pct']} rr={signal.rr:.2f}\n"
-            f"bias short={horizons['short']['bias']} mid={horizons['medium']['bias']} long={horizons['long']['bias']}"
+            f"bias short={horizons['short']['bias']} mid={horizons['medium']['bias']} long={horizons['long']['bias']}\n"
+            f"external count={external['count']} align={float(external['alignment_score']):.2f} "
+            f"community={float(external['community_score']):.2f} news={float(external['news_score']):.2f}"
         )
 
     def _rank_rows(self) -> list[dict[str, object]]:
@@ -910,6 +945,40 @@ class TradingEngine:
                     detail=str(exc),
                     payload={},
                 )
+
+    def _sync_external_research(self, reference_time: datetime) -> None:
+        last_sync = self.store.get_state("external_sync_at")
+        if last_sync:
+            try:
+                parsed = datetime.fromisoformat(last_sync)
+                if parsed.tzinfo is None:
+                    parsed = parsed.replace(tzinfo=timezone.utc)
+                if (reference_time.astimezone(timezone.utc) - parsed).total_seconds() < 900:
+                    return
+            except Exception:
+                pass
+        try:
+            inserted = 0
+            inserted += self.store.upsert_external_items(fetch_tradingview_ideas(limit=15))
+            inserted += self.store.upsert_external_items(fetch_blockmedia_news(limit=15))
+            self.store.set_state("external_sync_at", datetime.now(timezone.utc).isoformat())
+            self.store.log_decision(
+                symbol="SYSTEM",
+                mode=self.config.mode,
+                stage="external_sync",
+                outcome="updated",
+                detail=f"External sync completed with {inserted} new items.",
+                payload={"inserted": inserted},
+            )
+        except Exception as exc:
+            self.store.log_decision(
+                symbol="SYSTEM",
+                mode=self.config.mode,
+                stage="external_sync",
+                outcome="error",
+                detail=str(exc),
+                payload={},
+            )
 
     def _resolved_fill_price(self, order: dict, fallback_price: float) -> float:
         average = order.get("average")

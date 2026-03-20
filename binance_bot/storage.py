@@ -101,6 +101,24 @@ class StateStore:
                 )
                 """
             )
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS external_items (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    fetched_at TEXT NOT NULL,
+                    source TEXT NOT NULL,
+                    source_type TEXT NOT NULL,
+                    title TEXT NOT NULL,
+                    summary TEXT NOT NULL,
+                    url TEXT NOT NULL UNIQUE,
+                    published_at TEXT NOT NULL,
+                    direction TEXT NOT NULL,
+                    sentiment_score REAL NOT NULL,
+                    symbols_json TEXT NOT NULL,
+                    raw_json TEXT NOT NULL
+                )
+                """
+            )
             columns = {row["name"] for row in conn.execute("PRAGMA table_info(positions)").fetchall()}
             if columns and "realized_pnl" not in columns:
                 conn.execute("ALTER TABLE positions ADD COLUMN realized_pnl REAL")
@@ -475,6 +493,84 @@ class StateStore:
         with self._connect() as conn:
             row = conn.execute(query, tuple(params)).fetchone()
         return int(row["count"] if row else 0)
+
+    def upsert_external_items(self, items: list[dict]) -> int:
+        inserted = 0
+        if not items:
+            return inserted
+        with self._connect() as conn:
+            for item in items:
+                cursor = conn.execute(
+                    """
+                    INSERT OR IGNORE INTO external_items (
+                        fetched_at, source, source_type, title, summary, url,
+                        published_at, direction, sentiment_score, symbols_json, raw_json
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        datetime.now(timezone.utc).isoformat(),
+                        str(item.get("source", "")),
+                        str(item.get("source_type", "")),
+                        str(item.get("title", "")),
+                        str(item.get("summary", "")),
+                        str(item.get("url", "")),
+                        str(item.get("published_at", datetime.now(timezone.utc).isoformat())),
+                        str(item.get("direction", "neutral")),
+                        float(item.get("sentiment_score", 0.0) or 0.0),
+                        json.dumps(item.get("symbols", []), ensure_ascii=False),
+                        json.dumps(item.get("raw_json", {}), ensure_ascii=False),
+                    ),
+                )
+                inserted += int(cursor.rowcount > 0)
+        return inserted
+
+    def get_recent_external_items(self, limit: int = 10, symbol: str | None = None, hours: int = 24) -> list[sqlite3.Row]:
+        anchor = datetime.now(timezone.utc) - timedelta(hours=max(hours, 1))
+        query = """
+                SELECT *
+                FROM external_items
+                WHERE published_at >= ?
+                """
+        params: list[object] = [anchor.isoformat()]
+        if symbol is not None:
+            query += " AND symbols_json LIKE ?"
+            params.append(f"%{symbol}%")
+        query += " ORDER BY published_at DESC, id DESC LIMIT ?"
+        params.append(limit)
+        with self._connect() as conn:
+            return conn.execute(query, tuple(params)).fetchall()
+
+    def get_external_alignment(self, symbol: str, side: str, hours: int = 24) -> dict[str, float | int]:
+        rows = self.get_recent_external_items(limit=100, symbol=symbol, hours=hours)
+        if not rows:
+            return {
+                "count": 0,
+                "alignment_score": 0.0,
+                "community_score": 0.0,
+                "news_score": 0.0,
+            }
+        total = 0.0
+        community = 0.0
+        news = 0.0
+        community_count = 0
+        news_count = 0
+        for row in rows:
+            score = float(row["sentiment_score"] or 0.0)
+            total += score
+            if row["source"] == "tradingview":
+                community += score
+                community_count += 1
+            elif row["source"] == "blockmedia":
+                news += score
+                news_count += 1
+        avg = total / len(rows)
+        side_adjusted = avg if side == "long" else -avg
+        return {
+            "count": len(rows),
+            "alignment_score": side_adjusted,
+            "community_score": (community / community_count) if community_count else 0.0,
+            "news_score": (news / news_count) if news_count else 0.0,
+        }
 
     def get_symbol_stoploss_streak(self, symbol: str, mode: str) -> int:
         query = """

@@ -461,6 +461,24 @@ def run_research_snapshot() -> int:
     return 0
 
 
+def run_research_news() -> int:
+    from .external_sources import fetch_blockmedia_news, fetch_tradingview_ideas
+
+    _configure_logging()
+    config = BotConfig.from_env()
+    store = StateStore(config.database_path)
+    inserted = 0
+    inserted += store.upsert_external_items(fetch_tradingview_ideas(limit=12))
+    inserted += store.upsert_external_items(fetch_blockmedia_news(limit=12))
+    print(f"external_inserted: {inserted}")
+    for row in store.get_recent_external_items(limit=10, hours=48):
+        print(
+            f"{row['source']} | {row['direction']} | {row['published_at']} | "
+            f"{row['title'][:90]} | {row['url']}"
+        )
+    return 0
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description="Binance Bot V2 foundation")
     parser.add_argument("--once", action="store_true", help="Run one bot cycle and exit")
@@ -477,6 +495,7 @@ def main() -> int:
     parser.add_argument("--universe-backtest", action="store_true", help="Run a large backtest across the futures universe")
     parser.add_argument("--stage-report", action="store_true", help="Summarize readiness for stage-based leverage promotion")
     parser.add_argument("--research-snapshot", action="store_true", help="Show latest risky/new listing research candidates")
+    parser.add_argument("--research-news", action="store_true", help="Fetch and print recent TradingView ideas and Blockmedia news")
     args = parser.parse_args()
 
     if args.doctor:
@@ -514,6 +533,9 @@ def main() -> int:
 
     if args.research_snapshot:
         return run_research_snapshot()
+
+    if args.research_news:
+        return run_research_news()
 
     _configure_logging()
     engine = build_engine()
