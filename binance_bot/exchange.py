@@ -198,6 +198,18 @@ class BinanceExchange:
     def amount_to_precision(self, symbol: str, amount: float) -> float:
         return float(self.client.amount_to_precision(symbol, amount))
 
+    def price_to_precision(self, symbol: str, price: float) -> float:
+        return float(self.client.price_to_precision(symbol, price))
+
+    def market_rules(self, symbol: str) -> dict[str, float]:
+        market = self.client.market(symbol)
+        requirements = self.order_requirements(symbol)
+        return {
+            **requirements,
+            "step_size": self._amount_step(symbol),
+            "tick_size": self._price_step(symbol),
+        }
+
     def order_requirements(self, symbol: str) -> dict[str, float]:
         market = self.client.market(symbol)
         limits = market.get("limits", {}) or {}
@@ -228,6 +240,21 @@ class BinanceExchange:
         if candidates:
             return min(candidates)
         precision = float((market.get("precision") or {}).get("amount") or 0.0)
+        return precision if precision > 0 else 0.0
+
+    def _price_step(self, symbol: str) -> float:
+        market = self.client.market(symbol)
+        filters = (market.get("info") or {}).get("filters") or []
+        for item in filters:
+            if item.get("filterType") != "PRICE_FILTER":
+                continue
+            try:
+                tick = float(item.get("tickSize") or 0.0)
+            except Exception:
+                tick = 0.0
+            if tick > 0:
+                return tick
+        precision = float((market.get("precision") or {}).get("price") or 0.0)
         return precision if precision > 0 else 0.0
 
     def _round_up_amount(self, symbol: str, amount: float) -> float:
@@ -269,3 +296,75 @@ class BinanceExchange:
         if self.config.is_futures and reduce_only:
             params["reduceOnly"] = True
         return self.client.create_order(symbol=symbol, type="market", side=side, amount=amount, params=params)
+
+    def fetch_order_snapshot(self, symbol: str, order_id: str, fallback: dict | None = None) -> dict:
+        if not order_id:
+            return fallback or {}
+        try:
+            return self.client.fetch_order(order_id, symbol)
+        except Exception:
+            return fallback or {}
+
+    def resolve_fill_price(self, order: dict, fallback_price: float) -> float:
+        average = order.get("average")
+        price = order.get("price")
+        if average is not None and float(average or 0.0) > 0:
+            return float(average)
+        if price is not None and float(price or 0.0) > 0:
+            return float(price)
+        fills = order.get("trades") or order.get("fills") or []
+        if fills:
+            total_qty = 0.0
+            total_value = 0.0
+            for fill in fills:
+                qty = float(fill.get("amount") or fill.get("qty") or 0.0)
+                fill_price = float(fill.get("price") or 0.0)
+                total_qty += qty
+                total_value += qty * fill_price
+            if total_qty > 0:
+                return total_value / total_qty
+        return fallback_price
+
+    def resolve_filled_quantity(self, order: dict, fallback_quantity: float) -> float:
+        filled = order.get("filled")
+        amount = order.get("amount")
+        if filled is not None and float(filled or 0.0) > 0:
+            return float(filled)
+        if amount is not None and float(amount or 0.0) > 0:
+            return float(amount)
+        trades = order.get("trades") or order.get("fills") or []
+        if trades:
+            total_qty = 0.0
+            for trade in trades:
+                total_qty += float(trade.get("amount") or trade.get("qty") or 0.0)
+            if total_qty > 0:
+                return total_qty
+        return fallback_quantity
+
+    def estimate_market_fill_price(
+        self,
+        symbol: str,
+        side: str,
+        quantity: float,
+        *,
+        fallback_price: float,
+        microstructure: dict[str, float | int | str] | None = None,
+    ) -> float:
+        micro = microstructure or self.fetch_microstructure(symbol)
+        best_bid = float(micro.get("best_bid", 0.0) or 0.0)
+        best_ask = float(micro.get("best_ask", 0.0) or 0.0)
+        mid_price = float(micro.get("mid_price", 0.0) or 0.0)
+        total_depth = float(micro.get("total_depth_usdt", 0.0) or 0.0)
+        reference = best_ask if side == "buy" else best_bid
+        if reference <= 0:
+            reference = mid_price if mid_price > 0 else fallback_price
+        if reference <= 0:
+            return 0.0
+        notional = quantity * reference
+        if total_depth <= 0 or notional <= 0:
+            return reference
+        impact_share = min(notional / total_depth, 1.0)
+        impact_pct = impact_share * 0.003
+        if side == "buy":
+            return reference * (1.0 + impact_pct)
+        return reference * (1.0 - impact_pct)

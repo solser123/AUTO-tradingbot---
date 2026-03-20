@@ -8,6 +8,7 @@ from zoneinfo import ZoneInfo
 
 from .ai_validator import AIValidator
 from .config import BotConfig
+from .execution_router import ExecutionRouter
 from .exchange import BinanceExchange
 from .external_sources import fetch_blockmedia_news, fetch_tradingview_ideas
 from .models import Position, TradeSignal
@@ -45,6 +46,7 @@ class TradingEngine:
         notifier: TelegramNotifier,
         ai_validator: AIValidator,
         risk_manager: RiskManager,
+        execution_router: ExecutionRouter | None = None,
     ) -> None:
         self.config = config
         self.exchange = exchange
@@ -52,6 +54,7 @@ class TradingEngine:
         self.notifier = notifier
         self.ai_validator = ai_validator
         self.risk_manager = risk_manager
+        self.execution_router = execution_router or ExecutionRouter(exchange)
         self._scan_symbols_cache: list[str] | None = None
 
     def _scan_symbols(self) -> list[str]:
@@ -342,35 +345,45 @@ class TradingEngine:
 
         initial_notional = sizing.notional
         quantity_estimate = initial_notional / signal.entry_price
-        quantity_allowed, quantity, quantity_reason = self.exchange.validate_order_quantity(
-            symbol,
-            quantity_estimate,
-            signal.entry_price,
+        order_plan = self.execution_router.prepare_market_order(
+            symbol=symbol,
+            side="buy" if signal.side == "long" else "sell",
+            reference_price=signal.entry_price,
+            requested_quantity=quantity_estimate,
+            reduce_only=False,
         )
-        if not quantity_allowed:
-            logging.info("%s: order requirement rejected signal. %s", symbol, quantity_reason)
+        quantity = order_plan.normalized_quantity
+        if quantity <= 0 or order_plan.reason.startswith("Order rejected:"):
+            logging.info("%s: order requirement rejected signal. %s", symbol, order_plan.reason)
             self.store.log_decision(
                 symbol=symbol,
                 mode=self.config.mode,
                 stage="sizing",
                 outcome="rejected",
-                detail=quantity_reason,
+                detail=order_plan.reason,
                 payload={
                     "entry_price": signal.entry_price,
                     "requested_notional": initial_notional,
                     "requested_quantity": quantity_estimate,
                     "normalized_quantity": quantity,
-                    "requirements": self.exchange.order_requirements(symbol),
+                    "execution_plan": {
+                        "estimated_fill_price": order_plan.estimated_fill_price,
+                        "estimated_notional": order_plan.estimated_notional,
+                        "estimated_slippage_pct": order_plan.estimated_slippage_pct,
+                        "tick_size": order_plan.tick_size,
+                        "step_size": order_plan.step_size,
+                        "min_amount": order_plan.min_amount,
+                        "min_notional": order_plan.min_notional,
+                    },
                 },
             )
             return
 
         entry_price = signal.entry_price
         if self.config.mode == "live":
-            live_side = "buy" if signal.side == "long" else "sell"
-            order = self.exchange.create_market_order(symbol, live_side, quantity)
+            execution = self.execution_router.execute_market_order(order_plan)
             self.store.reset_state_counter("exchange_failure_streak")
-            entry_price = self._resolved_fill_price(order, signal.entry_price)
+            entry_price = execution.average_price or signal.entry_price
             slippage_pct = abs(entry_price - signal.entry_price) / signal.entry_price if signal.entry_price else 0.0
             if slippage_pct > self.config.max_slippage_pct:
                 self.store.set_emergency_stop(
@@ -379,6 +392,8 @@ class TradingEngine:
                 self.notifier.send(
                     f"[EMERGENCY STOP] {symbol} slippage {slippage_pct * 100:.2f}% exceeded limit."
                 )
+        else:
+            execution = None
 
         risk_distance = abs(signal.entry_price - signal.stop_price)
         half_defense_trigger, full_defense_trigger = self._defense_triggers(
@@ -416,6 +431,22 @@ class TradingEngine:
                 "entry_profile": signal.entry_profile,
                 "symbol_stage": self.config.stage_for_symbol(symbol),
                 "base_notional": initial_notional,
+                "execution_plan": {
+                    "estimated_fill_price": order_plan.estimated_fill_price,
+                    "estimated_notional": order_plan.estimated_notional,
+                    "estimated_slippage_pct": order_plan.estimated_slippage_pct,
+                    "normalized_quantity": order_plan.normalized_quantity,
+                },
+                "execution_result": (
+                    {
+                        "order_id": execution.order_id,
+                        "status": execution.status,
+                        "filled_notional": execution.filled_notional,
+                        "actual_slippage_pct": execution.actual_slippage_pct,
+                    }
+                    if execution is not None
+                    else {}
+                ),
                 "sizing": signal.strategy_data.get("sizing", {}),
                 "sector_context": sector_context,
                 "ai_confidence": review.confidence,
@@ -450,9 +481,16 @@ class TradingEngine:
             return
 
         if self.config.mode == "live":
-            live_side = "sell" if position.side == "long" else "buy"
-            self.exchange.create_market_order(position.symbol, live_side, position.quantity, reduce_only=self.config.is_futures)
+            order_plan = self.execution_router.prepare_market_order(
+                symbol=position.symbol,
+                side="sell" if position.side == "long" else "buy",
+                reference_price=current_price,
+                requested_quantity=position.quantity,
+                reduce_only=self.config.is_futures,
+            )
+            execution = self.execution_router.execute_market_order(order_plan)
             self.store.reset_state_counter("exchange_failure_streak")
+            current_price = execution.average_price or current_price
 
         self.store.close_position(position.id or 0, current_price, exit_reason)
         logging.info("%s: closed position at %.4f (%s)", position.symbol, current_price, exit_reason)
@@ -511,9 +549,16 @@ class TradingEngine:
             return
 
         if self.config.mode == "live":
-            live_side = "sell" if position.side == "long" else "buy"
-            self.exchange.create_market_order(position.symbol, live_side, reduce_qty, reduce_only=self.config.is_futures)
+            order_plan = self.execution_router.prepare_market_order(
+                symbol=position.symbol,
+                side="sell" if position.side == "long" else "buy",
+                reference_price=current_price,
+                requested_quantity=reduce_qty,
+                reduce_only=self.config.is_futures,
+            )
+            execution = self.execution_router.execute_market_order(order_plan)
             self.store.reset_state_counter("exchange_failure_streak")
+            reduce_qty = execution.executed_quantity or reduce_qty
 
         remaining_qty = max(position.quantity - reduce_qty, 0.0)
         self.store.update_position_stage(position.id or 0, remaining_qty, next_stage)
@@ -1393,9 +1438,16 @@ class TradingEngine:
             try:
                 current_price = self.exchange.fetch_last_price(position.symbol)
                 if self.config.mode == "live":
-                    live_side = "sell" if position.side == "long" else "buy"
-                    self.exchange.create_market_order(position.symbol, live_side, position.quantity, reduce_only=self.config.is_futures)
+                    order_plan = self.execution_router.prepare_market_order(
+                        symbol=position.symbol,
+                        side="sell" if position.side == "long" else "buy",
+                        reference_price=current_price,
+                        requested_quantity=position.quantity,
+                        reduce_only=self.config.is_futures,
+                    )
+                    execution = self.execution_router.execute_market_order(order_plan)
                     self.store.reset_state_counter("exchange_failure_streak")
+                    current_price = execution.average_price or current_price
                 self.store.close_position(position.id or 0, current_price, "telegram_closeall")
                 closed += 1
             except Exception as exc:
@@ -1510,12 +1562,3 @@ class TradingEngine:
                 detail=str(exc),
                 payload={},
             )
-
-    def _resolved_fill_price(self, order: dict, fallback_price: float) -> float:
-        average = order.get("average")
-        price = order.get("price")
-        if average is not None and float(average or 0.0) > 0:
-            return float(average)
-        if price is not None and float(price or 0.0) > 0:
-            return float(price)
-        return fallback_price
