@@ -5,6 +5,7 @@ from zoneinfo import ZoneInfo
 
 from .config import BotConfig
 from .models import AIReview, Position, RiskDecision, TradeSignal
+from .sectors import sector_for_symbol
 from .storage import StateStore, trading_day_anchor, trading_week_anchor
 
 
@@ -55,6 +56,10 @@ class RiskManager:
         trade_risk_pct = self._trade_risk_pct(signal, account_equity)
         if trade_risk_pct > self.config.max_trade_risk_pct:
             return RiskDecision(False, "Per-trade account risk exceeds the configured cap.")
+        if self._open_risk_pct(account_equity, self.config.mode) + trade_risk_pct > self.config.sizing_max_total_open_risk_pct:
+            return RiskDecision(False, "Total open risk would exceed the configured daily risk budget.")
+        if self._open_sector_risk_pct(signal.symbol, account_equity, self.config.mode) + trade_risk_pct > self.config.sizing_max_same_sector_open_risk_pct:
+            return RiskDecision(False, "Same-sector open risk would exceed the configured cap.")
 
         if signal.rr < self.config.min_rr:
             return RiskDecision(False, "Reward/risk is below the configured minimum.")
@@ -109,11 +114,34 @@ class RiskManager:
     def _trade_risk_pct(self, signal: TradeSignal, account_equity: float) -> float:
         if account_equity <= 0:
             return 1.0
-        notional = self.config.stage_notional(signal.symbol)
+        sizing = signal.strategy_data.get("sizing", {})
+        notional = float(sizing.get("notional", 0.0) or 0.0)
+        if notional <= 0:
+            notional = self.config.stage_notional(signal.symbol)
         if signal.entry_price <= 0:
             return 1.0
         stop_pct = abs(signal.entry_price - signal.stop_price) / signal.entry_price
         return (notional * stop_pct) / account_equity
+
+    def _position_risk_pct(self, position: Position, account_equity: float) -> float:
+        if account_equity <= 0 or position.entry_price <= 0:
+            return 0.0
+        stop_pct = abs(position.entry_price - position.stop_price) / position.entry_price
+        notional = position.entry_price * position.quantity
+        return (notional * stop_pct) / account_equity
+
+    def _open_risk_pct(self, account_equity: float, mode: str) -> float:
+        positions = self.store.get_open_positions(mode)
+        return sum(self._position_risk_pct(position, account_equity) for position in positions)
+
+    def _open_sector_risk_pct(self, symbol: str, account_equity: float, mode: str) -> float:
+        target_sector = sector_for_symbol(symbol)
+        positions = self.store.get_open_positions(mode)
+        return sum(
+            self._position_risk_pct(position, account_equity)
+            for position in positions
+            if sector_for_symbol(position.symbol) == target_sector
+        )
 
     def _is_allowed_entry_time(self, reference_time: datetime) -> bool:
         if not self.config.allowed_entry_windows:

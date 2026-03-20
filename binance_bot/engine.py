@@ -17,6 +17,7 @@ from .research import latest_universe_candidates, recent_listing_candidates
 from .risk import RiskManager
 from .sectors import sector_for_symbol, sector_label
 from .selector import build_exit_roadmap, default_candidate_symbols, rank_scan
+from .sizing import build_sizing_decision
 from .storage import StateStore, trading_day_anchor, trading_week_anchor
 from .strategy import scan_market, should_exit
 
@@ -265,6 +266,37 @@ class TradingEngine:
             )
             return
 
+        sizing = build_sizing_decision(
+            signal=signal,
+            config=self.config,
+            account_equity=account_equity,
+            open_positions=self.store.get_open_positions(self.config.mode),
+            horizon_context=horizon_context,
+            sector_context=sector_context,
+            external_alignment=external_alignment,
+            microstructure=microstructure,
+        )
+        signal.strategy_data["sizing"] = {
+            "score": sizing.score,
+            "bucket": sizing.bucket,
+            "risk_pct": sizing.risk_pct,
+            "risk_multiple": sizing.risk_multiple,
+            "notional": round(sizing.notional, 4),
+            "risk_notional_cap": round(sizing.risk_notional_cap, 4),
+            "stage_cap_notional": round(sizing.stage_cap_notional, 4),
+            "components": sizing.components,
+        }
+        if not sizing.allowed:
+            self.store.log_decision(
+                symbol=symbol,
+                mode=self.config.mode,
+                stage="sizing_model",
+                outcome="rejected",
+                detail=sizing.reason,
+                payload={"sizing": signal.strategy_data["sizing"], "signal": signal.strategy_data},
+            )
+            return
+
         review = self.ai_validator.review(signal)
         self.store.log_signal(signal, review.approved, review.confidence, review.reason)
         if review.reason.startswith("AI validation failed"):
@@ -308,7 +340,7 @@ class TradingEngine:
             )
             return
 
-        initial_notional = self._notional_for_profile(symbol, signal.entry_profile, signal.side, sector_context)
+        initial_notional = sizing.notional
         quantity_estimate = initial_notional / signal.entry_price
         quantity_allowed, quantity, quantity_reason = self.exchange.validate_order_quantity(
             symbol,
@@ -384,6 +416,7 @@ class TradingEngine:
                 "entry_profile": signal.entry_profile,
                 "symbol_stage": self.config.stage_for_symbol(symbol),
                 "base_notional": initial_notional,
+                "sizing": signal.strategy_data.get("sizing", {}),
                 "sector_context": sector_context,
                 "ai_confidence": review.confidence,
                 "committee": review.committee,

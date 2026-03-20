@@ -147,6 +147,12 @@ class BotConfig:
     microstructure_flow_gate_threshold: float
     microstructure_imbalance_gate_threshold: float
     microstructure_trade_limit: int
+    sizing_risk_pct_full: float
+    sizing_risk_pct_high: float
+    sizing_risk_pct_medium: float
+    sizing_risk_pct_low: float
+    sizing_max_total_open_risk_pct: float
+    sizing_max_same_sector_open_risk_pct: float
     paper_start_balance: float
     backtest_limit: int
     long_rsi_min: float
@@ -407,6 +413,12 @@ class BotConfig:
             microstructure_flow_gate_threshold=_as_float("BOT_MICROSTRUCTURE_FLOW_GATE_THRESHOLD", 0.18),
             microstructure_imbalance_gate_threshold=_as_float("BOT_MICROSTRUCTURE_IMBALANCE_GATE_THRESHOLD", 0.18),
             microstructure_trade_limit=_as_int("BOT_MICROSTRUCTURE_TRADE_LIMIT", 40),
+            sizing_risk_pct_full=_as_float("BOT_SIZING_RISK_PCT_FULL", 0.0075),
+            sizing_risk_pct_high=_as_float("BOT_SIZING_RISK_PCT_HIGH", 0.0060),
+            sizing_risk_pct_medium=_as_float("BOT_SIZING_RISK_PCT_MEDIUM", 0.0045),
+            sizing_risk_pct_low=_as_float("BOT_SIZING_RISK_PCT_LOW", 0.0035),
+            sizing_max_total_open_risk_pct=_as_float("BOT_SIZING_MAX_TOTAL_OPEN_RISK_PCT", 0.018),
+            sizing_max_same_sector_open_risk_pct=_as_float("BOT_SIZING_MAX_SAME_SECTOR_OPEN_RISK_PCT", 0.009),
             paper_start_balance=_as_float("BOT_PAPER_START_BALANCE", 1000.0),
             backtest_limit=_as_int("BOT_BACKTEST_LIMIT", 300),
             long_rsi_min=_as_float("BOT_LONG_RSI_MIN", 46.0),
