@@ -119,6 +119,35 @@ class StateStore:
                 )
                 """
             )
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS opportunity_reviews (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    decision_log_id INTEGER NOT NULL UNIQUE,
+                    reviewed_at TEXT NOT NULL,
+                    symbol TEXT NOT NULL,
+                    decision_time TEXT NOT NULL,
+                    timeframe TEXT NOT NULL,
+                    lookahead_minutes INTEGER NOT NULL,
+                    entry_price REAL NOT NULL,
+                    peak_price REAL NOT NULL,
+                    trough_price REAL NOT NULL,
+                    close_price REAL NOT NULL,
+                    peak_time TEXT NOT NULL,
+                    trough_time TEXT NOT NULL,
+                    dominant_side TEXT NOT NULL,
+                    dominant_move_pct REAL NOT NULL,
+                    up_move_pct REAL NOT NULL,
+                    down_move_pct REAL NOT NULL,
+                    close_move_pct REAL NOT NULL,
+                    missed_notional_pnl REAL NOT NULL,
+                    is_material INTEGER NOT NULL,
+                    blockers_csv TEXT NOT NULL,
+                    detail TEXT NOT NULL,
+                    payload_json TEXT NOT NULL
+                )
+                """
+            )
             columns = {row["name"] for row in conn.execute("PRAGMA table_info(positions)").fetchall()}
             if columns and "realized_pnl" not in columns:
                 conn.execute("ALTER TABLE positions ADD COLUMN realized_pnl REAL")
@@ -570,6 +599,110 @@ class StateStore:
             "alignment_score": side_adjusted,
             "community_score": (community / community_count) if community_count else 0.0,
             "news_score": (news / news_count) if news_count else 0.0,
+        }
+
+    def get_unreviewed_no_entry_decisions(
+        self,
+        *,
+        mode: str,
+        min_age_minutes: int,
+        limit: int = 50,
+    ) -> list[sqlite3.Row]:
+        anchor = datetime.now(timezone.utc) - timedelta(minutes=max(min_age_minutes, 1))
+        query = """
+                SELECT dl.*
+                FROM decision_log dl
+                LEFT JOIN opportunity_reviews opr ON opr.decision_log_id = dl.id
+                WHERE dl.mode = ?
+                  AND dl.outcome = 'no_entry'
+                  AND dl.stage = 'scan'
+                  AND dl.created_at <= ?
+                  AND opr.decision_log_id IS NULL
+                ORDER BY dl.created_at ASC, dl.id ASC
+                LIMIT ?
+                """
+        with self._connect() as conn:
+            return conn.execute(query, (mode, anchor.isoformat(), limit)).fetchall()
+
+    def log_opportunity_review(self, review: dict) -> None:
+        with self._connect() as conn:
+            conn.execute(
+                """
+                INSERT OR IGNORE INTO opportunity_reviews (
+                    decision_log_id, reviewed_at, symbol, decision_time, timeframe, lookahead_minutes,
+                    entry_price, peak_price, trough_price, close_price, peak_time, trough_time,
+                    dominant_side, dominant_move_pct, up_move_pct, down_move_pct, close_move_pct,
+                    missed_notional_pnl, is_material, blockers_csv, detail, payload_json
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    int(review["decision_log_id"]),
+                    str(review["reviewed_at"]),
+                    str(review["symbol"]),
+                    str(review["decision_time"]),
+                    str(review["timeframe"]),
+                    int(review["lookahead_minutes"]),
+                    float(review["entry_price"]),
+                    float(review["peak_price"]),
+                    float(review["trough_price"]),
+                    float(review["close_price"]),
+                    str(review["peak_time"]),
+                    str(review["trough_time"]),
+                    str(review["dominant_side"]),
+                    float(review["dominant_move_pct"]),
+                    float(review["up_move_pct"]),
+                    float(review["down_move_pct"]),
+                    float(review["close_move_pct"]),
+                    float(review["missed_notional_pnl"]),
+                    int(review["is_material"]),
+                    str(review["blockers_csv"]),
+                    str(review["detail"]),
+                    str(review["payload_json"]),
+                ),
+            )
+
+    def get_opportunity_reviews(
+        self,
+        *,
+        symbol: str | None = None,
+        hours: int = 48,
+        only_material: bool = False,
+        limit: int = 20,
+    ) -> list[sqlite3.Row]:
+        anchor = datetime.now(timezone.utc) - timedelta(hours=max(hours, 1))
+        query = """
+                SELECT *
+                FROM opportunity_reviews
+                WHERE decision_time >= ?
+                """
+        params: list[object] = [anchor.isoformat()]
+        if symbol is not None:
+            query += " AND symbol = ?"
+            params.append(symbol)
+        if only_material:
+            query += " AND is_material = 1"
+        query += " ORDER BY dominant_move_pct DESC, decision_time DESC LIMIT ?"
+        params.append(limit)
+        with self._connect() as conn:
+            return conn.execute(query, tuple(params)).fetchall()
+
+    def get_opportunity_summary(self, *, symbol: str | None = None, hours: int = 48) -> dict[str, float | int]:
+        rows = self.get_opportunity_reviews(symbol=symbol, hours=hours, only_material=False, limit=500)
+        if not rows:
+            return {
+                "reviews": 0,
+                "material_reviews": 0,
+                "avg_move_pct": 0.0,
+                "best_move_pct": 0.0,
+                "missed_notional_pnl": 0.0,
+            }
+        material = [row for row in rows if int(row["is_material"]) == 1]
+        return {
+            "reviews": len(rows),
+            "material_reviews": len(material),
+            "avg_move_pct": sum(float(row["dominant_move_pct"]) for row in rows) / len(rows),
+            "best_move_pct": max(float(row["dominant_move_pct"]) for row in rows),
+            "missed_notional_pnl": sum(float(row["missed_notional_pnl"]) for row in material),
         }
 
     def get_symbol_stoploss_streak(self, symbol: str, mode: str) -> int:

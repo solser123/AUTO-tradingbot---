@@ -133,6 +133,9 @@ class BotConfig:
     long_stoch_min: float
     long_stoch_max: float
     require_signal_candle_confirmation: bool
+    opportunity_lookahead_minutes: int
+    opportunity_min_move_pct: float
+    opportunity_sync_interval_minutes: int
     database_path: str
     ai_model: str
 
@@ -277,6 +280,9 @@ class BotConfig:
             long_stoch_min=_as_float("BOT_LONG_STOCH_MIN", 15.0),
             long_stoch_max=_as_float("BOT_LONG_STOCH_MAX", 75.0),
             require_signal_candle_confirmation=_as_bool(os.getenv("BOT_REQUIRE_SIGNAL_CANDLE_CONFIRMATION"), False),
+            opportunity_lookahead_minutes=_as_int("BOT_OPPORTUNITY_LOOKAHEAD_MINUTES", 240),
+            opportunity_min_move_pct=_as_float("BOT_OPPORTUNITY_MIN_MOVE_PCT", 1.0),
+            opportunity_sync_interval_minutes=_as_int("BOT_OPPORTUNITY_SYNC_INTERVAL_MINUTES", 60),
             database_path=os.getenv("BOT_DATABASE_PATH", "bot_state.db").strip(),
             ai_model=os.getenv("OPENAI_MODEL", "gpt-4o-mini").strip(),
         )

@@ -479,6 +479,28 @@ def run_research_news() -> int:
     return 0
 
 
+def run_opportunity_report() -> int:
+    from .exchange import BinanceExchange
+    from .opportunity import analyze_pending_opportunities
+
+    _configure_logging()
+    config = BotConfig.from_env()
+    store = StateStore(config.database_path)
+    exchange = BinanceExchange(config)
+    inserted = analyze_pending_opportunities(store, exchange, config, batch_limit=120)
+    print(f"reviews_inserted: {inserted}")
+    print("summary:")
+    for key, value in store.get_opportunity_summary(hours=48).items():
+        print(f"  {key}: {value}")
+    print("top_material:")
+    for row in store.get_opportunity_reviews(hours=48, only_material=True, limit=10):
+        print(
+            f"  {row['symbol']} | side={row['dominant_side']} | move={float(row['dominant_move_pct']):.2f}% | "
+            f"missed_pnl={float(row['missed_notional_pnl']):.4f} | blockers={row['blockers_csv']}"
+        )
+    return 0
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description="Binance Bot V2 foundation")
     parser.add_argument("--once", action="store_true", help="Run one bot cycle and exit")
@@ -496,6 +518,7 @@ def main() -> int:
     parser.add_argument("--stage-report", action="store_true", help="Summarize readiness for stage-based leverage promotion")
     parser.add_argument("--research-snapshot", action="store_true", help="Show latest risky/new listing research candidates")
     parser.add_argument("--research-news", action="store_true", help="Fetch and print recent TradingView ideas and Blockmedia news")
+    parser.add_argument("--opportunity-report", action="store_true", help="Backfill and print missed opportunity analysis")
     args = parser.parse_args()
 
     if args.doctor:
@@ -536,6 +559,9 @@ def main() -> int:
 
     if args.research_news:
         return run_research_news()
+
+    if args.opportunity_report:
+        return run_opportunity_report()
 
     _configure_logging()
     engine = build_engine()

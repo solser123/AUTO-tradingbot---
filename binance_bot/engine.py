@@ -12,6 +12,7 @@ from .exchange import BinanceExchange
 from .external_sources import fetch_blockmedia_news, fetch_tradingview_ideas
 from .models import Position
 from .notifier import TelegramNotifier
+from .opportunity import analyze_pending_opportunities
 from .research import latest_universe_candidates, recent_listing_candidates
 from .risk import RiskManager
 from .selector import build_exit_roadmap, default_candidate_symbols, rank_scan
@@ -63,7 +64,7 @@ class TradingEngine:
             f"[BOT START] mode={self.config.mode} "
             f"market={'USDT-M futures' if self.config.is_futures else 'spot'} "
             f"symbols={preview}\n"
-            f"cmd=/help /status /positions /pause /resume /rank /stage /research /research-news /scan BTC /summary /closeall /stopbot"
+            f"cmd=/help /status /positions /pause /resume /rank /stage /research /research-news /opportunity BTC /scan BTC /summary /closeall /stopbot"
         )
         while True:
             if self._process_telegram_commands():
@@ -92,7 +93,7 @@ class TradingEngine:
             f"[BOT START] mode={self.config.mode} "
             f"market={'USDT-M futures' if self.config.is_futures else 'spot'} "
             f"duration_seconds={duration_seconds} symbols={preview}\n"
-            f"cmd=/help /status /positions /pause /resume /rank /stage /research /research-news /scan BTC /summary /closeall /stopbot"
+            f"cmd=/help /status /positions /pause /resume /rank /stage /research /research-news /opportunity BTC /scan BTC /summary /closeall /stopbot"
         )
         while time.time() < end_time:
             if self._process_telegram_commands():
@@ -111,6 +112,7 @@ class TradingEngine:
         account_equity = self._account_equity(reference_time)
         self._refresh_reference_equity(account_equity, reference_time)
         self._sync_external_research(reference_time)
+        self._sync_opportunity_reviews(reference_time)
         self._reconcile_live_positions()
         emergency_active, emergency_reason = self.store.is_emergency_stop()
         if emergency_active:
@@ -476,6 +478,42 @@ class TradingEngine:
             self.store.set_emergency_stop(reason)
             self.notifier.send(f"[EMERGENCY STOP] {reason}")
 
+    def _sync_opportunity_reviews(self, reference_time: datetime) -> None:
+        last_sync_text = self.store.get_state("opportunity_sync_at")
+        if last_sync_text:
+            try:
+                last_sync = datetime.fromisoformat(last_sync_text)
+                if last_sync.tzinfo is None:
+                    last_sync = last_sync.replace(tzinfo=timezone.utc)
+                else:
+                    last_sync = last_sync.astimezone(timezone.utc)
+                elapsed = (reference_time.astimezone(timezone.utc) - last_sync).total_seconds()
+                if elapsed < self.config.opportunity_sync_interval_minutes * 60:
+                    return
+            except ValueError:
+                pass
+        try:
+            inserted = analyze_pending_opportunities(self.store, self.exchange, self.config, batch_limit=60)
+            self.store.set_state("opportunity_sync_at", reference_time.astimezone(timezone.utc).isoformat())
+            if inserted:
+                self.store.log_decision(
+                    symbol="SYSTEM",
+                    mode=self.config.mode,
+                    stage="opportunity_sync",
+                    outcome="updated",
+                    detail=f"Opportunity reviews inserted: {inserted}",
+                    payload={"inserted": inserted},
+                )
+        except Exception as exc:
+            self.store.log_decision(
+                symbol="SYSTEM",
+                mode=self.config.mode,
+                stage="opportunity_sync",
+                outcome="error",
+                detail=str(exc),
+                payload={},
+            )
+
     def _entries_paused(self) -> bool:
         return self.store.get_state("entry_pause") == "1"
 
@@ -549,6 +587,7 @@ class TradingEngine:
                 "/stage 레버리지 단계 보고\n"
                 "/research 연구 후보 스냅샷\n"
                 "/research-news 외부 뉴스/아이디어 요약\n"
+                "/opportunity BTC 놓친 자리 분석\n"
                 "/scan BTC 특정 심볼 스캔\n"
                 "/pause 신규 진입 정지\n"
                 "/resume 신규 진입 재개\n"
@@ -583,6 +622,10 @@ class TradingEngine:
 
         if command == "/research-news":
             return self._format_research_news(), False
+
+        if command == "/opportunity":
+            symbol = args[0] if args else None
+            return self._format_opportunity(symbol), False
 
         if command == "/scan":
             if not args:
@@ -735,6 +778,36 @@ class TradingEngine:
         for row in rows:
             lines.append(
                 f"{row['source']} {row['direction']} {row['title'][:70]}"
+            )
+        return "\n".join(lines)
+
+    def _format_opportunity(self, raw_symbol: str | None = None) -> str:
+        symbol = None
+        if raw_symbol:
+            token = raw_symbol.strip().upper()
+            symbol = token if "/" in token else f"{token}/USDT:USDT"
+        summary = self.store.get_opportunity_summary(symbol=symbol, hours=48)
+        rows = self.store.get_opportunity_reviews(symbol=symbol, hours=48, only_material=True, limit=5)
+        label = symbol or "ALL"
+        if not rows:
+            return (
+                f"opportunity {label}\n"
+                f"reviews={summary['reviews']} material={summary['material_reviews']}\n"
+                "아직 유의미한 놓친 자리 데이터가 없습니다."
+            )
+        lines = [
+            f"opportunity {label}",
+            (
+                f"reviews={summary['reviews']} material={summary['material_reviews']} "
+                f"avg_move={float(summary['avg_move_pct']):.2f}% "
+                f"best={float(summary['best_move_pct']):.2f}% "
+                f"missed_notional={float(summary['missed_notional_pnl']):.4f}"
+            ),
+        ]
+        for row in rows:
+            lines.append(
+                f"{row['symbol']} {row['dominant_side']} move={float(row['dominant_move_pct']):.2f}% "
+                f"blockers={row['blockers_csv']}"
             )
         return "\n".join(lines)
 
