@@ -107,6 +107,9 @@ class BotConfig:
     allowed_entry_windows: list[str]
     symbol_cooldown_minutes: int
     ai_validation: bool
+    ai_scan_assist: bool
+    ai_scan_min_confidence: float
+    ai_scan_trigger_score: float
     min_ai_confidence: float
     stage1_min_ai_confidence: float
     stage2_min_ai_confidence: float
@@ -373,6 +376,9 @@ class BotConfig:
             allowed_entry_windows=_as_list("BOT_ALLOWED_ENTRY_WINDOWS"),
             symbol_cooldown_minutes=_as_int("BOT_SYMBOL_COOLDOWN_MINUTES", 240),
             ai_validation=_as_bool(os.getenv("BOT_AI_VALIDATION"), True),
+            ai_scan_assist=_as_bool(os.getenv("BOT_AI_SCAN_ASSIST"), True),
+            ai_scan_min_confidence=_as_float("BOT_AI_SCAN_MIN_CONFIDENCE", 0.58),
+            ai_scan_trigger_score=_as_float("BOT_AI_SCAN_TRIGGER_SCORE", 4.0),
             min_ai_confidence=_as_float("BOT_MIN_AI_CONFIDENCE", 0.55),
             stage1_min_ai_confidence=_as_float("BOT_STAGE1_MIN_AI_CONFIDENCE", 0.60),
             stage2_min_ai_confidence=_as_float("BOT_STAGE2_MIN_AI_CONFIDENCE", 0.55),

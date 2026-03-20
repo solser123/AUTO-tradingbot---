@@ -11,7 +11,7 @@ from .config import BotConfig
 from .execution_router import ExecutionRouter
 from .exchange import BinanceExchange
 from .external_sources import fetch_blockmedia_news, fetch_tradingview_ideas
-from .models import Position, TradeSignal
+from .models import AIScanReview, Position, TradeSignal
 from .macro import adjust_sizing_for_macro, build_macro_risk_overlay, get_upcoming_macro_events
 from .notifier import TelegramNotifier
 from .opportunity import analyze_pending_opportunities
@@ -180,20 +180,81 @@ class TradingEngine:
         scan = scan_market(symbol, execution_df, higher_df, self.config)
         signal = scan.signal
         horizon_context = self._build_horizon_context(symbol, execution_df, higher_df, scan)
+        sector_context = self._sector_context(symbol)
+        microstructure = self.exchange.fetch_microstructure(
+            symbol,
+            depth=self.config.microstructure_orderbook_depth,
+            trade_limit=self.config.microstructure_trade_limit,
+        )
+        external_context = {
+            "long": self.store.get_external_alignment(symbol, "long", hours=36),
+            "short": self.store.get_external_alignment(symbol, "short", hours=36),
+        }
+        ai_scan_review: AIScanReview | None = None
         if signal is None:
             recovered_signal = None
             if self.config.enable_context_recovery:
                 recovered_signal = self._build_context_recovery_signal(symbol, scan, horizon_context)
-            if recovered_signal is not None:
-                signal = recovered_signal
+            if self._should_run_ai_scan(scan, recovered_signal):
+                ai_scan_review = self.ai_validator.review_scan(
+                    symbol=symbol,
+                    scan=scan,
+                    horizon_context=horizon_context,
+                    external_context=external_context,
+                    sector_context=sector_context,
+                    microstructure=microstructure,
+                )
+            if recovered_signal is not None and ai_scan_review is not None and ai_scan_review.approved:
+                signal = self._apply_ai_scan_signal_overrides(recovered_signal, ai_scan_review, scan)
                 self.store.log_decision(
                     symbol=symbol,
                     mode=self.config.mode,
-                    stage="context_recovery",
+                    stage="ai_scan_assist",
                     outcome="triggered",
-                    detail=f"Context recovery promoted {signal.side} entry candidate.",
-                    payload={"signal": signal.strategy_data, "reasons": scan.reasons[:8]},
+                    detail=f"AI-assisted recovery promoted {signal.side} entry candidate.",
+                    payload={
+                        "signal": signal.strategy_data,
+                        "reasons": scan.reasons[:8],
+                        "ai_scan_review": {
+                            "approved": ai_scan_review.approved,
+                            "confidence": ai_scan_review.confidence,
+                            "suggested_side": ai_scan_review.suggested_side,
+                            "setup_bias": ai_scan_review.setup_bias,
+                            "reason": ai_scan_review.reason,
+                            "committee": ai_scan_review.committee,
+                        },
+                    },
                 )
+            elif ai_scan_review is not None and ai_scan_review.approved:
+                signal = self._build_ai_assisted_signal(
+                    symbol=symbol,
+                    scan=scan,
+                    horizon_context=horizon_context,
+                    external_context=external_context,
+                    sector_context=sector_context,
+                    microstructure=microstructure,
+                    review=ai_scan_review,
+                )
+                if signal is not None:
+                    self.store.log_decision(
+                        symbol=symbol,
+                        mode=self.config.mode,
+                        stage="ai_scan_assist",
+                        outcome="triggered",
+                        detail=f"AI exploratory {signal.side} candidate promoted before hard confirmation.",
+                        payload={
+                            "signal": signal.strategy_data,
+                            "reasons": scan.reasons[:8],
+                            "ai_scan_review": {
+                                "approved": ai_scan_review.approved,
+                                "confidence": ai_scan_review.confidence,
+                                "suggested_side": ai_scan_review.suggested_side,
+                                "setup_bias": ai_scan_review.setup_bias,
+                                "reason": ai_scan_review.reason,
+                                "committee": ai_scan_review.committee,
+                            },
+                        },
+                    )
             else:
                 detail = " | ".join(scan.reasons[:3]) if scan.reasons else "No rule-based setup."
                 logging.info("%s: no rule-based setup. %s", symbol, detail)
@@ -213,21 +274,77 @@ class TradingEngine:
                         detail=detail,
                         payload={"metrics": scan.metrics, "reasons": scan.reasons[:8]},
                     )
+                if ai_scan_review is not None:
+                    self.store.log_decision(
+                        symbol=symbol,
+                        mode=self.config.mode,
+                        stage="ai_scan_assist",
+                        outcome="watch_only" if ai_scan_review.reason.startswith("AI scan assist disabled") else "rejected",
+                        detail=ai_scan_review.reason,
+                        payload={
+                            "metrics": scan.metrics,
+                            "reasons": scan.reasons[:8],
+                            "ai_scan_review": {
+                                "approved": ai_scan_review.approved,
+                                "confidence": ai_scan_review.confidence,
+                                "suggested_side": ai_scan_review.suggested_side,
+                                "setup_bias": ai_scan_review.setup_bias,
+                                "committee": ai_scan_review.committee,
+                            },
+                        },
+                    )
+                return
+            if signal is None:
+                detail = (
+                    ai_scan_review.reason
+                    if ai_scan_review is not None
+                    else (" | ".join(scan.reasons[:3]) if scan.reasons else "No rule-based setup.")
+                )
+                self.store.log_decision(
+                    symbol=symbol,
+                    mode=self.config.mode,
+                    stage="ai_scan_assist",
+                    outcome="rejected",
+                    detail=detail,
+                    payload={
+                        "metrics": scan.metrics,
+                        "reasons": scan.reasons[:8],
+                        "ai_scan_review": {
+                            "approved": ai_scan_review.approved if ai_scan_review is not None else False,
+                            "confidence": ai_scan_review.confidence if ai_scan_review is not None else 0.0,
+                            "suggested_side": ai_scan_review.suggested_side if ai_scan_review is not None else "none",
+                            "setup_bias": ai_scan_review.setup_bias if ai_scan_review is not None else "neutral",
+                            "committee": ai_scan_review.committee if ai_scan_review is not None else {},
+                        },
+                    },
+                )
                 return
 
         signal.strategy_data["multi_horizon"] = horizon_context
-        external_alignment = self.store.get_external_alignment(symbol, signal.side, hours=36)
+        if self.config.ai_scan_assist and ai_scan_review is None:
+            ai_scan_review = self.ai_validator.review_scan(
+                symbol=symbol,
+                scan=scan,
+                horizon_context=horizon_context,
+                external_context=external_context,
+                sector_context=sector_context,
+                microstructure=microstructure,
+            )
+        external_alignment = external_context.get(signal.side, self.store.get_external_alignment(symbol, signal.side, hours=36))
         signal.strategy_data["external_alignment"] = external_alignment
-        sector_context = self._sector_context(symbol)
         signal.strategy_data["sector"] = sector_context["sector"]
         signal.strategy_data["sector_label"] = sector_context["label"]
         signal.strategy_data["sector_context"] = sector_context
-        microstructure = self.exchange.fetch_microstructure(
-            symbol,
-            depth=self.config.microstructure_orderbook_depth,
-            trade_limit=self.config.microstructure_trade_limit,
-        )
         signal.strategy_data["microstructure"] = microstructure
+        if ai_scan_review is not None:
+            signal.strategy_data["ai_scan_review"] = {
+                "approved": ai_scan_review.approved,
+                "confidence": ai_scan_review.confidence,
+                "suggested_side": ai_scan_review.suggested_side,
+                "setup_bias": ai_scan_review.setup_bias,
+                "reason": ai_scan_review.reason,
+                "committee": ai_scan_review.committee,
+            }
         same_side_horizons = int(horizon_context.get("same_side_count", 0))
         opposite_horizons = int(horizon_context.get("opposite_side_count", 0))
         if opposite_horizons >= 2 and same_side_horizons == 0:
@@ -272,6 +389,25 @@ class TradingEngine:
                 outcome="rejected",
                 detail=detail,
                 payload={"external_alignment": external_alignment, "signal": signal.strategy_data},
+            )
+            return
+        if ai_scan_review is not None and not ai_scan_review.approved:
+            self.store.log_decision(
+                symbol=symbol,
+                mode=self.config.mode,
+                stage="ai_scan_gate",
+                outcome="rejected",
+                detail=ai_scan_review.reason,
+                payload={
+                    "signal": signal.strategy_data,
+                    "ai_scan_review": {
+                        "approved": ai_scan_review.approved,
+                        "confidence": ai_scan_review.confidence,
+                        "suggested_side": ai_scan_review.suggested_side,
+                        "setup_bias": ai_scan_review.setup_bias,
+                        "committee": ai_scan_review.committee,
+                    },
+                },
             )
             return
 
@@ -1275,6 +1411,119 @@ class TradingEngine:
                     },
                 )
         return None
+
+    def _should_run_ai_scan(self, scan, recovered_signal: TradeSignal | None) -> bool:
+        if not self.config.ai_scan_assist:
+            return False
+        if scan.signal is not None or recovered_signal is not None:
+            return True
+        _, score = rank_scan(scan, 0.0)
+        if score >= self.config.ai_scan_trigger_score:
+            return True
+        metrics = scan.metrics or {}
+        volume_ratio = float(metrics.get("volume_ratio", 0.0) or 0.0)
+        atr_ratio = float(metrics.get("atr_regime_ratio", 0.0) or 0.0)
+        return bool(metrics) and volume_ratio >= 0.45 and atr_ratio >= 0.65
+
+    def _apply_ai_scan_signal_overrides(self, signal: TradeSignal, review: AIScanReview, scan) -> TradeSignal:
+        confidence_score = max(signal.strategy_data.get("entry_profile_score", 0.44), 0.45 + (review.confidence * 0.18))
+        strategy_data = {
+            **signal.strategy_data,
+            "ai_scan_assisted": True,
+            "ai_scan_reason": review.reason,
+            "ai_scan_confidence": round(review.confidence, 4),
+            "ai_scan_suggested_side": review.suggested_side,
+            "ai_scan_setup_bias": review.setup_bias,
+            "ai_scan_committee": review.committee,
+            "scan_blockers": scan.reasons[:8],
+            "entry_profile_score": round(min(confidence_score, 0.72), 4),
+        }
+        return TradeSignal(
+            symbol=signal.symbol,
+            side=signal.side,
+            entry_price=signal.entry_price,
+            stop_price=signal.stop_price,
+            target_price=signal.target_price,
+            rr=signal.rr,
+            setup_type=signal.setup_type,
+            entry_profile=signal.entry_profile,
+            reason=f"{signal.reason} AI scan assist confirmed early context.",
+            strategy_data=strategy_data,
+        )
+
+    def _build_ai_assisted_signal(
+        self,
+        *,
+        symbol: str,
+        scan,
+        horizon_context: dict[str, object],
+        external_context: dict[str, dict[str, float | int]],
+        sector_context: dict[str, object],
+        microstructure: dict[str, object],
+        review: AIScanReview,
+    ) -> TradeSignal | None:
+        metrics = scan.metrics or {}
+        close = float(metrics.get("close", 0.0) or 0.0)
+        atr = float(metrics.get("atr_14", 0.0) or 0.0)
+        support = float(metrics.get("recent_support", 0.0) or 0.0)
+        resistance = float(metrics.get("recent_resistance", 0.0) or 0.0)
+        side = review.suggested_side
+        if side not in {"long", "short"} or min(close, atr) <= 0:
+            return None
+
+        rr = max(self.config.min_rr, 1.35)
+        if side == "long":
+            structural_stop = support if support > 0 else close - (atr * 1.6)
+            stop = min(close - (atr * 1.4), close * (1 - self.config.max_stop_pct))
+            stop = max(structural_stop, stop)
+            if stop >= close:
+                stop = close - max(atr * 1.2, close * 0.004)
+            risk = close - stop
+            if risk <= 0:
+                return None
+            target = max(close + (risk * rr), resistance if resistance > close else 0.0)
+        else:
+            structural_stop = resistance if resistance > 0 else close + (atr * 1.6)
+            stop = max(close + (atr * 1.4), close * (1 + self.config.max_stop_pct))
+            stop = min(structural_stop, stop)
+            if stop <= close:
+                stop = close + max(atr * 1.2, close * 0.004)
+            risk = stop - close
+            if risk <= 0:
+                return None
+            support_target = support if 0 < support < close else close - (risk * rr)
+            target = min(close - (risk * rr), support_target)
+
+        score = max(0.46, min(0.70, 0.48 + (review.confidence * 0.22)))
+        entry_profile = "conservative" if review.confidence < 0.72 else "balanced"
+        return TradeSignal(
+            symbol=symbol,
+            side=side,
+            entry_price=close,
+            stop_price=stop,
+            target_price=target,
+            rr=rr,
+            setup_type=f"ai_exploratory_{side}",
+            entry_profile=entry_profile,
+            reason=f"AI exploratory {side} entry: technicals are near transition and AI sees early edge.",
+            strategy_data={
+                **metrics,
+                "entry_profile_score": round(score, 4),
+                "entry_profile": entry_profile,
+                "ai_exploratory": True,
+                "ai_scan_assisted": True,
+                "ai_scan_reason": review.reason,
+                "ai_scan_confidence": round(review.confidence, 4),
+                "ai_scan_suggested_side": review.suggested_side,
+                "ai_scan_setup_bias": review.setup_bias,
+                "ai_scan_committee": review.committee,
+                "scan_blockers": scan.reasons[:8],
+                "multi_horizon_preview": horizon_context,
+                "external_context_preview": external_context,
+                "sector_context_preview": sector_context,
+                "microstructure_preview": microstructure,
+            },
+        )
 
     def _quote_volume_map(self) -> dict[str, float]:
         volume_map: dict[str, float] = {}

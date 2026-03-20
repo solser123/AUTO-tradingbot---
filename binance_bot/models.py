@@ -26,6 +26,16 @@ class AIReview:
     committee: dict[str, float | str | bool]
 
 
+@dataclass(frozen=True)
+class AIScanReview:
+    approved: bool
+    confidence: float
+    suggested_side: str
+    setup_bias: str
+    reason: str
+    committee: dict[str, float | str | bool]
+
+
 @dataclass
 class Position:
     symbol: str

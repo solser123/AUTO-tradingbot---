@@ -4,7 +4,7 @@ import json
 from typing import Any
 
 from .config import BotConfig
-from .models import AIReview, TradeSignal
+from .models import AIReview, AIScanReview, MarketScan, TradeSignal
 
 
 def _json_safe(value):
@@ -20,6 +20,25 @@ def _json_safe(value):
         except Exception:
             pass
     return str(value)
+
+
+def _safe_float(value, default: float = 0.0) -> float:
+    try:
+        return float(value)
+    except Exception:
+        return default
+
+
+def _safe_bool(value, default: bool = False) -> bool:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        lowered = value.strip().lower()
+        if lowered in {"true", "1", "yes", "on"}:
+            return True
+        if lowered in {"false", "0", "no", "off"}:
+            return False
+    return default
 
 
 class AIValidator:
@@ -83,18 +102,18 @@ class AIValidator:
             )
             raw = response.choices[0].message.content or "{}"
             parsed = json.loads(raw)
-            confidence = float(parsed.get("confidence", 0.0))
+            confidence = _safe_float(parsed.get("confidence", 0.0), 0.0)
             committee = {
-                "trend_score": max(0.0, min(float(parsed.get("trend_score", 0.0)), 1.0)),
+                "trend_score": max(0.0, min(_safe_float(parsed.get("trend_score", 0.0), 0.0), 1.0)),
                 "trend_reason": str(parsed.get("trend_reason", "")),
-                "risk_score": max(0.0, min(float(parsed.get("risk_score", 0.0)), 1.0)),
+                "risk_score": max(0.0, min(_safe_float(parsed.get("risk_score", 0.0), 0.0), 1.0)),
                 "risk_reason": str(parsed.get("risk_reason", "")),
-                "execution_score": max(0.0, min(float(parsed.get("execution_score", 0.0)), 1.0)),
+                "execution_score": max(0.0, min(_safe_float(parsed.get("execution_score", 0.0), 0.0), 1.0)),
                 "execution_reason": str(parsed.get("execution_reason", "")),
                 "advisory_mode": advisory,
             }
             return AIReview(
-                approved=bool(parsed.get("approved", False)),
+                approved=_safe_bool(parsed.get("approved", False), False),
                 confidence=max(0.0, min(confidence, 1.0)),
                 reason=str(parsed.get("reason", "No reason provided.")),
                 committee=committee,
@@ -104,6 +123,93 @@ class AIValidator:
                 approved=False,
                 confidence=0.0,
                 reason=f"AI validation failed: {exc}",
+                committee={},
+            )
+
+    def review_scan(
+        self,
+        *,
+        symbol: str,
+        scan: MarketScan,
+        horizon_context: dict[str, object],
+        external_context: dict[str, dict[str, float | int]],
+        sector_context: dict[str, object],
+        microstructure: dict[str, object],
+        advisory: bool = False,
+    ) -> AIScanReview:
+        if not self.enabled or self.client is None:
+            return AIScanReview(
+                approved=False,
+                confidence=0.0,
+                suggested_side="none",
+                setup_bias="neutral",
+                reason="AI scan assist disabled.",
+                committee={},
+            )
+
+        prompt = (
+            "You are a crypto pre-signal review committee that works before final trade approval. "
+            "Use technical metrics, no-entry reasons, multi-horizon bias, sector flow, external/news alignment, "
+            "and microstructure together. "
+            "Your job is not to predict perfectly but to detect whether the market is in an actionable early transition "
+            "that deserves either: no trade, long exploratory review, short exploratory review, or confirmed signal support. "
+            "Approve only when there is a plausible early edge versus waiting. "
+            "If the scan has no signal, you may still approve an exploratory setup with smaller size if the context suggests "
+            "the move is starting before rules fully confirm. "
+            "Return strict JSON with keys: approved, confidence, suggested_side, setup_bias, reason, "
+            "trend_score, trend_reason, context_score, context_reason, timing_score, timing_reason."
+        )
+        payload = {
+            "advisory_mode": advisory,
+            "symbol": symbol,
+            "scan_has_signal": scan.signal is not None,
+            "scan_signal_side": scan.signal.side if scan.signal is not None else "none",
+            "scan_reasons": scan.reasons[:8],
+            "scan_metrics": scan.metrics,
+            "horizon_context": horizon_context,
+            "external_context": external_context,
+            "sector_context": sector_context,
+            "microstructure": microstructure,
+        }
+        try:
+            response = self.client.chat.completions.create(
+                model=self.model,
+                messages=[
+                    {"role": "system", "content": prompt},
+                    {"role": "user", "content": json.dumps(_json_safe(payload), ensure_ascii=False)},
+                ],
+                response_format={"type": "json_object"},
+            )
+            raw = response.choices[0].message.content or "{}"
+            parsed = json.loads(raw)
+            suggested_side = str(parsed.get("suggested_side", "none")).strip().lower()
+            if suggested_side not in {"long", "short", "none"}:
+                suggested_side = "none"
+            confidence = max(0.0, min(_safe_float(parsed.get("confidence", 0.0), 0.0), 1.0))
+            committee = {
+                "trend_score": max(0.0, min(_safe_float(parsed.get("trend_score", 0.0), 0.0), 1.0)),
+                "trend_reason": str(parsed.get("trend_reason", "")),
+                "context_score": max(0.0, min(_safe_float(parsed.get("context_score", 0.0), 0.0), 1.0)),
+                "context_reason": str(parsed.get("context_reason", "")),
+                "timing_score": max(0.0, min(_safe_float(parsed.get("timing_score", 0.0), 0.0), 1.0)),
+                "timing_reason": str(parsed.get("timing_reason", "")),
+                "advisory_mode": advisory,
+            }
+            return AIScanReview(
+                approved=_safe_bool(parsed.get("approved", False), False),
+                confidence=confidence,
+                suggested_side=suggested_side,
+                setup_bias=str(parsed.get("setup_bias", "neutral")),
+                reason=str(parsed.get("reason", "No reason provided.")),
+                committee=committee,
+            )
+        except Exception as exc:
+            return AIScanReview(
+                approved=False,
+                confidence=0.0,
+                suggested_side="none",
+                setup_bias="neutral",
+                reason=f"AI scan review failed: {exc}",
                 committee={},
             )
 
