@@ -148,6 +148,25 @@ class StateStore:
                 )
                 """
             )
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS sector_flow_snapshots (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    snapshot_at TEXT NOT NULL,
+                    sector TEXT NOT NULL,
+                    direction TEXT NOT NULL,
+                    flow_score REAL NOT NULL,
+                    avg_short_return_pct REAL NOT NULL,
+                    avg_medium_return_pct REAL NOT NULL,
+                    avg_volume_ratio REAL NOT NULL,
+                    liquidity_usdt REAL NOT NULL,
+                    symbol_count INTEGER NOT NULL,
+                    leaders_json TEXT NOT NULL,
+                    payload_json TEXT NOT NULL,
+                    UNIQUE(snapshot_at, sector)
+                )
+                """
+            )
             columns = {row["name"] for row in conn.execute("PRAGMA table_info(positions)").fetchall()}
             if columns and "realized_pnl" not in columns:
                 conn.execute("ALTER TABLE positions ADD COLUMN realized_pnl REAL")
@@ -630,6 +649,99 @@ class StateStore:
             "community_score": (community / community_count) if community_count else 0.0,
             "news_score": (news / news_count) if news_count else 0.0,
         }
+
+    def log_sector_flow_snapshot(self, snapshot: dict) -> None:
+        with self._connect() as conn:
+            conn.execute(
+                """
+                INSERT OR REPLACE INTO sector_flow_snapshots (
+                    snapshot_at, sector, direction, flow_score, avg_short_return_pct,
+                    avg_medium_return_pct, avg_volume_ratio, liquidity_usdt, symbol_count,
+                    leaders_json, payload_json
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    str(snapshot["snapshot_at"]),
+                    str(snapshot["sector"]),
+                    str(snapshot["direction"]),
+                    float(snapshot["flow_score"]),
+                    float(snapshot["avg_short_return_pct"]),
+                    float(snapshot["avg_medium_return_pct"]),
+                    float(snapshot["avg_volume_ratio"]),
+                    float(snapshot["liquidity_usdt"]),
+                    int(snapshot["symbol_count"]),
+                    json.dumps(snapshot.get("leaders", []), ensure_ascii=False),
+                    json.dumps(snapshot.get("payload", {}), ensure_ascii=False),
+                ),
+            )
+
+    def get_latest_sector_flow(self, sector: str) -> dict[str, object]:
+        query = """
+                SELECT *
+                FROM sector_flow_snapshots
+                WHERE sector = ?
+                ORDER BY snapshot_at DESC, id DESC
+                LIMIT 1
+                """
+        with self._connect() as conn:
+            row = conn.execute(query, (sector,)).fetchone()
+        if row is None:
+            return {
+                "sector": sector,
+                "direction": "neutral",
+                "flow_score": 0.0,
+                "avg_short_return_pct": 0.0,
+                "avg_medium_return_pct": 0.0,
+                "avg_volume_ratio": 0.0,
+                "liquidity_usdt": 0.0,
+                "symbol_count": 0,
+                "leaders": [],
+            }
+        return {
+            "sector": str(row["sector"]),
+            "direction": str(row["direction"]),
+            "flow_score": float(row["flow_score"]),
+            "avg_short_return_pct": float(row["avg_short_return_pct"]),
+            "avg_medium_return_pct": float(row["avg_medium_return_pct"]),
+            "avg_volume_ratio": float(row["avg_volume_ratio"]),
+            "liquidity_usdt": float(row["liquidity_usdt"]),
+            "symbol_count": int(row["symbol_count"]),
+            "leaders": json.loads(row["leaders_json"] or "[]"),
+            "snapshot_at": str(row["snapshot_at"]),
+        }
+
+    def get_latest_sector_flows(self, limit: int = 8) -> list[dict[str, object]]:
+        query = """
+                SELECT s.*
+                FROM sector_flow_snapshots s
+                INNER JOIN (
+                    SELECT sector, MAX(id) AS max_id
+                    FROM sector_flow_snapshots
+                    GROUP BY sector
+                ) latest
+                    ON latest.max_id = s.id
+                ORDER BY ABS(s.flow_score) DESC, s.liquidity_usdt DESC
+                LIMIT ?
+                """
+        with self._connect() as conn:
+            rows = conn.execute(query, (limit,)).fetchall()
+        result: list[dict[str, object]] = []
+        for row in rows:
+            result.append(
+                {
+                    "sector": str(row["sector"]),
+                    "direction": str(row["direction"]),
+                    "flow_score": float(row["flow_score"]),
+                    "avg_short_return_pct": float(row["avg_short_return_pct"]),
+                    "avg_medium_return_pct": float(row["avg_medium_return_pct"]),
+                    "avg_volume_ratio": float(row["avg_volume_ratio"]),
+                    "liquidity_usdt": float(row["liquidity_usdt"]),
+                    "symbol_count": int(row["symbol_count"]),
+                    "leaders": json.loads(row["leaders_json"] or "[]"),
+                    "snapshot_at": str(row["snapshot_at"]),
+                }
+            )
+        return result
 
     def get_unreviewed_no_entry_decisions(
         self,

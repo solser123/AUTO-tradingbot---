@@ -132,6 +132,14 @@ class BotConfig:
     enable_context_recovery: bool
     context_recovery_external_min: float
     context_recovery_external_count_min: int
+    enable_sector_flow: bool
+    sector_sync_interval_minutes: int
+    sector_flow_positive_threshold: float
+    sector_flow_negative_threshold: float
+    sector_opposition_gate_threshold: float
+    sector_alignment_notional_boost_pct: float
+    sector_alignment_ai_relief: float
+    sector_min_liquidity_usdt: float
     paper_start_balance: float
     backtest_limit: int
     long_rsi_min: float
@@ -377,6 +385,14 @@ class BotConfig:
             enable_context_recovery=_as_bool(os.getenv("BOT_ENABLE_CONTEXT_RECOVERY"), True),
             context_recovery_external_min=_as_float("BOT_CONTEXT_RECOVERY_EXTERNAL_MIN", 0.10),
             context_recovery_external_count_min=_as_int("BOT_CONTEXT_RECOVERY_EXTERNAL_COUNT_MIN", 4),
+            enable_sector_flow=_as_bool(os.getenv("BOT_ENABLE_SECTOR_FLOW"), True),
+            sector_sync_interval_minutes=_as_int("BOT_SECTOR_SYNC_INTERVAL_MINUTES", 15),
+            sector_flow_positive_threshold=_as_float("BOT_SECTOR_FLOW_POSITIVE_THRESHOLD", 0.18),
+            sector_flow_negative_threshold=_as_float("BOT_SECTOR_FLOW_NEGATIVE_THRESHOLD", -0.18),
+            sector_opposition_gate_threshold=_as_float("BOT_SECTOR_OPPOSITION_GATE_THRESHOLD", 0.30),
+            sector_alignment_notional_boost_pct=_as_float("BOT_SECTOR_ALIGNMENT_NOTIONAL_BOOST_PCT", 0.15),
+            sector_alignment_ai_relief=_as_float("BOT_SECTOR_ALIGNMENT_AI_RELIEF", 0.03),
+            sector_min_liquidity_usdt=_as_float("BOT_SECTOR_MIN_LIQUIDITY_USDT", 10000000.0),
             paper_start_balance=_as_float("BOT_PAPER_START_BALANCE", 1000.0),
             backtest_limit=_as_int("BOT_BACKTEST_LIMIT", 300),
             long_rsi_min=_as_float("BOT_LONG_RSI_MIN", 46.0),

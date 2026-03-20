@@ -87,6 +87,7 @@ def run_doctor() -> int:
     checks.append(("stage2", True, f"s2={','.join(config.stage2_symbols) or 'none'} notional={config.stage2_notional:.2f} ai={config.stage2_min_ai_confidence:.2f}"))
     checks.append(("stage3", True, f"s3={','.join(config.stage3_symbols) or 'none'} notional={config.stage3_notional:.2f} ai={config.stage3_min_ai_confidence:.2f}"))
     checks.append(("stage4", True, f"s4={','.join(config.stage4_symbols) or 'none'} notional={config.stage4_notional:.2f} ai={config.stage4_min_ai_confidence:.2f}"))
+    checks.append(("sector-flow", True, f"enabled={config.enable_sector_flow} sync={config.sector_sync_interval_minutes}m boost={config.sector_alignment_notional_boost_pct:.0%}"))
     if config.research_symbols:
         checks.append(("research-symbols", True, f"research={', '.join(config.research_symbols)}"))
     checks.append(("database", True, f"db={config.database_path}"))

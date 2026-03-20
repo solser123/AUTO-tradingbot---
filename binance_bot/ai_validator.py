@@ -35,6 +35,7 @@ class AIValidator:
             "Reviewer 1 is Trend, Reviewer 2 is Risk, Reviewer 3 is Execution Timing. "
             "Each reviewer must independently score the candidate from 0.0 to 1.0 and explain briefly. "
             "Use short-term, medium-term, and long-term horizon context together. "
+            "Also use sector flow / capital rotation context if it is present in strategy_data. "
             "Short-term is for timing, medium-term is for continuation quality, long-term is for structural bias. "
             "Approve only if the setup has clear edge, not just a signal. "
             "Reject trades that are late, stretched, noisy, reversal-prone, weak on follow-through, "

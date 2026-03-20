@@ -15,6 +15,7 @@ from .notifier import TelegramNotifier
 from .opportunity import analyze_pending_opportunities
 from .research import latest_universe_candidates, recent_listing_candidates
 from .risk import RiskManager
+from .sectors import sector_for_symbol, sector_label
 from .selector import build_exit_roadmap, default_candidate_symbols, rank_scan
 from .storage import StateStore, trading_day_anchor, trading_week_anchor
 from .strategy import scan_market, should_exit
@@ -75,7 +76,7 @@ class TradingEngine:
             f"[BOT START] mode={self.config.mode} "
             f"market={'USDT-M futures' if self.config.is_futures else 'spot'} "
             f"symbols={preview}\n"
-            f"cmd=/help /status /positions /pause /resume /rank /stage /research /research-news /opportunity BTC /scan BTC /summary /closeall /stopbot"
+            f"cmd=/help /status /positions /pause /resume /rank /stage /research /sectors /research-news /opportunity BTC /scan BTC /summary /closeall /stopbot"
         )
         while True:
             if self._process_telegram_commands():
@@ -104,7 +105,7 @@ class TradingEngine:
             f"[BOT START] mode={self.config.mode} "
             f"market={'USDT-M futures' if self.config.is_futures else 'spot'} "
             f"duration_seconds={duration_seconds} symbols={preview}\n"
-            f"cmd=/help /status /positions /pause /resume /rank /stage /research /research-news /opportunity BTC /scan BTC /summary /closeall /stopbot"
+            f"cmd=/help /status /positions /pause /resume /rank /stage /research /sectors /research-news /opportunity BTC /scan BTC /summary /closeall /stopbot"
         )
         while time.time() < end_time:
             if self._process_telegram_commands():
@@ -123,6 +124,7 @@ class TradingEngine:
         account_equity = self._account_equity(reference_time)
         self._refresh_reference_equity(account_equity, reference_time)
         self._sync_external_research(reference_time)
+        self._sync_sector_flows(reference_time)
         self._sync_opportunity_reviews(reference_time)
         self._reconcile_live_positions()
         emergency_active, emergency_reason = self.store.is_emergency_stop()
@@ -206,6 +208,10 @@ class TradingEngine:
         signal.strategy_data["multi_horizon"] = horizon_context
         external_alignment = self.store.get_external_alignment(symbol, signal.side, hours=36)
         signal.strategy_data["external_alignment"] = external_alignment
+        sector_context = self._sector_context(symbol)
+        signal.strategy_data["sector"] = sector_context["sector"]
+        signal.strategy_data["sector_label"] = sector_context["label"]
+        signal.strategy_data["sector_context"] = sector_context
         same_side_horizons = int(horizon_context.get("same_side_count", 0))
         opposite_horizons = int(horizon_context.get("opposite_side_count", 0))
         if opposite_horizons >= 2 and same_side_horizons == 0:
@@ -217,6 +223,17 @@ class TradingEngine:
                 outcome="rejected",
                 detail=detail,
                 payload={"multi_horizon": horizon_context, "signal": signal.strategy_data},
+            )
+            return
+        if self._sector_blocks_signal(signal.side, sector_context):
+            detail = "Sector flow is materially against this trade."
+            self.store.log_decision(
+                symbol=symbol,
+                mode=self.config.mode,
+                stage="sector_gate",
+                outcome="rejected",
+                detail=detail,
+                payload={"sector_context": sector_context, "signal": signal.strategy_data},
             )
             return
         if int(external_alignment.get("count", 0)) >= 4 and float(external_alignment.get("alignment_score", 0.0)) <= -0.25:
@@ -274,7 +291,7 @@ class TradingEngine:
             )
             return
 
-        initial_notional = self._notional_for_profile(symbol, signal.entry_profile)
+        initial_notional = self._notional_for_profile(symbol, signal.entry_profile, signal.side, sector_context)
         quantity_estimate = initial_notional / signal.entry_price
         quantity_allowed, quantity, quantity_reason = self.exchange.validate_order_quantity(
             symbol,
@@ -350,6 +367,7 @@ class TradingEngine:
                 "entry_profile": signal.entry_profile,
                 "symbol_stage": self.config.stage_for_symbol(symbol),
                 "base_notional": initial_notional,
+                "sector_context": sector_context,
                 "ai_confidence": review.confidence,
                 "committee": review.committee,
                 "signal": signal.strategy_data,
@@ -400,13 +418,23 @@ class TradingEngine:
             if global_streak >= self.config.global_stoploss_limit:
                 self.notifier.send(f"[REVIEW MODE] global stop-loss streak={global_streak}")
 
-    def _notional_for_profile(self, symbol: str, profile: str) -> float:
+    def _notional_for_profile(
+        self,
+        symbol: str,
+        profile: str,
+        side: str,
+        sector_context: dict[str, object] | None = None,
+    ) -> float:
         base_notional = self.config.stage_notional(symbol)
         if profile == "aggressive":
-            return base_notional
-        if profile == "balanced":
-            return base_notional * 0.75
-        return base_notional * 0.5
+            notional = base_notional
+        elif profile == "balanced":
+            notional = base_notional * 0.75
+        else:
+            notional = base_notional * 0.5
+        if self.config.stage_for_symbol(symbol) >= 2 and self._sector_supports_side(side, sector_context):
+            notional *= 1.0 + self.config.sector_alignment_notional_boost_pct
+        return notional
 
     def _defense_triggers(self, side: str, entry_price: float, risk_distance: float) -> tuple[float, float]:
         if side == "long":
@@ -621,6 +649,7 @@ class TradingEngine:
                 "/rank 후보 상위 5개\n"
                 "/stage 레버리지 단계 보고\n"
                 "/research 연구 후보 스냅샷\n"
+                "/sectors 섹터 자금 흐름\n"
                 "/research-news 외부 뉴스/아이디어 요약\n"
                 "/opportunity BTC 놓친 자리 분석\n"
                 "/scan BTC 특정 심볼 스캔\n"
@@ -654,6 +683,9 @@ class TradingEngine:
 
         if command == "/research":
             return self._format_research_snapshot(), False
+
+        if command == "/sectors":
+            return self._format_sector_flows(), False
 
         if command == "/research-news":
             return self._format_research_news(), False
@@ -699,6 +731,11 @@ class TradingEngine:
         emergency_active, emergency_reason = self.store.is_emergency_stop()
         equity = self.store.get_state("last_known_equity") or "0"
         paused = "on" if self._entries_paused() else "off"
+        sectors = self.store.get_latest_sector_flows(limit=3)
+        sector_text = ", ".join(
+            f"{sector_label(str(item['sector']))}:{float(item['flow_score']):.2f}"
+            for item in sectors
+        ) or "none"
         return (
             f"status mode={self.config.mode}\n"
             f"paused={paused} emergency={emergency_active}\n"
@@ -706,6 +743,7 @@ class TradingEngine:
             f"open={summary['open_positions']} closed={summary['closed_positions']}\n"
             f"signals={summary['total_signals']} approved={summary['approved_signals']}\n"
             f"realized_pnl={summary['realized_pnl']:.4f} win_rate={summary['win_rate']:.2f}%\n"
+            f"sectors={sector_text}\n"
             f"reason={emergency_reason or 'none'}"
         )
 
@@ -752,17 +790,21 @@ class TradingEngine:
         lines = ["top candidates"]
         for row in rows:
             scan = row["scan"]
+            sector = sector_for_symbol(str(row["symbol"]))
+            sector_ctx = self.store.get_latest_sector_flow(sector)
             if scan.signal is not None:
                 signal = scan.signal
                 roadmap = build_exit_roadmap(signal.entry_price, signal.stop_price, signal.target_price, self.config.max_hold_minutes)
                 lines.append(
                     f"{row['symbol']} signal {signal.side} {signal.entry_profile} "
-                    f"entry={signal.entry_price:.4f} stop={roadmap['stop_pct']}% target={roadmap['target_pct']}%"
+                    f"entry={signal.entry_price:.4f} stop={roadmap['stop_pct']}% target={roadmap['target_pct']}% "
+                    f"sector={sector_label(sector)}:{float(sector_ctx['flow_score']):.2f}"
                 )
             else:
                 lines.append(
                     f"{row['symbol']} watch score={row['score']:.2f} "
-                    f"rsi={scan.metrics.get('rsi_14')} vol={scan.metrics.get('volume_ratio')}"
+                    f"rsi={scan.metrics.get('rsi_14')} vol={scan.metrics.get('volume_ratio')} "
+                    f"sector={sector_label(sector)}:{float(sector_ctx['flow_score']):.2f}"
                 )
         return "\n".join(lines)
 
@@ -799,20 +841,45 @@ class TradingEngine:
     def _format_research_snapshot(self) -> str:
         backtest = latest_universe_candidates(Path("logs"), limit=8, min_trades=2)
         recent = recent_listing_candidates(self.exchange, limit=8, lookback_days=180)
+        sectors = self.store.get_latest_sector_flows(limit=5)
+        sector_lines = ",".join(
+            f"{sector_label(str(item['sector']))}:{str(item['direction'])}:{float(item['flow_score']):.2f}"
+            for item in sectors
+        ) or "none"
         return (
             "research snapshot\n"
             f"backtest={','.join(backtest) or 'none'}\n"
-            f"recent={','.join(recent) or 'none'}"
+            f"recent={','.join(recent) or 'none'}\n"
+            f"sectors={sector_lines}"
         )
 
     def _format_research_news(self) -> str:
         rows = self.store.get_recent_external_items(limit=8, hours=36)
         if not rows:
             return "research news\nno external items yet"
-        lines = ["research news"]
+        sectors = self.store.get_latest_sector_flows(limit=3)
+        sector_text = ", ".join(
+            f"{sector_label(str(item['sector']))}:{str(item['direction'])}:{float(item['flow_score']):.2f}"
+            for item in sectors
+        ) or "none"
+        lines = ["research news", f"top_sectors={sector_text}"]
         for row in rows:
             lines.append(
                 f"{row['source']} {row['direction']} {row['title'][:70]}"
+            )
+        return "\n".join(lines)
+
+    def _format_sector_flows(self) -> str:
+        rows = self.store.get_latest_sector_flows(limit=8)
+        if not rows:
+            return "sector flows\nno sector data yet"
+        lines = ["sector flows"]
+        for row in rows:
+            leaders = [str(item.get("symbol", "")) for item in list(row.get("leaders", []))[:2] if item.get("symbol")]
+            leader_text = ",".join(leaders) or "none"
+            lines.append(
+                f"{sector_label(str(row['sector']))} {row['direction']} score={float(row['flow_score']):.2f} "
+                f"liq={float(row['liquidity_usdt']):.0f} count={int(row['symbol_count'])} leaders={leader_text}"
             )
         return "\n".join(lines)
 
@@ -857,13 +924,15 @@ class TradingEngine:
         horizons = self._build_horizon_context(resolved, execution_df, higher_df, scan)
         side = scan.signal.side if scan.signal is not None else "long"
         external = self.store.get_external_alignment(resolved, side, hours=36)
+        sector_ctx = self._sector_context(resolved)
         if scan.signal is None:
             return (
                 f"{resolved}\nno signal\n"
                 + "\n".join(scan.reasons[:5])
                 + "\n"
                 + f"bias short={horizons['short']['bias']} mid={horizons['medium']['bias']} long={horizons['long']['bias']}\n"
-                + f"external count={external['count']} align={float(external['alignment_score']):.2f}"
+                + f"external count={external['count']} align={float(external['alignment_score']):.2f}\n"
+                + f"sector={sector_ctx['label']} flow={float(sector_ctx['flow_score']):.2f} direction={sector_ctx['direction']}"
             )
         signal = scan.signal
         roadmap = build_exit_roadmap(signal.entry_price, signal.stop_price, signal.target_price, self.config.max_hold_minutes)
@@ -874,7 +943,8 @@ class TradingEngine:
             f"stop_pct={roadmap['stop_pct']} target_pct={roadmap['target_pct']} rr={signal.rr:.2f}\n"
             f"bias short={horizons['short']['bias']} mid={horizons['medium']['bias']} long={horizons['long']['bias']}\n"
             f"external count={external['count']} align={float(external['alignment_score']):.2f} "
-            f"community={float(external['community_score']):.2f} news={float(external['news_score']):.2f}"
+            f"community={float(external['community_score']):.2f} news={float(external['news_score']):.2f}\n"
+            f"sector={sector_ctx['label']} flow={float(sector_ctx['flow_score']):.2f} direction={sector_ctx['direction']}"
         )
 
     def _rank_rows(self) -> list[dict[str, object]]:
@@ -1069,6 +1139,167 @@ class TradingEngine:
                     },
                 )
         return None
+
+    def _quote_volume_map(self) -> dict[str, float]:
+        volume_map: dict[str, float] = {}
+        if not self.config.is_futures:
+            return volume_map
+        try:
+            for item in self.exchange.client.fapiPublicGetTicker24hr():
+                symbol_id = item.get("symbol", "")
+                if not symbol_id.endswith("USDT"):
+                    continue
+                volume_map[f"{symbol_id[:-4]}/USDT:USDT"] = float(item.get("quoteVolume") or 0.0)
+        except Exception:
+            return {}
+        return volume_map
+
+    def _sector_context(self, symbol: str) -> dict[str, object]:
+        sector = sector_for_symbol(symbol)
+        context = self.store.get_latest_sector_flow(sector)
+        context["sector"] = sector
+        context["label"] = sector_label(sector)
+        return context
+
+    def _sector_supports_side(self, side: str, sector_context: dict[str, object] | None) -> bool:
+        if not self.config.enable_sector_flow or not sector_context:
+            return False
+        flow_score = float(sector_context.get("flow_score", 0.0) or 0.0)
+        liquidity = float(sector_context.get("liquidity_usdt", 0.0) or 0.0)
+        if liquidity < self.config.sector_min_liquidity_usdt:
+            return False
+        if side == "long":
+            return flow_score >= self.config.sector_flow_positive_threshold
+        return flow_score <= self.config.sector_flow_negative_threshold
+
+    def _sector_blocks_signal(self, side: str, sector_context: dict[str, object] | None) -> bool:
+        if not self.config.enable_sector_flow or not sector_context:
+            return False
+        flow_score = float(sector_context.get("flow_score", 0.0) or 0.0)
+        symbol_count = int(sector_context.get("symbol_count", 0) or 0)
+        if symbol_count < 2:
+            return False
+        if side == "long":
+            return flow_score <= (-1.0 * self.config.sector_opposition_gate_threshold)
+        return flow_score >= self.config.sector_opposition_gate_threshold
+
+    def _sync_sector_flows(self, reference_time: datetime) -> None:
+        if not self.config.enable_sector_flow:
+            return
+        last_sync = self.store.get_state("sector_flow_sync_at")
+        if last_sync:
+            try:
+                parsed = datetime.fromisoformat(last_sync)
+                if parsed.tzinfo is None:
+                    parsed = parsed.replace(tzinfo=timezone.utc)
+                elapsed = (reference_time.astimezone(timezone.utc) - parsed).total_seconds()
+                if elapsed < max(self.config.sector_sync_interval_minutes, 1) * 60:
+                    return
+            except Exception:
+                pass
+
+        universe = list(
+            dict.fromkeys(
+                self.config.live_symbols()
+                + self.config.candidate_symbols
+                + self.config.overflow_symbols
+            )
+        )
+        if not universe:
+            return
+
+        volume_map = self._quote_volume_map()
+        grouped: dict[str, list[dict[str, float | str]]] = {}
+        for symbol in self.exchange.resolve_symbols(universe):
+            sector = sector_for_symbol(symbol)
+            try:
+                execution_df = self.exchange.fetch_ohlcv(symbol, self.config.timeframe)
+                higher_df = self.exchange.fetch_ohlcv(symbol, self.config.higher_timeframe)
+            except Exception:
+                continue
+            if execution_df is None or higher_df is None or len(execution_df) < 20 or len(higher_df) < 6:
+                continue
+            try:
+                close_now = float(execution_df["close"].iloc[-1])
+                close_then = float(execution_df["close"].iloc[-5])
+                high_close_now = float(higher_df["close"].iloc[-1])
+                high_close_then = float(higher_df["close"].iloc[-4])
+                last_volume = float(execution_df["volume"].iloc[-1])
+                avg_volume = float(execution_df["volume"].tail(20).mean())
+            except Exception:
+                continue
+            if min(close_now, close_then, high_close_now, high_close_then) <= 0:
+                continue
+            grouped.setdefault(sector, []).append(
+                {
+                    "symbol": symbol,
+                    "short_return_pct": ((close_now / close_then) - 1.0) * 100.0,
+                    "medium_return_pct": ((high_close_now / high_close_then) - 1.0) * 100.0,
+                    "volume_ratio": (last_volume / avg_volume) if avg_volume > 0 else 0.0,
+                    "liquidity_usdt": float(volume_map.get(symbol, 0.0) or 0.0),
+                }
+            )
+
+        if not grouped:
+            return
+
+        snapshot_at = datetime.now(timezone.utc).replace(second=0, microsecond=0).isoformat()
+        logged = 0
+        for sector, rows in grouped.items():
+            avg_short = sum(float(item["short_return_pct"]) for item in rows) / len(rows)
+            avg_medium = sum(float(item["medium_return_pct"]) for item in rows) / len(rows)
+            avg_volume_ratio = sum(float(item["volume_ratio"]) for item in rows) / len(rows)
+            liquidity = sum(float(item["liquidity_usdt"]) for item in rows)
+            positive = sum(
+                1 for item in rows
+                if float(item["short_return_pct"]) > 0 and float(item["medium_return_pct"]) > 0
+            )
+            negative = sum(
+                1 for item in rows
+                if float(item["short_return_pct"]) < 0 and float(item["medium_return_pct"]) < 0
+            )
+            breadth = (positive - negative) / max(len(rows), 1)
+            flow_score = (
+                max(-0.60, min(0.60, avg_short / 3.0))
+                + max(-0.45, min(0.45, avg_medium / 4.0))
+                + max(-0.30, min(0.30, (avg_volume_ratio - 1.0) * 0.30))
+                + max(-0.25, min(0.25, breadth * 0.25))
+            )
+            direction = "neutral"
+            if flow_score >= self.config.sector_flow_positive_threshold:
+                direction = "bullish"
+            elif flow_score <= self.config.sector_flow_negative_threshold:
+                direction = "bearish"
+            leaders = sorted(
+                rows,
+                key=lambda item: abs(float(item["short_return_pct"])) + abs(float(item["medium_return_pct"])),
+                reverse=True,
+            )[:3]
+            self.store.log_sector_flow_snapshot(
+                {
+                    "snapshot_at": snapshot_at,
+                    "sector": sector,
+                    "direction": direction,
+                    "flow_score": flow_score,
+                    "avg_short_return_pct": avg_short,
+                    "avg_medium_return_pct": avg_medium,
+                    "avg_volume_ratio": avg_volume_ratio,
+                    "liquidity_usdt": liquidity,
+                    "symbol_count": len(rows),
+                    "leaders": leaders,
+                    "payload": {"breadth": breadth},
+                }
+            )
+            logged += 1
+        self.store.set_state("sector_flow_sync_at", datetime.now(timezone.utc).isoformat())
+        self.store.log_decision(
+            symbol="SYSTEM",
+            mode=self.config.mode,
+            stage="sector_flow_sync",
+            outcome="updated",
+            detail=f"Sector flow sync completed for {logged} sectors.",
+            payload={"sectors": logged},
+        )
 
     def _close_all_positions(self) -> str:
         positions = self.store.get_open_positions(self.config.mode)
