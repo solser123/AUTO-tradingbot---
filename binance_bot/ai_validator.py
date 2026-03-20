@@ -186,6 +186,9 @@ class AIValidator:
             if suggested_side not in {"long", "short", "none"}:
                 suggested_side = "none"
             confidence = max(0.0, min(_safe_float(parsed.get("confidence", 0.0), 0.0), 1.0))
+            approved = _safe_bool(parsed.get("approved", False), False)
+            if suggested_side == "none":
+                approved = False
             committee = {
                 "trend_score": max(0.0, min(_safe_float(parsed.get("trend_score", 0.0), 0.0), 1.0)),
                 "trend_reason": str(parsed.get("trend_reason", "")),
@@ -196,7 +199,7 @@ class AIValidator:
                 "advisory_mode": advisory,
             }
             return AIScanReview(
-                approved=_safe_bool(parsed.get("approved", False), False),
+                approved=approved,
                 confidence=confidence,
                 suggested_side=suggested_side,
                 setup_bias=str(parsed.get("setup_bias", "neutral")),
