@@ -135,8 +135,15 @@ def scan_market(
     atr_value = float(current["atr_14"]) if not math.isnan(float(current["atr_14"])) else 0.0
     candle_is_bullish = float(current["close"]) > float(current["open"])
     candle_is_bearish = float(current["close"]) < float(current["open"])
-    near_vwap_long = float(current["close"]) >= float(current["vwap"]) * 0.997
-    near_vwap_short = float(current["close"]) <= float(current["vwap"]) * 1.003
+    vwap_gap_pct = abs(float(current["close"]) - float(current["vwap"])) / float(current["vwap"]) if float(current["vwap"]) > 0 else 0.0
+    near_vwap_long = (
+        float(current["close"]) >= float(current["vwap"]) * 0.988
+        or (atr_value > 0 and float(current["close"]) >= float(current["vwap"]) - (atr_value * 1.4))
+    )
+    near_vwap_short = (
+        float(current["close"]) <= float(current["vwap"]) * 1.012
+        or (atr_value > 0 and float(current["close"]) <= float(current["vwap"]) + (atr_value * 1.4))
+    )
     short_stoch_aligned = (
         config.short_stoch_min <= float(current["stoch_k"]) <= config.short_stoch_max
         and float(current["stoch_k"]) < float(current["stoch_d"])
@@ -171,6 +178,7 @@ def scan_market(
         "higher_ema_falling": higher_ema_falling,
         "near_vwap_long": near_vwap_long,
         "near_vwap_short": near_vwap_short,
+        "vwap_gap_pct": round(vwap_gap_pct * 100, 2),
     }
 
     def classify_entry_profile(base_score: float) -> str:
@@ -190,12 +198,18 @@ def scan_market(
         and float(current["close"]) > float(current["ema_20"])
         and volume_ratio >= (config.min_volume_ratio * 0.6)
     )
+    permissive_long_stoch = (
+        float(current["stoch_k"]) > float(current["stoch_d"])
+        and float(current["stoch_k"]) <= (config.long_stoch_max + 12)
+    )
+    strong_long_continuation = continuation_long and volume_ratio >= max(config.min_volume_ratio, 0.8)
     early_reversal_long = (
         higher_long_bias
         and current["close"] > current["ema_20"]
         and float(current["stoch_k"]) > float(current["stoch_d"])
         and max(config.long_rsi_min - 8, 44) <= float(current["rsi_14"]) <= min(config.long_rsi_max + 8, 82)
     )
+    long_stoch_ok = long_stoch_aligned or (higher_long_bias and permissive_long_stoch) or strong_long_continuation
     long_rsi_ok = config.long_rsi_min <= current["rsi_14"] <= config.long_rsi_max or early_reversal_long
     long_setup_ready = pullback_recovery_long or breakout_long or continuation_long or early_reversal_long
     if not higher_long_bias:
@@ -204,7 +218,7 @@ def scan_market(
         reasons.append("Long rejected: price is too far below VWAP.")
     if not long_rsi_ok:
         reasons.append("Long rejected: RSI is outside the long trend zone.")
-    if not long_stoch_aligned:
+    if not long_stoch_ok:
         reasons.append("Long rejected: stochastic is not aligned for a profitable long entry.")
     if config.require_signal_candle_confirmation and not candle_is_bullish:
         reasons.append("Long rejected: signal candle does not confirm bullish continuation.")
@@ -212,7 +226,7 @@ def scan_market(
         reasons.append("Long rejected: no recovery, continuation, or breakout confirmation.")
     if higher_long_bias and near_vwap_long and long_rsi_ok:
         if long_setup_ready:
-            if not long_stoch_aligned:
+            if not long_stoch_ok:
                 return MarketScan(symbol=symbol, signal=None, reasons=reasons, metrics=metrics)
             if config.require_signal_candle_confirmation and not candle_is_bullish:
                 return MarketScan(symbol=symbol, signal=None, reasons=reasons, metrics=metrics)
@@ -230,7 +244,7 @@ def scan_market(
                     1.0,
                 ) * 0.15
                 base_score += min(max(volume_ratio / max(config.min_volume_ratio, 0.1), 0.0), 2.0) / 2.0 * 0.20
-                base_score += 0.15 if long_stoch_aligned else 0.0
+                base_score += 0.15 if long_stoch_aligned else 0.08 if long_stoch_ok else 0.0
                 base_score += 0.10 if candle_is_bullish else 0.0
                 base_score += 0.10 if breakout_long or pullback_recovery_long or continuation_long else 0.0
                 entry_profile = classify_entry_profile(base_score)
@@ -270,6 +284,11 @@ def scan_market(
         and float(current["close"]) < float(current["ema_20"])
         and volume_ratio >= (config.min_volume_ratio * 0.6)
     )
+    permissive_short_stoch = (
+        float(current["stoch_k"]) < float(current["stoch_d"])
+        and float(current["stoch_k"]) >= max(config.short_stoch_min - 12, 5)
+    )
+    strong_short_continuation = continuation_short and volume_ratio >= max(config.min_volume_ratio, 0.8)
     early_reversal_short = (
         higher_short_bias
         and current["close"] < current["ema_20"]
@@ -278,14 +297,15 @@ def scan_market(
     )
     short_rsi_ok = config.short_rsi_min <= current["rsi_14"] <= config.short_rsi_max or early_reversal_short
     short_setup_ready = pullback_recovery_short or breakdown_short or continuation_short or early_reversal_short
+    short_stoch_ok = short_stoch_aligned or (higher_short_bias and permissive_short_stoch) or strong_short_continuation
 
     if config.allow_short and higher_short_bias and near_vwap_short and short_rsi_ok:
-        if not short_stoch_aligned:
+        if not short_stoch_ok:
             reasons.append("Short rejected: stochastic is not aligned for a profitable short entry.")
         if config.require_signal_candle_confirmation and not candle_is_bearish:
             reasons.append("Short rejected: signal candle does not confirm bearish continuation.")
         if short_setup_ready:
-            if not short_stoch_aligned:
+            if not short_stoch_ok:
                 return MarketScan(symbol=symbol, signal=None, reasons=reasons, metrics=metrics)
             if config.require_signal_candle_confirmation and not candle_is_bearish:
                 return MarketScan(symbol=symbol, signal=None, reasons=reasons, metrics=metrics)
@@ -306,7 +326,7 @@ def scan_market(
                         1.0,
                     ) * 0.15
                 base_score += min(max(volume_ratio / max(config.min_volume_ratio, 0.1), 0.0), 2.0) / 2.0 * 0.20
-                base_score += 0.15 if short_stoch_aligned else 0.0
+                base_score += 0.15 if short_stoch_aligned else 0.08 if short_stoch_ok else 0.0
                 base_score += 0.10 if candle_is_bearish else 0.0
                 base_score += 0.10 if breakdown_short or pullback_recovery_short or continuation_short else 0.0
                 entry_profile = classify_entry_profile(base_score)
