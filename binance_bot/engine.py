@@ -12,6 +12,7 @@ from .execution_router import ExecutionRouter
 from .exchange import BinanceExchange
 from .external_sources import fetch_blockmedia_news, fetch_tradingview_ideas
 from .models import Position, TradeSignal
+from .macro import adjust_sizing_for_macro, build_macro_risk_overlay, get_upcoming_macro_events
 from .notifier import TelegramNotifier
 from .opportunity import analyze_pending_opportunities
 from .research import latest_universe_candidates, recent_listing_candidates
@@ -284,6 +285,17 @@ class TradingEngine:
             external_alignment=external_alignment,
             microstructure=microstructure,
         )
+        macro_events = get_upcoming_macro_events(self.store, hours=24)
+        macro_overlay = build_macro_risk_overlay(reference_time.astimezone(timezone.utc), macro_events)
+        signal.strategy_data["macro_overlay"] = {
+            "blocked": macro_overlay.blocked,
+            "penalty": macro_overlay.penalty,
+            "size_multiplier": macro_overlay.size_multiplier,
+            "reason": macro_overlay.reason,
+            "event_title": macro_overlay.event_title,
+            "importance": macro_overlay.importance,
+        }
+        sizing = adjust_sizing_for_macro(sizing, macro_overlay)
         signal.strategy_data["sizing"] = {
             "score": sizing.score,
             "bucket": sizing.bucket,

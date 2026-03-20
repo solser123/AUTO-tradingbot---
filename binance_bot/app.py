@@ -24,17 +24,22 @@ def _configure_logging() -> None:
 
 def build_engine():
     from .engine import TradingEngine
+    from .execution import ExecutionRouter, OrderRegistry
     from .exchange import BinanceExchange
+    from .macro import seed_default_macro_events
 
     config = BotConfig.from_env()
     exchange = BinanceExchange(config)
     store = StateStore(config.database_path)
     exchange_ok, exchange_message = exchange.validate_connection()
     recover_runtime_state(store, exchange_ok=exchange_ok, exchange_message=exchange_message)
+    seed_default_macro_events(store)
     notifier = TelegramNotifier(config.telegram_token, config.telegram_chat_id)
     ai_validator = AIValidator(config)
     risk_manager = RiskManager(config, store)
-    return TradingEngine(config, exchange, store, notifier, ai_validator, risk_manager)
+    order_registry = OrderRegistry(store)
+    execution_router = ExecutionRouter(exchange, registry=order_registry)
+    return TradingEngine(config, exchange, store, notifier, ai_validator, risk_manager, execution_router=execution_router)
 
 
 def run_preflight() -> int:
@@ -115,6 +120,8 @@ def run_doctor() -> int:
     checks.append(("micro-filter", True, f"enabled={config.enable_microstructure_filter} depth={config.microstructure_orderbook_depth} spread={config.microstructure_max_spread_pct:.3%}"))
     checks.append(("sizing", True, f"risk_full={config.sizing_risk_pct_full:.2%} total_open={config.sizing_max_total_open_risk_pct:.2%} sector_cap={config.sizing_max_same_sector_open_risk_pct:.2%}"))
     checks.append(("execution-router", True, "market-order planning with exchange rules and fill estimation"))
+    checks.append(("order-lifecycle", True, "order_lifecycle table + registry enabled"))
+    checks.append(("macro-layer", True, f"upcoming={len(store.get_upcoming_macro_events(hours=48, limit=10))}"))
     checks.append(("emergency-stop", True, runtime_flags.get("emergency_stop", "0") or "0"))
     checks.append(("emergency-severity", True, runtime_flags.get("emergency_severity", "") or "none"))
     checks.append(("emergency-reason", True, runtime_flags.get("emergency_reason", "") or "none"))
@@ -224,8 +231,17 @@ def run_summary() -> int:
     summary["emergency_stop"] = emergency_active
     if emergency_reason:
         summary["emergency_reason"] = emergency_reason
+    recent_orders = store.get_recent_order_lifecycle(limit=3)
+    summary["recent_order_events"] = len(recent_orders)
     for key, value in summary.items():
         print(f"{key}: {value}")
+    if recent_orders:
+        print("recent_orders:")
+        for row in recent_orders:
+            print(
+                f"  {row['symbol']} {row['side']} status={row['status']} "
+                f"filled={float(row['filled_qty'] or 0.0):.6f} avg={float(row['avg_price'] or 0.0):.6f}"
+            )
     return 0
 
 
@@ -548,6 +564,23 @@ def run_opportunity_report() -> int:
     return 0
 
 
+def run_macro() -> int:
+    from .macro import get_upcoming_macro_events, seed_default_macro_events
+
+    _configure_logging()
+    config = BotConfig.from_env()
+    store = StateStore(config.database_path)
+    seeded = seed_default_macro_events(store)
+    print(f"seeded: {seeded}")
+    events = get_upcoming_macro_events(store, hours=168)
+    for event in events[:20]:
+        print(
+            f"{event['importance']} | {event['scheduled_at']} | "
+            f"{event['country']} | {event['title']} | {event['source']}"
+        )
+    return 0
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description="Binance Bot V2 foundation")
     parser.add_argument("--once", action="store_true", help="Run one bot cycle and exit")
@@ -566,6 +599,7 @@ def main() -> int:
     parser.add_argument("--research-snapshot", action="store_true", help="Show latest risky/new listing research candidates")
     parser.add_argument("--research-news", action="store_true", help="Fetch and print recent TradingView ideas and Blockmedia news")
     parser.add_argument("--opportunity-report", action="store_true", help="Backfill and print missed opportunity analysis")
+    parser.add_argument("--macro", action="store_true", help="Show upcoming stored macro events")
     args = parser.parse_args()
 
     if args.doctor:
@@ -609,6 +643,9 @@ def main() -> int:
 
     if args.opportunity_report:
         return run_opportunity_report()
+
+    if args.macro:
+        return run_macro()
 
     _configure_logging()
     engine = build_engine()

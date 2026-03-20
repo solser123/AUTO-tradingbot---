@@ -217,6 +217,41 @@ class StateStore:
                 )
                 """
             )
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS order_lifecycle (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    client_order_id TEXT,
+                    exchange_order_id TEXT,
+                    symbol TEXT,
+                    order_type TEXT,
+                    side TEXT,
+                    status TEXT,
+                    requested_qty REAL,
+                    filled_qty REAL,
+                    avg_price REAL,
+                    is_algo INTEGER,
+                    is_reduce_only INTEGER,
+                    raw_json TEXT,
+                    created_at TEXT,
+                    updated_at TEXT
+                )
+                """
+            )
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS macro_event (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    event_key TEXT UNIQUE,
+                    title TEXT,
+                    country TEXT,
+                    importance TEXT,
+                    scheduled_at TEXT,
+                    source TEXT,
+                    raw_json TEXT
+                )
+                """
+            )
             columns = {row["name"] for row in conn.execute("PRAGMA table_info(positions)").fetchall()}
             if columns and "realized_pnl" not in columns:
                 conn.execute("ALTER TABLE positions ADD COLUMN realized_pnl REAL")
@@ -1080,3 +1115,112 @@ class StateStore:
                     for item in trades
                 ],
             )
+
+    def upsert_order_lifecycle(self, lifecycle: dict) -> int:
+        exchange_order_id = str(lifecycle.get("exchange_order_id") or "")
+        client_order_id = str(lifecycle.get("client_order_id") or "")
+        with self._connect() as conn:
+            existing = None
+            if exchange_order_id:
+                existing = conn.execute(
+                    "SELECT id FROM order_lifecycle WHERE exchange_order_id = ? ORDER BY id DESC LIMIT 1",
+                    (exchange_order_id,),
+                ).fetchone()
+            if existing is None and client_order_id:
+                existing = conn.execute(
+                    "SELECT id FROM order_lifecycle WHERE client_order_id = ? ORDER BY id DESC LIMIT 1",
+                    (client_order_id,),
+                ).fetchone()
+            payload = (
+                client_order_id,
+                exchange_order_id,
+                str(lifecycle.get("symbol") or ""),
+                str(lifecycle.get("order_type") or ""),
+                str(lifecycle.get("side") or ""),
+                str(lifecycle.get("status") or ""),
+                float(lifecycle.get("requested_qty") or 0.0),
+                float(lifecycle.get("filled_qty") or 0.0),
+                float(lifecycle.get("avg_price") or 0.0),
+                int(bool(lifecycle.get("is_algo"))),
+                int(bool(lifecycle.get("is_reduce_only"))),
+                json.dumps(_json_safe(lifecycle.get("raw_json") or {}), ensure_ascii=False),
+                str(lifecycle.get("created_at") or datetime.now(timezone.utc).isoformat()),
+                str(lifecycle.get("updated_at") or datetime.now(timezone.utc).isoformat()),
+            )
+            if existing is None:
+                cursor = conn.execute(
+                    """
+                    INSERT INTO order_lifecycle (
+                        client_order_id, exchange_order_id, symbol, order_type, side, status,
+                        requested_qty, filled_qty, avg_price, is_algo, is_reduce_only, raw_json,
+                        created_at, updated_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    payload,
+                )
+                return int(cursor.lastrowid)
+            conn.execute(
+                """
+                UPDATE order_lifecycle
+                SET client_order_id = ?, exchange_order_id = ?, symbol = ?, order_type = ?, side = ?, status = ?,
+                    requested_qty = ?, filled_qty = ?, avg_price = ?, is_algo = ?, is_reduce_only = ?,
+                    raw_json = ?, created_at = ?, updated_at = ?
+                WHERE id = ?
+                """,
+                (*payload, int(existing["id"])),
+            )
+            return int(existing["id"])
+
+    def get_recent_order_lifecycle(self, limit: int = 20) -> list[sqlite3.Row]:
+        with self._connect() as conn:
+            return conn.execute(
+                "SELECT * FROM order_lifecycle ORDER BY updated_at DESC, id DESC LIMIT ?",
+                (limit,),
+            ).fetchall()
+
+    def upsert_macro_events(self, events: list[dict]) -> int:
+        inserted = 0
+        if not events:
+            return inserted
+        with self._connect() as conn:
+            for event in events:
+                cursor = conn.execute(
+                    """
+                    INSERT INTO macro_event (
+                        event_key, title, country, importance, scheduled_at, source, raw_json
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                    ON CONFLICT(event_key) DO UPDATE SET
+                        title = excluded.title,
+                        country = excluded.country,
+                        importance = excluded.importance,
+                        scheduled_at = excluded.scheduled_at,
+                        source = excluded.source,
+                        raw_json = excluded.raw_json
+                    """,
+                    (
+                        str(event.get("event_key") or ""),
+                        str(event.get("title") or ""),
+                        str(event.get("country") or ""),
+                        str(event.get("importance") or ""),
+                        str(event.get("scheduled_at") or ""),
+                        str(event.get("source") or ""),
+                        json.dumps(_json_safe(event.get("raw_json") or {}), ensure_ascii=False),
+                    ),
+                )
+                inserted += int(cursor.rowcount > 0)
+        return inserted
+
+    def get_upcoming_macro_events(self, hours: int = 48, limit: int = 20) -> list[sqlite3.Row]:
+        anchor = datetime.now(timezone.utc)
+        horizon = anchor + timedelta(hours=max(hours, 1))
+        with self._connect() as conn:
+            return conn.execute(
+                """
+                SELECT *
+                FROM macro_event
+                WHERE scheduled_at >= ? AND scheduled_at <= ?
+                ORDER BY scheduled_at ASC, id ASC
+                LIMIT ?
+                """,
+                (anchor.isoformat(), horizon.isoformat(), limit),
+            ).fetchall()
