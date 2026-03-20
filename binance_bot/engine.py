@@ -163,6 +163,22 @@ class TradingEngine:
             )
             return
 
+        horizon_context = self._build_horizon_context(symbol, execution_df, higher_df, scan)
+        signal.strategy_data["multi_horizon"] = horizon_context
+        same_side_horizons = int(horizon_context.get("same_side_count", 0))
+        opposite_horizons = int(horizon_context.get("opposite_side_count", 0))
+        if opposite_horizons >= 2 and same_side_horizons == 0:
+            detail = "Multi-horizon context is materially against the short-term entry."
+            self.store.log_decision(
+                symbol=symbol,
+                mode=self.config.mode,
+                stage="horizon_gate",
+                outcome="rejected",
+                detail=detail,
+                payload={"multi_horizon": horizon_context, "signal": signal.strategy_data},
+            )
+            return
+
         review = self.ai_validator.review(signal)
         self.store.log_signal(signal, review.approved, review.confidence, review.reason)
         if review.reason.startswith("AI validation failed"):
@@ -651,15 +667,22 @@ class TradingEngine:
         execution_df = self.exchange.fetch_ohlcv(resolved, self.config.timeframe)
         higher_df = self.exchange.fetch_ohlcv(resolved, self.config.higher_timeframe)
         scan = scan_market(resolved, execution_df, higher_df, self.config)
+        horizons = self._build_horizon_context(resolved, execution_df, higher_df, scan)
         if scan.signal is None:
-            return f"{resolved}\nno signal\n" + "\n".join(scan.reasons[:5])
+            return (
+                f"{resolved}\nno signal\n"
+                + "\n".join(scan.reasons[:5])
+                + "\n"
+                + f"bias short={horizons['short']['bias']} mid={horizons['medium']['bias']} long={horizons['long']['bias']}"
+            )
         signal = scan.signal
         roadmap = build_exit_roadmap(signal.entry_price, signal.stop_price, signal.target_price, self.config.max_hold_minutes)
         return (
             f"{resolved}\n"
             f"signal={signal.side} profile={signal.entry_profile} setup={signal.setup_type}\n"
             f"entry={signal.entry_price:.6f} stop={signal.stop_price:.6f} target={signal.target_price:.6f}\n"
-            f"stop_pct={roadmap['stop_pct']} target_pct={roadmap['target_pct']} rr={signal.rr:.2f}"
+            f"stop_pct={roadmap['stop_pct']} target_pct={roadmap['target_pct']} rr={signal.rr:.2f}\n"
+            f"bias short={horizons['short']['bias']} mid={horizons['medium']['bias']} long={horizons['long']['bias']}"
         )
 
     def _rank_rows(self) -> list[dict[str, object]]:
@@ -692,6 +715,57 @@ class TradingEngine:
             )
         ranked_rows.sort(key=lambda item: (item["status"] != "signal", -float(item["score"])))
         return ranked_rows
+
+    def _build_horizon_context(self, symbol: str, execution_df, higher_df, short_scan) -> dict[str, object]:
+        medium_higher_df = self.exchange.fetch_ohlcv(symbol, self.config.medium_higher_timeframe)
+        long_higher_df = self.exchange.fetch_ohlcv(symbol, self.config.long_higher_timeframe)
+        medium_scan = scan_market(symbol, higher_df, medium_higher_df, self.config)
+        long_scan = scan_market(symbol, medium_higher_df, long_higher_df, self.config)
+
+        short_bias = self._horizon_bias(short_scan)
+        medium_bias = self._horizon_bias(medium_scan)
+        long_bias = self._horizon_bias(long_scan)
+        target_side = short_scan.signal.side if short_scan.signal is not None else "none"
+        expected_bias = "bullish" if target_side == "long" else "bearish" if target_side == "short" else "neutral"
+        same_side_count = sum(1 for bias in (medium_bias, long_bias) if bias == expected_bias)
+        opposite_side_count = sum(
+            1 for bias in (medium_bias, long_bias) if bias not in {"neutral", expected_bias}
+        )
+        return {
+            "short": {
+                "timeframes": f"{self.config.timeframe}/{self.config.higher_timeframe}",
+                "bias": short_bias,
+                "has_signal": short_scan.signal is not None,
+            },
+            "medium": {
+                "timeframes": f"{self.config.medium_timeframe}/{self.config.medium_higher_timeframe}",
+                "bias": medium_bias,
+                "has_signal": medium_scan.signal is not None,
+                "top_reasons": medium_scan.reasons[:3],
+            },
+            "long": {
+                "timeframes": f"{self.config.long_timeframe}/{self.config.long_higher_timeframe}",
+                "bias": long_bias,
+                "has_signal": long_scan.signal is not None,
+                "top_reasons": long_scan.reasons[:3],
+            },
+            "same_side_count": same_side_count,
+            "opposite_side_count": opposite_side_count,
+        }
+
+    def _horizon_bias(self, scan) -> str:
+        metrics = scan.metrics
+        close = float(metrics.get("close", 0.0) or 0.0)
+        ema_20 = float(metrics.get("ema_20", 0.0) or 0.0)
+        ema_50 = float(metrics.get("ema_50", 0.0) or 0.0)
+        higher_ema_20 = float(metrics.get("higher_ema_20", 0.0) or 0.0)
+        higher_ema_50 = float(metrics.get("higher_ema_50", 0.0) or 0.0)
+        vwap = float(metrics.get("vwap", 0.0) or 0.0)
+        if ema_20 >= ema_50 and higher_ema_20 >= higher_ema_50 and close >= vwap * 0.995:
+            return "bullish"
+        if ema_20 <= ema_50 and higher_ema_20 <= higher_ema_50 and close <= vwap * 1.005:
+            return "bearish"
+        return "neutral"
 
     def _close_all_positions(self) -> str:
         positions = self.store.get_open_positions(self.config.mode)

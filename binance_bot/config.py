@@ -75,6 +75,10 @@ class BotConfig:
     candidate_symbols: list[str]
     timeframe: str
     higher_timeframe: str
+    medium_timeframe: str
+    medium_higher_timeframe: str
+    long_timeframe: str
+    long_higher_timeframe: str
     loop_seconds: int
     notional_per_trade: float
     max_open_positions: int
@@ -215,6 +219,10 @@ class BotConfig:
             candidate_symbols=candidate_symbols,
             timeframe=os.getenv("BOT_TIMEFRAME", "15m").strip(),
             higher_timeframe=os.getenv("BOT_HIGHER_TIMEFRAME", "1h").strip(),
+            medium_timeframe=os.getenv("BOT_MEDIUM_TIMEFRAME", "1h").strip(),
+            medium_higher_timeframe=os.getenv("BOT_MEDIUM_HIGHER_TIMEFRAME", "4h").strip(),
+            long_timeframe=os.getenv("BOT_LONG_TIMEFRAME", "4h").strip(),
+            long_higher_timeframe=os.getenv("BOT_LONG_HIGHER_TIMEFRAME", "1d").strip(),
             loop_seconds=_as_int("BOT_LOOP_SECONDS", 60),
             notional_per_trade=_as_float("BOT_NOTIONAL_PER_TRADE", 100.0),
             max_open_positions=_as_int("BOT_MAX_OPEN_POSITIONS", 2),
