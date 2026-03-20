@@ -73,6 +73,10 @@ class BotConfig:
     research_symbols: list[str]
     overflow_symbols: list[str]
     candidate_symbols: list[str]
+    stage1_symbols: list[str]
+    stage2_symbols: list[str]
+    stage3_symbols: list[str]
+    stage4_symbols: list[str]
     timeframe: str
     higher_timeframe: str
     medium_timeframe: str
@@ -81,6 +85,10 @@ class BotConfig:
     long_higher_timeframe: str
     loop_seconds: int
     notional_per_trade: float
+    stage1_notional: float
+    stage2_notional: float
+    stage3_notional: float
+    stage4_notional: float
     max_open_positions: int
     futures_leverage: int
     core_symbols: list[str]
@@ -88,7 +96,6 @@ class BotConfig:
     liquid_leverage: int
     experimental_x10_symbols: list[str]
     experimental_x20_symbols: list[str]
-    enable_experimental_live: bool
     enable_overflow_review: bool
     overflow_scan_limit: int
     overflow_min_score: float
@@ -101,6 +108,10 @@ class BotConfig:
     symbol_cooldown_minutes: int
     ai_validation: bool
     min_ai_confidence: float
+    stage1_min_ai_confidence: float
+    stage2_min_ai_confidence: float
+    stage3_min_ai_confidence: float
+    stage4_min_ai_confidence: float
     max_daily_loss: float
     max_daily_loss_pct: float
     max_weekly_loss_pct: float
@@ -147,11 +158,58 @@ class BotConfig:
         return self.market_type == "swap"
 
     def active_symbols(self) -> list[str]:
-        if self.mode == "live" and self.main_symbols:
-            return self.main_symbols
+        if self.mode == "live":
+            live_symbols = self.live_symbols()
+            if live_symbols:
+                return live_symbols
+            if self.main_symbols:
+                return self.main_symbols
         if self.mode == "paper" and self.research_symbols:
             return self.research_symbols
         return self.symbols
+
+    def live_symbols(self) -> list[str]:
+        ordered = self.stage1_symbols + self.stage2_symbols + self.stage3_symbols + self.stage4_symbols
+        if ordered:
+            return list(dict.fromkeys(ordered))
+        return self.main_symbols
+
+    def stage_for_symbol(self, symbol: str) -> int:
+        if symbol in self.stage1_symbols:
+            return 1
+        if symbol in self.stage2_symbols:
+            return 2
+        if symbol in self.stage3_symbols:
+            return 3
+        if symbol in self.stage4_symbols:
+            return 4
+        if symbol in self.core_symbols:
+            return 1
+        if symbol in self.experimental_x10_symbols or symbol in self.experimental_x20_symbols:
+            return 4
+        if symbol in self.main_symbols:
+            return 2
+        return 3
+
+    def stage_notional(self, symbol: str) -> float:
+        stage = self.stage_for_symbol(symbol)
+        if stage == 1:
+            return self.stage1_notional
+        if stage == 2:
+            return self.stage2_notional
+        if stage == 3:
+            return self.stage3_notional
+        return self.stage4_notional
+
+    def min_ai_confidence_for_symbol(self, symbol: str) -> float:
+        stage = self.stage_for_symbol(symbol)
+        if stage == 1:
+            return self.stage1_min_ai_confidence
+        if stage == 2:
+            return self.stage2_min_ai_confidence
+        if stage == 3:
+            return self.stage3_min_ai_confidence
+        return self.stage4_min_ai_confidence
 
     def leverage_for_symbol(self, symbol: str) -> int:
         if symbol in self.experimental_x20_symbols:
@@ -160,6 +218,10 @@ class BotConfig:
             return 10
         if symbol in self.core_symbols:
             return self.core_leverage
+        if self.stage_for_symbol(symbol) == 3 and self.is_futures:
+            return max(self.liquid_leverage, 3)
+        if self.stage_for_symbol(symbol) == 4 and self.is_futures:
+            return max(self.liquid_leverage, 5)
         return self.liquid_leverage if self.is_futures else 1
 
     def is_experimental_symbol(self, symbol: str) -> bool:
@@ -186,6 +248,22 @@ class BotConfig:
             _normalize_symbol(item, market_type)
             for item in _as_list("BOT_RESEARCH_SYMBOLS")
         ]
+        stage1_symbols = [
+            _normalize_symbol(item, market_type)
+            for item in _as_list("BOT_STAGE1_SYMBOLS")
+        ]
+        stage2_symbols = [
+            _normalize_symbol(item, market_type)
+            for item in _as_list("BOT_STAGE2_SYMBOLS")
+        ]
+        stage3_symbols = [
+            _normalize_symbol(item, market_type)
+            for item in _as_list("BOT_STAGE3_SYMBOLS")
+        ]
+        stage4_symbols = [
+            _normalize_symbol(item, market_type)
+            for item in _as_list("BOT_STAGE4_SYMBOLS")
+        ]
         overflow_symbols = [
             _normalize_symbol(item, market_type)
             for item in _as_list("BOT_OVERFLOW_SYMBOLS")
@@ -210,6 +288,23 @@ class BotConfig:
         if not symbols:
             raise ValueError("BOT_SYMBOLS must include at least one symbol.")
 
+        if not stage1_symbols and core_symbols:
+            stage1_symbols = core_symbols[:]
+        if not stage4_symbols and (experimental_x10_symbols or experimental_x20_symbols):
+            stage4_symbols = list(dict.fromkeys(experimental_x10_symbols + experimental_x20_symbols))
+        if not stage2_symbols and main_symbols:
+            stage2_symbols = [
+                symbol
+                for symbol in main_symbols
+                if symbol not in stage1_symbols and symbol not in stage4_symbols
+            ]
+        if not stage3_symbols:
+            stage3_symbols = [
+                symbol
+                for symbol in candidate_symbols + overflow_symbols
+                if symbol not in stage1_symbols and symbol not in stage2_symbols and symbol not in stage4_symbols
+            ]
+
         config = cls(
             api_key=os.getenv("BINANCE_API_KEY", "").strip(),
             secret_key=os.getenv("BINANCE_SECRET_KEY", "").strip(),
@@ -223,6 +318,10 @@ class BotConfig:
             research_symbols=research_symbols,
             overflow_symbols=overflow_symbols,
             candidate_symbols=candidate_symbols,
+            stage1_symbols=list(dict.fromkeys(stage1_symbols)),
+            stage2_symbols=list(dict.fromkeys(stage2_symbols)),
+            stage3_symbols=list(dict.fromkeys(stage3_symbols)),
+            stage4_symbols=list(dict.fromkeys(stage4_symbols)),
             timeframe=os.getenv("BOT_TIMEFRAME", "15m").strip(),
             higher_timeframe=os.getenv("BOT_HIGHER_TIMEFRAME", "1h").strip(),
             medium_timeframe=os.getenv("BOT_MEDIUM_TIMEFRAME", "1h").strip(),
@@ -231,6 +330,10 @@ class BotConfig:
             long_higher_timeframe=os.getenv("BOT_LONG_HIGHER_TIMEFRAME", "1d").strip(),
             loop_seconds=_as_int("BOT_LOOP_SECONDS", 60),
             notional_per_trade=_as_float("BOT_NOTIONAL_PER_TRADE", 100.0),
+            stage1_notional=_as_float("BOT_STAGE1_NOTIONAL", 100.0),
+            stage2_notional=_as_float("BOT_STAGE2_NOTIONAL", 20.0),
+            stage3_notional=_as_float("BOT_STAGE3_NOTIONAL", 10.0),
+            stage4_notional=_as_float("BOT_STAGE4_NOTIONAL", 5.0),
             max_open_positions=_as_int("BOT_MAX_OPEN_POSITIONS", 2),
             futures_leverage=_as_int("BOT_FUTURES_LEVERAGE", 1),
             core_symbols=core_symbols,
@@ -238,7 +341,6 @@ class BotConfig:
             liquid_leverage=_as_int("BOT_LIQUID_LEVERAGE", 2),
             experimental_x10_symbols=experimental_x10_symbols,
             experimental_x20_symbols=experimental_x20_symbols,
-            enable_experimental_live=_as_bool(os.getenv("BOT_ENABLE_EXPERIMENTAL_LIVE"), False),
             enable_overflow_review=_as_bool(os.getenv("BOT_ENABLE_OVERFLOW_REVIEW"), True),
             overflow_scan_limit=_as_int("BOT_OVERFLOW_SCAN_LIMIT", 5),
             overflow_min_score=_as_float("BOT_OVERFLOW_MIN_SCORE", 6.0),
@@ -251,6 +353,10 @@ class BotConfig:
             symbol_cooldown_minutes=_as_int("BOT_SYMBOL_COOLDOWN_MINUTES", 240),
             ai_validation=_as_bool(os.getenv("BOT_AI_VALIDATION"), True),
             min_ai_confidence=_as_float("BOT_MIN_AI_CONFIDENCE", 0.55),
+            stage1_min_ai_confidence=_as_float("BOT_STAGE1_MIN_AI_CONFIDENCE", 0.60),
+            stage2_min_ai_confidence=_as_float("BOT_STAGE2_MIN_AI_CONFIDENCE", 0.55),
+            stage3_min_ai_confidence=_as_float("BOT_STAGE3_MIN_AI_CONFIDENCE", 0.50),
+            stage4_min_ai_confidence=_as_float("BOT_STAGE4_MIN_AI_CONFIDENCE", 0.46),
             max_daily_loss=_as_float("BOT_MAX_DAILY_LOSS", 50.0),
             max_daily_loss_pct=_as_float("BOT_MAX_DAILY_LOSS_PCT", 0.10),
             max_weekly_loss_pct=_as_float("BOT_MAX_WEEKLY_LOSS_PCT", 0.10),
@@ -297,8 +403,8 @@ class BotConfig:
             raise ValueError("Live mode requires BINANCE_API_KEY and BINANCE_SECRET_KEY.")
         if config.mode == "live" and config.market_type == "spot" and config.allow_short:
             raise ValueError("Spot live mode does not support BOT_ALLOW_SHORT=true in this foundation.")
-        if config.mode == "live" and not config.main_symbols:
-            raise ValueError("Live mode requires BOT_MAIN_SYMBOLS to be configured.")
+        if config.mode == "live" and not config.live_symbols():
+            raise ValueError("Live mode requires at least one live stage symbol to be configured.")
         if config.is_futures and config.futures_margin_mode not in {"isolated", "cross"}:
             raise ValueError("BOT_FUTURES_MARGIN_MODE must be either 'isolated' or 'cross'.")
         if config.is_futures and config.futures_leverage < 1:
@@ -315,11 +421,4 @@ class BotConfig:
             config.aggressive_entry_score >= config.balanced_entry_score >= config.conservative_entry_score >= 0
         ):
             raise ValueError("Entry profile scores must descend: aggressive >= balanced >= conservative >= 0.")
-        if config.mode == "live" and not config.enable_experimental_live:
-            live_experimental = [symbol for symbol in config.main_symbols if config.is_experimental_symbol(symbol)]
-            if live_experimental:
-                raise ValueError(
-                    "Experimental x10/x20 symbols are present in BOT_MAIN_SYMBOLS while BOT_ENABLE_EXPERIMENTAL_LIVE=false."
-                )
-
         return config

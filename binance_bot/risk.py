@@ -38,8 +38,8 @@ class RiskManager:
         if self.store.count_open_positions(self.config.mode) >= self.config.max_open_positions:
             return RiskDecision(False, "Maximum number of open positions reached.")
 
-        if self.config.mode == "live" and signal.symbol not in self.config.main_symbols:
-            return RiskDecision(False, "Live trading is restricted to main symbols only.")
+        if self.config.mode == "live" and signal.symbol not in self.config.live_symbols():
+            return RiskDecision(False, "Live trading is restricted to configured stage symbols only.")
 
         if self.config.mode == "live" and not self._is_allowed_entry_time(reference_time):
             return RiskDecision(False, "New entries are disabled outside the configured main session windows.")
@@ -63,7 +63,7 @@ class RiskManager:
         if atr_regime_ratio >= self.config.atr_overheat_multiplier:
             return RiskDecision(False, "ATR regime is overheated for a safe entry.")
 
-        if self.config.ai_validation and review.confidence < self.config.min_ai_confidence:
+        if self.config.ai_validation and review.confidence < self.config.min_ai_confidence_for_symbol(signal.symbol):
             return RiskDecision(False, "AI confidence is below the configured minimum.")
 
         if self.store.get_symbol_stoploss_streak(signal.symbol, self.config.mode) >= self.config.same_symbol_stoploss_limit:
@@ -91,7 +91,7 @@ class RiskManager:
         if self.config.mode == "paper":
             open_exposure = self.store.get_open_exposure(self.config.mode)
             free_capital = self.config.paper_start_balance + self.store.get_summary()["realized_pnl"] - open_exposure
-            if free_capital < self.config.notional_per_trade:
+            if free_capital < self.config.stage_notional(signal.symbol):
                 return RiskDecision(False, "Paper balance is not large enough for another trade.")
 
         return RiskDecision(True, "Trade allowed.")
@@ -99,7 +99,7 @@ class RiskManager:
     def _trade_risk_pct(self, signal: TradeSignal, account_equity: float) -> float:
         if account_equity <= 0:
             return 1.0
-        notional = self.config.notional_per_trade
+        notional = self.config.stage_notional(signal.symbol)
         if signal.entry_price <= 0:
             return 1.0
         stop_pct = abs(signal.entry_price - signal.stop_price) / signal.entry_price

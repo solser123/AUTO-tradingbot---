@@ -274,19 +274,7 @@ class TradingEngine:
             )
             return
 
-        if self.config.mode == "live" and self.config.is_experimental_symbol(symbol) and not self.config.enable_experimental_live:
-            logging.info("%s: live execution blocked for experimental x10/x20 tier.", symbol)
-            self.store.log_decision(
-                symbol=symbol,
-                mode=self.config.mode,
-                stage="tier_gate",
-                outcome="blocked",
-                detail="Experimental tier is blocked in live mode.",
-                payload={"signal": signal.strategy_data},
-            )
-            return
-
-        initial_notional = self._notional_for_profile(signal.entry_profile)
+        initial_notional = self._notional_for_profile(symbol, signal.entry_profile)
         quantity_estimate = initial_notional / signal.entry_price
         quantity_allowed, quantity, quantity_reason = self.exchange.validate_order_quantity(
             symbol,
@@ -360,6 +348,8 @@ class TradingEngine:
                 "target_price": signal.target_price,
                 "quantity": quantity,
                 "entry_profile": signal.entry_profile,
+                "symbol_stage": self.config.stage_for_symbol(symbol),
+                "base_notional": initial_notional,
                 "ai_confidence": review.confidence,
                 "committee": review.committee,
                 "signal": signal.strategy_data,
@@ -367,7 +357,7 @@ class TradingEngine:
         )
         logging.info("%s: opened %s position at %.4f", symbol, signal.side, entry_price)
         self.notifier.send(
-            f"[OPEN] {symbol} {signal.side} entry={entry_price:.4f} "
+            f"[OPEN] {symbol} s{self.config.stage_for_symbol(symbol)} {signal.side} entry={entry_price:.4f} "
             f"stop={signal.stop_price:.4f} target={signal.target_price:.4f} ai={review.confidence:.2f}"
         )
 
@@ -410,12 +400,13 @@ class TradingEngine:
             if global_streak >= self.config.global_stoploss_limit:
                 self.notifier.send(f"[REVIEW MODE] global stop-loss streak={global_streak}")
 
-    def _notional_for_profile(self, profile: str) -> float:
+    def _notional_for_profile(self, symbol: str, profile: str) -> float:
+        base_notional = self.config.stage_notional(symbol)
         if profile == "aggressive":
-            return self.config.notional_per_trade
+            return base_notional
         if profile == "balanced":
-            return self.config.notional_per_trade * 0.75
-        return self.config.notional_per_trade * 0.5
+            return base_notional * 0.75
+        return base_notional * 0.5
 
     def _defense_triggers(self, side: str, entry_price: float, risk_distance: float) -> tuple[float, float]:
         if side == "long":

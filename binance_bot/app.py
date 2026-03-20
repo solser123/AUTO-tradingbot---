@@ -74,7 +74,6 @@ def run_doctor() -> int:
     if config.is_futures:
         checks.append(("futures-risk", True, f"margin={config.futures_margin_mode}, leverage={config.futures_leverage}x"))
         checks.append(("core-tier", True, f"core={config.core_leverage}x liquid={config.liquid_leverage}x"))
-        checks.append(("experimental-live", True, f"enabled={config.enable_experimental_live}"))
         checks.append(("overflow-review", True, f"enabled={config.enable_overflow_review} limit={config.overflow_scan_limit}"))
         checks.append(("entry-windows", True, ",".join(config.allowed_entry_windows) or "always"))
         checks.append(("cooldown", True, f"{config.symbol_cooldown_minutes}m"))
@@ -82,6 +81,12 @@ def run_doctor() -> int:
     checks.append(("symbols", bool(config.symbols), f"symbols={', '.join(config.symbols)}"))
     if config.main_symbols:
         checks.append(("main-symbols", True, f"main={', '.join(config.main_symbols)}"))
+    if config.live_symbols():
+        checks.append(("live-symbols", True, f"live={', '.join(config.live_symbols())}"))
+    checks.append(("stage1", True, f"s1={','.join(config.stage1_symbols) or 'none'} notional={config.stage1_notional:.2f} ai={config.stage1_min_ai_confidence:.2f}"))
+    checks.append(("stage2", True, f"s2={','.join(config.stage2_symbols) or 'none'} notional={config.stage2_notional:.2f} ai={config.stage2_min_ai_confidence:.2f}"))
+    checks.append(("stage3", True, f"s3={','.join(config.stage3_symbols) or 'none'} notional={config.stage3_notional:.2f} ai={config.stage3_min_ai_confidence:.2f}"))
+    checks.append(("stage4", True, f"s4={','.join(config.stage4_symbols) or 'none'} notional={config.stage4_notional:.2f} ai={config.stage4_min_ai_confidence:.2f}"))
     if config.research_symbols:
         checks.append(("research-symbols", True, f"research={', '.join(config.research_symbols)}"))
     checks.append(("database", True, f"db={config.database_path}"))
@@ -439,10 +444,10 @@ def run_stage_report() -> int:
     print(f"slippage_events: {slippage_events}")
     print(f"emergency_events: {emergency_events}")
     print("stage_rules:")
-    print("  stage1=BTC/ETH x3, main alts x2")
-    print("  stage2=BTC/ETH x5, main alts x3")
-    print("  stage3=selected tactical x5 with overflow review still advisory")
-    print("  stage4=isolated experimental x10 review-only bucket")
+    print(f"  symbol_stage1={','.join(config.stage1_symbols) or 'none'} notional={config.stage1_notional:.2f} ai={config.stage1_min_ai_confidence:.2f}")
+    print(f"  symbol_stage2={','.join(config.stage2_symbols) or 'none'} notional={config.stage2_notional:.2f} ai={config.stage2_min_ai_confidence:.2f}")
+    print(f"  symbol_stage3={','.join(config.stage3_symbols) or 'none'} notional={config.stage3_notional:.2f} ai={config.stage3_min_ai_confidence:.2f}")
+    print(f"  symbol_stage4={','.join(config.stage4_symbols) or 'none'} notional={config.stage4_notional:.2f} ai={config.stage4_min_ai_confidence:.2f}")
     return 0
 
 

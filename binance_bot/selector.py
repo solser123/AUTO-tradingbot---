@@ -42,6 +42,9 @@ DEFAULT_FUTURES_CANDIDATES = [
 
 
 def default_candidate_symbols(config: BotConfig) -> list[str]:
+    live_symbols = config.live_symbols()
+    if live_symbols:
+        return live_symbols
     if config.candidate_symbols:
         return config.candidate_symbols
     if config.main_symbols:

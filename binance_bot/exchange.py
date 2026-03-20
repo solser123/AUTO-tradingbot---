@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import ccxt
+import math
 import pandas as pd
 
 from .config import BotConfig
@@ -157,26 +158,54 @@ class BinanceExchange:
             "min_cost": float(cost_limits.get("min") or 0.0),
         }
 
+    def _amount_step(self, symbol: str) -> float:
+        market = self.client.market(symbol)
+        filters = (market.get("info") or {}).get("filters") or []
+        candidates: list[float] = []
+        for item in filters:
+            if item.get("filterType") not in {"LOT_SIZE", "MARKET_LOT_SIZE"}:
+                continue
+            try:
+                step = float(item.get("stepSize") or 0.0)
+            except Exception:
+                step = 0.0
+            if step > 0:
+                candidates.append(step)
+        if candidates:
+            return min(candidates)
+        precision = float((market.get("precision") or {}).get("amount") or 0.0)
+        return precision if precision > 0 else 0.0
+
+    def _round_up_amount(self, symbol: str, amount: float) -> float:
+        step = self._amount_step(symbol)
+        if step <= 0:
+            return self.amount_to_precision(symbol, amount)
+        rounded = math.ceil(max(amount, 0.0) / step - 1e-12) * step
+        return float(self.client.amount_to_precision(symbol, rounded))
+
     def validate_order_quantity(self, symbol: str, amount: float, reference_price: float) -> tuple[bool, float, str]:
         requirements = self.order_requirements(symbol)
-        try:
-            normalized_amount = self.amount_to_precision(symbol, amount)
-        except Exception:
-            normalized_amount = float(amount)
+        normalized_amount = self._round_up_amount(symbol, amount)
 
         min_amount = max(requirements["min_amount"], requirements["min_market_amount"])
         max_amount_candidates = [value for value in (requirements["max_market_amount"], requirements["max_amount"]) if value > 0]
         max_amount = min(max_amount_candidates) if max_amount_candidates else 0.0
-        notional = normalized_amount * reference_price
 
         if normalized_amount <= 0:
             return False, normalized_amount, "Quantity rounds down to zero for exchange precision."
         if min_amount > 0 and normalized_amount < min_amount:
-            return False, normalized_amount, f"Quantity {normalized_amount} is below minimum amount {min_amount}."
+            normalized_amount = self._round_up_amount(symbol, min_amount)
+        notional = normalized_amount * reference_price
+        if requirements["min_cost"] > 0 and notional < requirements["min_cost"]:
+            required_amount = requirements["min_cost"] / reference_price if reference_price > 0 else normalized_amount
+            normalized_amount = self._round_up_amount(symbol, max(normalized_amount, required_amount))
+            notional = normalized_amount * reference_price
         if max_amount > 0 and normalized_amount > max_amount:
             return False, normalized_amount, f"Quantity {normalized_amount} is above maximum amount {max_amount}."
         if requirements["min_cost"] > 0 and notional < requirements["min_cost"]:
             return False, normalized_amount, f"Notional {notional:.4f} is below minimum notional {requirements['min_cost']:.4f}."
+        if normalized_amount > amount:
+            return True, normalized_amount, f"Adjusted quantity upward to meet exchange minimums. notional={notional:.4f}"
         return True, normalized_amount, "ok"
 
     def create_market_order(self, symbol: str, side: str, amount: float, reduce_only: bool = False) -> dict:
