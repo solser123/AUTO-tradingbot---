@@ -313,32 +313,29 @@ def run_rank() -> int:
 def run_backtest() -> int:
     from .backtest import run_backtest_for_symbol
     from .exchange import BinanceExchange
+    from .reporting import format_report_lines, summarize_backtest_results
 
     _configure_logging()
     config = BotConfig.from_env()
     exchange = BinanceExchange(config)
-    total_trades = 0
-    total_wins = 0
-    total_pnl = 0.0
+    results = []
     for symbol in config.symbols:
         result = run_backtest_for_symbol(symbol, exchange, config)
-        total_trades += result.trades
-        total_wins += result.wins
-        total_pnl += result.realized_pnl
+        results.append(result)
         print(f"symbol: {result.symbol}")
         print(f"  trades: {result.trades}")
         print(f"  wins: {result.wins}")
         print(f"  losses: {result.losses}")
         print(f"  win_rate: {result.win_rate:.2f}")
-        print(f"  realized_pnl: {result.realized_pnl:.2f}")
+        print(f"  realized_pnl: {result.realized_pnl:.4f}")
+        print(f"  profit_factor: {result.metrics.profit_factor:.4f}")
+        print(f"  expectancy: {result.metrics.expectancy:.4f}")
+        print(f"  max_drawdown_pct: {result.metrics.max_drawdown_pct * 100:.2f}")
         print("")
 
-    aggregate_win_rate = (total_wins / total_trades) * 100 if total_trades else 0.0
-    print("aggregate:")
-    print(f"  trades: {total_trades}")
-    print(f"  wins: {total_wins}")
-    print(f"  win_rate: {aggregate_win_rate:.2f}")
-    print(f"  realized_pnl: {total_pnl:.2f}")
+    report = summarize_backtest_results(results, config.paper_start_balance)
+    for line in format_report_lines(report):
+        print(line)
     return 0
 
 
@@ -361,9 +358,11 @@ def run_optimize() -> int:
         total_wins = sum(item.wins for item in results)
         total_pnl = sum(item.realized_pnl for item in results)
         win_rate = (total_wins / total_trades) * 100 if total_trades else 0.0
+        profit_factor = sum(item.metrics.profit_factor for item in results if item.trades > 0) / max(len([item for item in results if item.trades > 0]), 1)
         print(f"  aggregate_trades: {total_trades}")
         print(f"  aggregate_win_rate: {win_rate:.2f}")
-        print(f"  aggregate_pnl: {total_pnl:.2f}")
+        print(f"  aggregate_pnl: {total_pnl:.4f}")
+        print(f"  aggregate_profit_factor: {profit_factor:.4f}")
         print(f"  score: {score:.2f}")
         print("")
     return 0

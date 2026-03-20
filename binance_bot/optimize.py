@@ -29,9 +29,11 @@ def run_optimization(exchange: BinanceExchange, base_config: BotConfig) -> list[
         results = [run_backtest_for_symbol(symbol, exchange, config) for symbol in config.symbols]
         total_pnl = sum(item.realized_pnl for item in results)
         total_trades = sum(item.trades for item in results)
+        total_profit_factor = sum(item.metrics.profit_factor for item in results if item.trades > 0)
+        total_expectancy = sum(item.metrics.expectancy for item in results if item.trades > 0)
         if total_trades == 0:
             continue
-        score = total_pnl + (total_trades * 0.05)
+        score = total_pnl + (total_trades * 0.05) + (total_profit_factor * 0.3) + total_expectancy
         scored.append((config, results, score))
 
     scored.sort(key=lambda item: item[2], reverse=True)
