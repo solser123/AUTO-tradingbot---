@@ -143,6 +143,42 @@ class BinanceExchange:
     def amount_to_precision(self, symbol: str, amount: float) -> float:
         return float(self.client.amount_to_precision(symbol, amount))
 
+    def order_requirements(self, symbol: str) -> dict[str, float]:
+        market = self.client.market(symbol)
+        limits = market.get("limits", {}) or {}
+        amount_limits = limits.get("amount", {}) or {}
+        market_limits = limits.get("market", {}) or {}
+        cost_limits = limits.get("cost", {}) or {}
+        return {
+            "min_amount": float(amount_limits.get("min") or 0.0),
+            "max_amount": float(amount_limits.get("max") or 0.0),
+            "min_market_amount": float(market_limits.get("min") or 0.0),
+            "max_market_amount": float(market_limits.get("max") or 0.0),
+            "min_cost": float(cost_limits.get("min") or 0.0),
+        }
+
+    def validate_order_quantity(self, symbol: str, amount: float, reference_price: float) -> tuple[bool, float, str]:
+        requirements = self.order_requirements(symbol)
+        try:
+            normalized_amount = self.amount_to_precision(symbol, amount)
+        except Exception:
+            normalized_amount = float(amount)
+
+        min_amount = max(requirements["min_amount"], requirements["min_market_amount"])
+        max_amount_candidates = [value for value in (requirements["max_market_amount"], requirements["max_amount"]) if value > 0]
+        max_amount = min(max_amount_candidates) if max_amount_candidates else 0.0
+        notional = normalized_amount * reference_price
+
+        if normalized_amount <= 0:
+            return False, normalized_amount, "Quantity rounds down to zero for exchange precision."
+        if min_amount > 0 and normalized_amount < min_amount:
+            return False, normalized_amount, f"Quantity {normalized_amount} is below minimum amount {min_amount}."
+        if max_amount > 0 and normalized_amount > max_amount:
+            return False, normalized_amount, f"Quantity {normalized_amount} is above maximum amount {max_amount}."
+        if requirements["min_cost"] > 0 and notional < requirements["min_cost"]:
+            return False, normalized_amount, f"Notional {notional:.4f} is below minimum notional {requirements['min_cost']:.4f}."
+        return True, normalized_amount, "ok"
+
     def create_market_order(self, symbol: str, side: str, amount: float, reduce_only: bool = False) -> dict:
         params = {}
         if self.config.is_futures:

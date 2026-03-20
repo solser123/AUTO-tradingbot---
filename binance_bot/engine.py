@@ -287,16 +287,27 @@ class TradingEngine:
             return
 
         initial_notional = self._notional_for_profile(signal.entry_profile)
-        quantity = self.exchange.amount_to_precision(symbol, initial_notional / signal.entry_price)
-        if quantity <= 0:
-            logging.info("%s: quantity below exchange minimum.", symbol)
+        quantity_estimate = initial_notional / signal.entry_price
+        quantity_allowed, quantity, quantity_reason = self.exchange.validate_order_quantity(
+            symbol,
+            quantity_estimate,
+            signal.entry_price,
+        )
+        if not quantity_allowed:
+            logging.info("%s: order requirement rejected signal. %s", symbol, quantity_reason)
             self.store.log_decision(
                 symbol=symbol,
                 mode=self.config.mode,
                 stage="sizing",
                 outcome="rejected",
-                detail="Quantity below exchange minimum.",
-                payload={"entry_price": signal.entry_price},
+                detail=quantity_reason,
+                payload={
+                    "entry_price": signal.entry_price,
+                    "requested_notional": initial_notional,
+                    "requested_quantity": quantity_estimate,
+                    "normalized_quantity": quantity,
+                    "requirements": self.exchange.order_requirements(symbol),
+                },
             )
             return
 
