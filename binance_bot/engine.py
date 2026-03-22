@@ -347,8 +347,9 @@ class TradingEngine:
             }
         same_side_horizons = int(horizon_context.get("same_side_count", 0))
         opposite_horizons = int(horizon_context.get("opposite_side_count", 0))
-        ai_override = self._ai_override_allowed(ai_scan_review, signal.side)
-        if opposite_horizons >= 2 and same_side_horizons == 0 and not ai_override:
+        ai_override = self._ai_override_allowed(ai_scan_review, signal)
+        exploratory_signal = signal.setup_type.startswith("ai_") or "context_recovery" in signal.setup_type
+        if opposite_horizons >= 2 and same_side_horizons == 0 and not (ai_override and exploratory_signal):
             detail = "Multi-horizon context is materially against the short-term entry."
             self.store.log_decision(
                 symbol=symbol,
@@ -370,7 +371,7 @@ class TradingEngine:
                 payload={"sector_context": sector_context, "signal": signal.strategy_data},
             )
             return
-        micro_rejection = self._microstructure_rejection(signal.side, microstructure)
+        micro_rejection = self._microstructure_rejection(signal.symbol, signal.side, microstructure)
         if micro_rejection and not self._microstructure_soft_pass(signal, microstructure, ai_scan_review):
             self.store.log_decision(
                 symbol=symbol,
@@ -1569,12 +1570,15 @@ class TradingEngine:
             return flow_score <= (-1.0 * self.config.sector_opposition_gate_threshold)
         return flow_score >= self.config.sector_opposition_gate_threshold
 
-    def _ai_override_allowed(self, review: AIScanReview | None, side: str) -> bool:
+    def _ai_override_allowed(self, review: AIScanReview | None, signal: TradeSignal) -> bool:
         if review is None or not review.approved:
             return False
-        if review.suggested_side != side:
+        if review.suggested_side != signal.side:
             return False
-        return review.confidence >= max(self.config.ai_scan_min_confidence, 0.60)
+        required_confidence = self.config.ai_scan_min_confidence
+        if signal.setup_type.startswith("ai_") or "context_recovery" in signal.setup_type:
+            required_confidence = max(0.45, self.config.ai_scan_min_confidence - 0.05)
+        return review.confidence >= required_confidence
 
     def _sector_soft_pass(
         self,
@@ -1582,24 +1586,39 @@ class TradingEngine:
         sector_context: dict[str, object] | None,
         review: AIScanReview | None,
     ) -> bool:
-        if sector_context is None or not self._ai_override_allowed(review, signal.side):
+        if sector_context is None or not self._ai_override_allowed(review, signal):
             return False
         flow_score = float(sector_context.get("flow_score", 0.0) or 0.0)
         if signal.side == "long":
             return flow_score > (-1.0 * self.config.sector_opposition_gate_threshold * 1.5)
         return flow_score < (self.config.sector_opposition_gate_threshold * 1.5)
 
-    def _microstructure_rejection(self, side: str, micro: dict[str, object] | None) -> str | None:
+    def _microstructure_min_depth(self, symbol: str) -> float:
+        stage = self.config.stage_for_symbol(symbol)
+        base = self.config.microstructure_min_total_depth_usdt
+        if symbol in self.config.core_symbols or stage == 1:
+            return max(base * 0.35, 2000.0)
+        if stage == 2:
+            return max(base * 0.40, 2400.0)
+        if stage == 3:
+            return max(base * 0.25, 1200.0)
+        return max(base * 0.15, 500.0)
+
+    def _microstructure_rejection(self, symbol: str, side: str, micro: dict[str, object] | None) -> str | None:
         if not self.config.enable_microstructure_filter or not micro:
             return None
         spread_pct = float(micro.get("spread_pct", 0.0) or 0.0)
         total_depth = float(micro.get("total_depth_usdt", 0.0) or 0.0)
         trade_flow = float(micro.get("trade_flow_score", 0.0) or 0.0)
         depth_imbalance = float(micro.get("depth_imbalance", 0.0) or 0.0)
+        trade_count = int(micro.get("trade_count", 0) or 0)
+        min_depth = self._microstructure_min_depth(symbol)
 
         if spread_pct > self.config.microstructure_max_spread_pct:
             return "Microstructure rejected: spread is too wide."
-        if total_depth < self.config.microstructure_min_total_depth_usdt:
+        if total_depth <= 0 and trade_count >= 20:
+            return None
+        if total_depth < min_depth:
             return "Microstructure rejected: order book depth is too thin."
         if side == "long":
             if trade_flow <= (-1.0 * self.config.microstructure_flow_gate_threshold):
@@ -1619,15 +1638,18 @@ class TradingEngine:
         micro: dict[str, object] | None,
         review: AIScanReview | None,
     ) -> bool:
-        if micro is None or not self._ai_override_allowed(review, signal.side):
+        if micro is None or not self._ai_override_allowed(review, signal):
             return False
         spread_pct = float(micro.get("spread_pct", 0.0) or 0.0)
         total_depth = float(micro.get("total_depth_usdt", 0.0) or 0.0)
         trade_flow = float(micro.get("trade_flow_score", 0.0) or 0.0)
         depth_imbalance = float(micro.get("depth_imbalance", 0.0) or 0.0)
+        trade_count = int(micro.get("trade_count", 0) or 0)
         if spread_pct > self.config.microstructure_max_spread_pct * 1.1:
             return False
-        if total_depth < self.config.microstructure_min_total_depth_usdt * 0.30:
+        if total_depth <= 0 and trade_count >= 20:
+            return True
+        if total_depth < self._microstructure_min_depth(signal.symbol) * 0.35:
             return False
         if signal.side == "long":
             return trade_flow > -0.05 and depth_imbalance > -0.25
