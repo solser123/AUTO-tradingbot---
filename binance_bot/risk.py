@@ -49,7 +49,8 @@ class RiskManager:
                 return RiskDecision(False, "Live trading is restricted to configured stage symbols only.")
 
         if self.config.mode == "live" and not self._is_allowed_entry_time(reference_time):
-            return RiskDecision(False, "New entries are disabled outside the configured main session windows.")
+            if not self._is_exploratory_time_override(signal, exploratory):
+                return RiskDecision(False, "New entries are disabled outside the configured main session windows.")
 
         cooldown_deadline = self._cooldown_deadline(signal.symbol)
         if cooldown_deadline is not None and reference_time.astimezone(ZoneInfo("UTC")) < cooldown_deadline:
@@ -167,6 +168,15 @@ class RiskManager:
             if start_minutes > end_minutes and (current_minutes >= start_minutes or current_minutes <= end_minutes):
                 return True
         return False
+
+    def _is_exploratory_time_override(self, signal: TradeSignal, exploratory: bool) -> bool:
+        if not exploratory:
+            return False
+        if bool(signal.strategy_data.get("hot_mover_scout", False)):
+            return True
+        engine_family = str(signal.strategy_data.get("engine_family", "") or "").lower()
+        engine_key = str(signal.strategy_data.get("engine_key", "") or "").lower()
+        return engine_family in {"reversal", "scout"} or engine_key in {"reversal", "scout"}
 
     def _parse_minutes(self, value: str) -> int:
         hour, minute = value.split(":", 1)

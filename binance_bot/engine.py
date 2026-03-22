@@ -1924,6 +1924,73 @@ class TradingEngine:
             for token in ("ai_", "context_recovery", "smc_reversal", "early_reversal", "hot_mover_scout")
         )
 
+    def _engine_key(self, signal: TradeSignal) -> str:
+        return str(signal.strategy_data.get("engine_key", "") or "").lower()
+
+    def _engine_family(self, signal: TradeSignal) -> str:
+        return str(signal.strategy_data.get("engine_family", "") or "").lower()
+
+    def _exploratory_override_floor(self, signal: TradeSignal) -> float:
+        if bool(signal.strategy_data.get("hot_mover_scout", False)):
+            return 42.0
+        engine_key = self._engine_key(signal)
+        engine_family = self._engine_family(signal)
+        if engine_key == "scout" or engine_family == "scout":
+            return 43.0
+        if engine_key == "reversal" or engine_family == "reversal":
+            return 44.0
+        if engine_key == "continuation" or engine_family == "continuation":
+            return 46.0
+        return 45.0
+
+    def _exploratory_review_confidence_floor(self, signal: TradeSignal) -> float:
+        if bool(signal.strategy_data.get("hot_mover_scout", False)):
+            return 0.35
+        engine_key = self._engine_key(signal)
+        engine_family = self._engine_family(signal)
+        if engine_key == "scout" or engine_family == "scout":
+            return 0.37
+        if engine_key == "reversal" or engine_family == "reversal":
+            return 0.38
+        return self.config.exploratory_ai_min_confidence
+
+    def _exploratory_scan_confidence_floor(self, signal: TradeSignal) -> float:
+        if bool(signal.strategy_data.get("hot_mover_scout", False)):
+            return 0.42
+        engine_key = self._engine_key(signal)
+        engine_family = self._engine_family(signal)
+        if engine_key == "scout" or engine_family == "scout":
+            return 0.44
+        if engine_key == "reversal" or engine_family == "reversal":
+            return 0.45
+        return max(0.48, self.config.exploratory_ai_scan_min_confidence - 0.02)
+
+    def _exploratory_sector_multiplier(self, signal: TradeSignal) -> float:
+        if not self._is_exploratory_signal(signal):
+            return 1.5
+        if bool(signal.strategy_data.get("hot_mover_scout", False)):
+            return 5.0
+        engine_key = self._engine_key(signal)
+        engine_family = self._engine_family(signal)
+        if engine_key == "scout" or engine_family == "scout":
+            return 4.0
+        if engine_key == "reversal" or engine_family == "reversal":
+            return 3.5
+        return 2.5
+
+    def _exploratory_micro_profile(self, signal: TradeSignal) -> tuple[float, float, float, float]:
+        if not self._is_exploratory_signal(signal):
+            return 1.1, 0.35, 0.20, 0.45
+        if bool(signal.strategy_data.get("hot_mover_scout", False)):
+            return 1.9, 0.03, 0.45, 0.70
+        engine_key = self._engine_key(signal)
+        engine_family = self._engine_family(signal)
+        if engine_key == "scout" or engine_family == "scout":
+            return 1.8, 0.04, 0.40, 0.65
+        if engine_key == "reversal" or engine_family == "reversal":
+            return 1.7, 0.05, 0.35, 0.60
+        return 1.45, 0.08, 0.22, 0.45
+
     def _maybe_override_hot_mover_sizing(self, signal: TradeSignal, sizing: SizingDecision) -> SizingDecision:
         if not bool(signal.strategy_data.get("hot_mover_scout", False)):
             return sizing
@@ -1969,7 +2036,7 @@ class TradingEngine:
             return sizing
         if review is None or not review.approved or review.suggested_side != signal.side:
             return sizing
-        floor = 45.0 if bool(signal.strategy_data.get("hot_mover_scout", False)) else 46.0
+        floor = self._exploratory_override_floor(signal)
         if sizing.score < floor:
             return sizing
         if bool(signal.strategy_data.get("hot_mover_scout", False)):
@@ -2008,13 +2075,13 @@ class TradingEngine:
             return False
         if sizing.bucket != "0.25R":
             return False
-        if review.confidence < self.config.exploratory_ai_min_confidence:
+        if review.confidence < self._exploratory_review_confidence_floor(signal):
             return False
         if ai_scan_review is None or not ai_scan_review.approved:
             return False
         if ai_scan_review.suggested_side != signal.side:
             return False
-        if ai_scan_review.confidence < self.config.exploratory_ai_scan_min_confidence:
+        if ai_scan_review.confidence < self._exploratory_scan_confidence_floor(signal):
             return False
         if review.recommended_action == "no_trade":
             return False
@@ -2107,7 +2174,7 @@ class TradingEngine:
             return False
         required_confidence = self.config.ai_scan_min_confidence
         if self._is_exploratory_signal(signal):
-            required_confidence = max(0.45, self.config.ai_scan_min_confidence - 0.05)
+            required_confidence = max(0.42, self._exploratory_scan_confidence_floor(signal))
         return review.confidence >= required_confidence
 
     def _exploratory_soft_pass_allowed(self, signal: TradeSignal, review: AIScanReview | None) -> bool:
@@ -2117,9 +2184,7 @@ class TradingEngine:
             return False
         if review.suggested_side != signal.side:
             return False
-        if bool(signal.strategy_data.get("hot_mover_scout", False)):
-            return review.confidence >= max(0.44, self.config.exploratory_ai_scan_min_confidence - 0.10)
-        return review.confidence >= max(0.46, self.config.exploratory_ai_scan_min_confidence - 0.08)
+        return review.confidence >= self._exploratory_scan_confidence_floor(signal)
 
     def _exploratory_horizon_soft_pass(
         self,
@@ -2134,8 +2199,14 @@ class TradingEngine:
         same_side_horizons = int(horizon_context.get("same_side_count", 0) or 0)
         opposite_horizons = int(horizon_context.get("opposite_side_count", 0) or 0)
         if bool(signal.strategy_data.get("hot_mover_scout", False)):
-            return opposite_horizons <= 3
-        return same_side_horizons >= 1 or opposite_horizons <= 3
+            return opposite_horizons <= 4
+        engine_key = self._engine_key(signal)
+        engine_family = self._engine_family(signal)
+        if engine_key == "scout" or engine_family == "scout":
+            return same_side_horizons >= 1 or opposite_horizons <= 4
+        if engine_key == "reversal" or engine_family == "reversal":
+            return same_side_horizons >= 1 or opposite_horizons <= 3
+        return same_side_horizons >= 1 or opposite_horizons <= 2
 
     def _sector_soft_pass(
         self,
@@ -2148,7 +2219,7 @@ class TradingEngine:
         if not (self._ai_override_allowed(review, signal) or self._exploratory_soft_pass_allowed(signal, review)):
             return False
         flow_score = float(sector_context.get("flow_score", 0.0) or 0.0)
-        multiplier = 3.0 if self._is_exploratory_signal(signal) else 1.5
+        multiplier = self._exploratory_sector_multiplier(signal)
         if signal.side == "long":
             return flow_score > (-1.0 * self.config.sector_opposition_gate_threshold * multiplier)
         return flow_score < (self.config.sector_opposition_gate_threshold * multiplier)
@@ -2207,17 +2278,16 @@ class TradingEngine:
         trade_flow = float(micro.get("trade_flow_score", 0.0) or 0.0)
         depth_imbalance = float(micro.get("depth_imbalance", 0.0) or 0.0)
         trade_count = int(micro.get("trade_count", 0) or 0)
-        spread_multiplier = 1.4 if self._is_exploratory_signal(signal) else 1.1
+        spread_multiplier, depth_ratio, flow_limit, imbalance_limit = self._exploratory_micro_profile(signal)
         if spread_pct > self.config.microstructure_max_spread_pct * spread_multiplier:
             return False
         if total_depth <= 0 and trade_count >= 12:
             return True
-        depth_ratio = 0.10 if self._is_exploratory_signal(signal) else 0.35
         if total_depth < self._microstructure_min_depth(signal.symbol) * depth_ratio:
             return False
         if signal.side == "long":
-            return trade_flow > -0.20 and depth_imbalance > -0.45
-        return trade_flow < 0.20 and depth_imbalance < 0.45
+            return trade_flow > (-1.0 * flow_limit) and depth_imbalance > (-1.0 * imbalance_limit)
+        return trade_flow < flow_limit and depth_imbalance < imbalance_limit
 
     def _sync_sector_flows(self, reference_time: datetime) -> None:
         if not self.config.enable_sector_flow:
