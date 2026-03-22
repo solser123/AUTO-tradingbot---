@@ -300,6 +300,26 @@ def scan_market(
         and (float(current["squeeze_momentum"]) if not pd.isna(current["squeeze_momentum"]) else 0.0) < 0
         and (float(current["session_vwap_zscore"]) if not pd.isna(current["session_vwap_zscore"]) else 0.0) <= 2.4
     )
+    higher_long_bias = higher_long_bias or (
+        higher_close >= float(higher["ema_20"]) * 0.988
+        and higher_rsi >= 42
+        and (
+            higher_ema_rising
+            or bullish_choch
+            or recent_bullish_fvg
+            or (bool(current["squeeze_off"]) and (float(current["squeeze_momentum"]) if not pd.isna(current["squeeze_momentum"]) else 0.0) > 0)
+        )
+    )
+    higher_short_bias = higher_short_bias or (
+        higher_close <= float(higher["ema_20"]) * 1.012
+        and higher_rsi <= 58
+        and (
+            higher_ema_falling
+            or bearish_choch
+            or recent_bearish_fvg
+            or (bool(current["squeeze_off"]) and (float(current["squeeze_momentum"]) if not pd.isna(current["squeeze_momentum"]) else 0.0) < 0)
+        )
+    )
     volume_ratio = current["volume"] / current["volume_sma_20"] if float(current["volume_sma_20"]) > 0 else 0.0
     atr_value = float(current["atr_14"]) if not math.isnan(float(current["atr_14"])) else 0.0
     close_now = float(current["close"])
@@ -347,6 +367,14 @@ def scan_market(
     macd_hist_now = float(current["macd_hist"])
     macd_prev = float(previous["macd"])
     macd_signal_prev = float(previous["macd_signal"])
+    macd_bullish = (
+        (macd_now >= macd_signal_now and macd_hist_now >= -0.000001)
+        or (macd_prev <= macd_signal_prev and macd_now > macd_signal_now)
+    )
+    macd_bearish = (
+        (macd_now <= macd_signal_now and macd_hist_now <= 0.000001)
+        or (macd_prev >= macd_signal_prev and macd_now < macd_signal_now)
+    )
     short_stoch_aligned = (
         config.short_stoch_min <= float(current["stoch_k"]) <= config.short_stoch_max
         and float(current["stoch_k"]) < float(current["stoch_d"])
@@ -419,20 +447,20 @@ def scan_market(
         return "conservative"
 
     pullback_recovery_long = (
-        previous["low"] <= previous["ema_20"] * (1 + config.pullback_tolerance)
-        and current["close"] > current["ema_20"]
+        previous["low"] <= previous["ema_20"] * (1 + (config.pullback_tolerance * 2.5))
+        and current["close"] > current["ema_20"] * 0.996
     )
-    breakout_long = current["close"] > current["breakout_high"] and volume_ratio > config.min_volume_ratio
+    breakout_long = current["close"] > current["breakout_high"] * 0.998 and volume_ratio > (config.min_volume_ratio * 0.7)
     continuation_long = (
-        float(current["close"]) > float(previous["high"])
-        and float(current["close"]) > float(current["ema_20"])
-        and volume_ratio >= (config.min_volume_ratio * 0.6)
+        float(current["close"]) >= float(previous["high"]) * 0.998
+        and float(current["close"]) > float(current["ema_20"]) * 0.996
+        and volume_ratio >= (config.min_volume_ratio * 0.4)
     )
     trend_reclaim_long = (
         close_prev < float(previous["ema_20"])
-        and close_now > float(current["ema_20"])
-        and candle_is_bullish
-        and body_to_atr >= 0.22
+        and close_now > float(current["ema_20"]) * 0.996
+        and (candle_is_bullish or close_now > close_prev)
+        and body_to_atr >= 0.14
     )
     smc_reversal_long = (
         (bullish_choch or eql_sweep)
@@ -441,13 +469,13 @@ def scan_market(
     )
     vwap_reclaim_long = (
         close_prev < float(previous["vwap"]) * 1.002
-        and close_now >= float(current["vwap"]) * 0.995
-        and candle_is_bullish
+        and close_now >= float(current["vwap"]) * 0.992
+        and (candle_is_bullish or close_now > close_prev)
     )
     bollinger_reclaim_long = (
         close_prev <= float(previous["bb_mid"])
         and close_now > float(current["bb_mid"])
-        and candle_is_bullish
+        and (candle_is_bullish or close_now > close_prev)
     )
     long_resume_confirmed = (
         breakout_long
@@ -457,39 +485,37 @@ def scan_market(
         or vwap_reclaim_long
         or session_vwap_reclaim_long
         or (squeeze_long_bias and candle_is_bullish and recent_bullish_fvg)
+        or (recent_bullish_fvg and macd_bullish and close_now >= float(current["ema_20"]) * 0.994)
+        or (squeeze_off and squeeze_momentum > 0 and close_now > close_prev)
         or (
-            candle_is_bullish
+            (candle_is_bullish or close_now > close_prev)
             and close_now > close_prev
             and high_now >= high_prev
-            and close_now >= high_prev * 0.996
+            and close_now >= high_prev * 0.994
         )
     )
     long_impulse_confirmed = (
         close_now > close_prev >= close_prev_2
-        and three_bar_return_pct >= max((atr_value / close_now) * 100 * 0.55, 0.10)
-        and body_to_atr >= 0.22
-        and volume_ratio >= max(config.min_volume_ratio * 0.55, 0.22)
-    )
-    macd_bullish = (
-        (macd_now >= macd_signal_now and macd_hist_now >= -0.000001)
-        or (macd_prev <= macd_signal_prev and macd_now > macd_signal_now)
+        and three_bar_return_pct >= max((atr_value / close_now) * 100 * 0.35, 0.04)
+        and body_to_atr >= 0.14
+        and volume_ratio >= max(config.min_volume_ratio * 0.35, 0.12)
     )
     permissive_long_stoch = (
         float(current["stoch_k"]) > float(current["stoch_d"])
         and float(current["stoch_k"]) <= (config.long_stoch_max + 12)
     )
-    strong_long_continuation = continuation_long and volume_ratio >= max(config.min_volume_ratio, 0.8)
+    strong_long_continuation = continuation_long and volume_ratio >= max(config.min_volume_ratio * 0.75, 0.45)
     early_reversal_long = (
         higher_long_bias
-        and (current["close"] > current["ema_20"] or smc_reversal_long or session_vwap_zscore <= -1.8)
+        and (current["close"] > current["ema_20"] * 0.994 or smc_reversal_long or session_vwap_zscore <= -1.8 or recent_bullish_fvg)
         and (float(current["stoch_k"]) > float(current["stoch_d"]) or macd_bullish)
-        and max(config.long_rsi_min - 8, 44) <= float(current["rsi_14"]) <= min(config.long_rsi_max + 8, 82)
+        and max(config.long_rsi_min - 10, 40) <= float(current["rsi_14"]) <= min(config.long_rsi_max + 10, 84)
     )
-    long_stoch_ok = long_stoch_aligned or (higher_long_bias and permissive_long_stoch) or strong_long_continuation or macd_bullish
+    long_stoch_ok = long_stoch_aligned or (higher_long_bias and permissive_long_stoch) or strong_long_continuation or macd_bullish or squeeze_long_bias
     long_rsi_ok = (
         config.long_rsi_min <= current["rsi_14"] <= config.long_rsi_max
         or early_reversal_long
-        or ((trend_reclaim_long or vwap_reclaim_long or bollinger_reclaim_long) and 42 <= float(current["rsi_14"]) <= 82)
+        or ((trend_reclaim_long or vwap_reclaim_long or bollinger_reclaim_long or recent_bullish_fvg) and 40 <= float(current["rsi_14"]) <= 84)
     )
     long_setup_ready = (
         pullback_recovery_long
@@ -501,11 +527,13 @@ def scan_market(
         or vwap_reclaim_long
         or bollinger_reclaim_long
         or (recent_bullish_fvg and squeeze_long_bias)
+        or session_vwap_reclaim_long
+        or ((bullish_choch or eql_sweep) and (macd_bullish or squeeze_off))
     )
     estimated_long_stop = min(float(low_df["low"].tail(5).min()), close_now - atr_value * config.atr_stop_multiplier) if atr_value > 0 else float(low_df["low"].tail(5).min())
     estimated_long_risk_pct = max(0.0, (close_now - estimated_long_stop) / close_now) if close_now > 0 else 0.0
     resistance_room_pct = max(0.0, (recent_resistance - close_now) / close_now) if close_now > 0 else 0.0
-    long_resistance_room_ok = breakout_long or resistance_room_pct >= max(estimated_long_risk_pct * 0.55, 0.0022)
+    long_resistance_room_ok = breakout_long or resistance_room_pct >= max(estimated_long_risk_pct * 0.35, 0.0014)
     if not higher_long_bias:
         reasons.append("Long rejected: higher timeframe bias is still too weak.")
     if not near_vwap_long:
@@ -532,7 +560,7 @@ def scan_market(
                 return MarketScan(symbol=symbol, signal=None, reasons=reasons, metrics=metrics)
             if config.require_signal_candle_confirmation and not candle_is_bullish:
                 return MarketScan(symbol=symbol, signal=None, reasons=reasons, metrics=metrics)
-            if not long_resume_confirmed or not long_impulse_confirmed or not long_resistance_room_ok:
+            if not (long_resume_confirmed or early_reversal_long or smc_reversal_long) or not (long_impulse_confirmed or early_reversal_long or squeeze_long_bias) or not long_resistance_room_ok:
                 return MarketScan(symbol=symbol, signal=None, reasons=reasons, metrics=metrics)
             entry = float(current["close"])
             swing_stop = float(low_df["low"].tail(5).min())
@@ -597,20 +625,20 @@ def scan_market(
             reasons.append("Long rejected: stop distance is too wide for configured risk.")
 
     pullback_recovery_short = (
-        previous["high"] >= previous["ema_20"] * (1 - config.pullback_tolerance)
-        and current["close"] < current["ema_20"]
+        previous["high"] >= previous["ema_20"] * (1 - (config.pullback_tolerance * 2.5))
+        and current["close"] < current["ema_20"] * 1.004
     )
-    breakdown_short = current["close"] < current["breakdown_low"] and volume_ratio > config.min_volume_ratio
+    breakdown_short = current["close"] < current["breakdown_low"] * 1.002 and volume_ratio > (config.min_volume_ratio * 0.7)
     continuation_short = (
-        float(current["close"]) < float(previous["low"])
-        and float(current["close"]) < float(current["ema_20"])
-        and volume_ratio >= (config.min_volume_ratio * 0.6)
+        float(current["close"]) <= float(previous["low"]) * 1.002
+        and float(current["close"]) < float(current["ema_20"]) * 1.004
+        and volume_ratio >= (config.min_volume_ratio * 0.4)
     )
     trend_reclaim_short = (
         close_prev > float(previous["ema_20"])
-        and close_now < float(current["ema_20"])
-        and candle_is_bearish
-        and body_to_atr >= 0.22
+        and close_now < float(current["ema_20"]) * 1.004
+        and (candle_is_bearish or close_now < close_prev)
+        and body_to_atr >= 0.14
     )
     smc_reversal_short = (
         (bearish_choch or eqh_sweep)
@@ -619,13 +647,13 @@ def scan_market(
     )
     vwap_reject_short = (
         close_prev > float(previous["vwap"]) * 0.998
-        and close_now <= float(current["vwap"]) * 1.005
-        and candle_is_bearish
+        and close_now <= float(current["vwap"]) * 1.008
+        and (candle_is_bearish or close_now < close_prev)
     )
     bollinger_reject_short = (
         close_prev >= float(previous["bb_mid"])
         and close_now < float(current["bb_mid"])
-        and candle_is_bearish
+        and (candle_is_bearish or close_now < close_prev)
     )
     short_resume_confirmed = (
         breakdown_short
@@ -635,33 +663,31 @@ def scan_market(
         or vwap_reject_short
         or session_vwap_reject_short
         or (squeeze_short_bias and candle_is_bearish and recent_bearish_fvg)
+        or (recent_bearish_fvg and macd_bearish and close_now <= float(current["ema_20"]) * 1.006)
+        or (squeeze_off and squeeze_momentum < 0 and close_now < close_prev)
         or (
-            candle_is_bearish
+            (candle_is_bearish or close_now < close_prev)
             and close_now < close_prev
             and low_now <= low_prev
-            and close_now <= low_prev * 1.004
+            and close_now <= low_prev * 1.006
         )
     )
     short_impulse_confirmed = (
         close_now < close_prev <= close_prev_2
-        and three_bar_return_pct <= -max((atr_value / close_now) * 100 * 0.55, 0.10)
-        and body_to_atr >= 0.22
-        and volume_ratio >= max(config.min_volume_ratio * 0.55, 0.22)
-    )
-    macd_bearish = (
-        (macd_now <= macd_signal_now and macd_hist_now <= 0.000001)
-        or (macd_prev >= macd_signal_prev and macd_now < macd_signal_now)
+        and three_bar_return_pct <= -max((atr_value / close_now) * 100 * 0.35, 0.04)
+        and body_to_atr >= 0.14
+        and volume_ratio >= max(config.min_volume_ratio * 0.35, 0.12)
     )
     permissive_short_stoch = (
         float(current["stoch_k"]) < float(current["stoch_d"])
         and float(current["stoch_k"]) >= max(config.short_stoch_min - 12, 5)
     )
-    strong_short_continuation = continuation_short and volume_ratio >= max(config.min_volume_ratio, 0.8)
+    strong_short_continuation = continuation_short and volume_ratio >= max(config.min_volume_ratio * 0.75, 0.45)
     early_reversal_short = (
         higher_short_bias
-        and (current["close"] < current["ema_20"] or smc_reversal_short or session_vwap_zscore >= 1.8)
+        and (current["close"] < current["ema_20"] * 1.006 or smc_reversal_short or session_vwap_zscore >= 1.8 or recent_bearish_fvg)
         and (float(current["stoch_k"]) < float(current["stoch_d"]) or macd_bearish)
-        and max(config.short_rsi_min - 8, 24) <= float(current["rsi_14"]) <= min(config.short_rsi_max + 10, 74)
+        and max(config.short_rsi_min - 10, 22) <= float(current["rsi_14"]) <= min(config.short_rsi_max + 12, 76)
     )
     short_rsi_ok = (
         config.short_rsi_min <= current["rsi_14"] <= config.short_rsi_max
@@ -678,8 +704,10 @@ def scan_market(
         or vwap_reject_short
         or bollinger_reject_short
         or (recent_bearish_fvg and squeeze_short_bias)
+        or session_vwap_reject_short
+        or ((bearish_choch or eqh_sweep) and (macd_bearish or squeeze_off))
     )
-    short_stoch_ok = short_stoch_aligned or (higher_short_bias and permissive_short_stoch) or strong_short_continuation or macd_bearish
+    short_stoch_ok = short_stoch_aligned or (higher_short_bias and permissive_short_stoch) or strong_short_continuation or macd_bearish or squeeze_short_bias
     estimated_short_stop = max(float(low_df["high"].tail(5).max()), close_now + atr_value * config.atr_stop_multiplier) if atr_value > 0 else float(low_df["high"].tail(5).max())
     estimated_short_risk_pct = max(0.0, (estimated_short_stop - close_now) / close_now) if close_now > 0 else 0.0
     support_room_pct = max(0.0, (close_now - recent_support) / close_now) if close_now > 0 else 0.0
@@ -702,7 +730,7 @@ def scan_market(
                 return MarketScan(symbol=symbol, signal=None, reasons=reasons, metrics=metrics)
             if config.require_signal_candle_confirmation and not candle_is_bearish:
                 return MarketScan(symbol=symbol, signal=None, reasons=reasons, metrics=metrics)
-            if not short_resume_confirmed or not short_impulse_confirmed:
+            if not (short_resume_confirmed or early_reversal_short or smc_reversal_short) or not (short_impulse_confirmed or early_reversal_short or squeeze_short_bias):
                 return MarketScan(symbol=symbol, signal=None, reasons=reasons, metrics=metrics)
             if not (breakdown_short or support_room_pct >= max(estimated_short_risk_pct * 0.55, 0.0022)):
                 return MarketScan(symbol=symbol, signal=None, reasons=reasons, metrics=metrics)
