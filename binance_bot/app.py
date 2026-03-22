@@ -581,6 +581,20 @@ def run_macro() -> int:
     return 0
 
 
+def run_live_report() -> int:
+    from .live_report import build_live_report, render_live_report, write_live_report
+
+    _configure_logging()
+    config = BotConfig.from_env()
+    store = StateStore(config.database_path)
+    report = build_live_report(store, lookback_hours=48)
+    rendered = render_live_report(report)
+    print(rendered)
+    output_path = write_live_report(report, Path("logs"))
+    print(f"\nreport_path: {output_path}")
+    return 0
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description="Binance Bot V2 foundation")
     parser.add_argument("--once", action="store_true", help="Run one bot cycle and exit")
@@ -600,6 +614,7 @@ def main() -> int:
     parser.add_argument("--research-news", action="store_true", help="Fetch and print recent TradingView ideas and Blockmedia news")
     parser.add_argument("--opportunity-report", action="store_true", help="Backfill and print missed opportunity analysis")
     parser.add_argument("--macro", action="store_true", help="Show upcoming stored macro events")
+    parser.add_argument("--live-report", action="store_true", help="Summarize recent live trading strengths and weaknesses")
     args = parser.parse_args()
 
     if args.doctor:
@@ -646,6 +661,9 @@ def main() -> int:
 
     if args.macro:
         return run_macro()
+
+    if args.live_report:
+        return run_live_report()
 
     _configure_logging()
     engine = build_engine()
