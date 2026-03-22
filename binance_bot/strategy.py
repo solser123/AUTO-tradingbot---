@@ -797,9 +797,19 @@ def should_exit(
     current_price: float,
     max_hold_minutes: int,
     now_time: datetime | None = None,
+    exploratory_window_minutes: int = 0,
+    exploratory_min_progress_r: float = 0.0,
 ) -> str | None:
     reference_time = now_time or datetime.now(timezone.utc)
     age_minutes = (reference_time - position.opened_at).total_seconds() / 60
+    risk_distance = abs(position.entry_price - position.stop_price)
+    if position.profile_stage == "exploratory" and exploratory_window_minutes > 0 and risk_distance > 0:
+        if position.side == "long":
+            progress_r = (current_price - position.entry_price) / risk_distance
+        else:
+            progress_r = (position.entry_price - current_price) / risk_distance
+        if age_minutes >= exploratory_window_minutes and progress_r < exploratory_min_progress_r:
+            return "exploratory_timeout"
     if position.side == "long":
         if current_price <= position.stop_price:
             return "stop_loss"

@@ -477,19 +477,31 @@ class TradingEngine:
             return
         self.store.reset_state_counter("ai_failure_streak")
 
+        exploratory_live = self._should_open_exploratory_live(signal, sizing, review, ai_scan_review)
         if not review.approved:
-            logging.info("%s: AI rejected signal. %s", symbol, review.reason)
+            if not exploratory_live:
+                logging.info("%s: AI rejected signal. %s", symbol, review.reason)
+                self.store.log_decision(
+                    symbol=symbol,
+                    mode=self.config.mode,
+                    stage="ai_review",
+                    outcome="rejected",
+                    detail=review.reason,
+                    payload={"signal": signal.strategy_data, "confidence": review.confidence, "committee": review.committee},
+                )
+                return
             self.store.log_decision(
                 symbol=symbol,
                 mode=self.config.mode,
                 stage="ai_review",
-                outcome="rejected",
-                detail=review.reason,
+                outcome="exploratory_override",
+                detail=f"Exploratory live allowed despite AI rejection: {review.reason}",
                 payload={"signal": signal.strategy_data, "confidence": review.confidence, "committee": review.committee},
             )
-            return
+        if exploratory_live:
+            signal = self._mark_exploratory_signal(signal, review, ai_scan_review, sizing)
 
-        decision = self.risk_manager.can_open_trade(signal, review, account_equity, reference_time)
+        decision = self.risk_manager.can_open_trade(signal, review, account_equity, reference_time, exploratory=exploratory_live)
         if not decision.allowed:
             logging.info("%s: risk manager rejected signal. %s", symbol, decision.reason)
             self.store.log_decision(
@@ -568,7 +580,7 @@ class TradingEngine:
             stop_price=signal.stop_price,
             target_price=signal.target_price,
             entry_profile=signal.entry_profile,
-            profile_stage=signal.entry_profile,
+            profile_stage="exploratory" if exploratory_live else signal.entry_profile,
             half_defense_trigger=half_defense_trigger,
             full_defense_trigger=full_defense_trigger,
             opened_at=datetime.now(timezone.utc),
@@ -588,6 +600,7 @@ class TradingEngine:
                 "target_price": signal.target_price,
                 "quantity": quantity,
                 "entry_profile": signal.entry_profile,
+                "exploratory_live": exploratory_live,
                 "symbol_stage": self.config.stage_for_symbol(symbol),
                 "base_notional": initial_notional,
                 "execution_plan": {
@@ -614,14 +627,22 @@ class TradingEngine:
             },
         )
         logging.info("%s: opened %s position at %.4f", symbol, signal.side, entry_price)
+        tag = "[EXPLORATORY OPEN]" if exploratory_live else "[OPEN]"
         self.notifier.send(
-            f"[OPEN] {symbol} s{self.config.stage_for_symbol(symbol)} {signal.side} entry={entry_price:.4f} "
+            f"{tag} {symbol} s{self.config.stage_for_symbol(symbol)} {signal.side} entry={entry_price:.4f} "
             f"stop={signal.stop_price:.4f} target={signal.target_price:.4f} ai={review.confidence:.2f}"
         )
 
     def _manage_position(self, position: Position, reference_time: datetime) -> None:
         current_price = self.exchange.fetch_last_price(position.symbol)
-        exit_reason = should_exit(position, current_price, self.config.max_hold_minutes, reference_time.astimezone(timezone.utc))
+        exit_reason = should_exit(
+            position,
+            current_price,
+            self.config.max_hold_minutes,
+            reference_time.astimezone(timezone.utc),
+            exploratory_window_minutes=self.config.exploratory_followthrough_bars * _timeframe_to_minutes(self.config.timeframe),
+            exploratory_min_progress_r=self.config.exploratory_min_progress_r,
+        )
         if exit_reason is None:
             logging.info("%s: position open, no exit. price=%.4f", position.symbol, current_price)
             self.store.log_decision(
@@ -1525,6 +1546,68 @@ class TradingEngine:
                 "sector_context_preview": sector_context,
                 "microstructure_preview": microstructure,
             },
+        )
+
+    def _should_open_exploratory_live(
+        self,
+        signal: TradeSignal,
+        sizing,
+        review,
+        ai_scan_review: AIScanReview | None,
+    ) -> bool:
+        if not self.config.enable_exploratory_live:
+            return False
+        if self.config.mode != "live":
+            return False
+        if sizing.bucket != "0.25R":
+            return False
+        if review.confidence < self.config.exploratory_ai_min_confidence:
+            return False
+        if ai_scan_review is None or not ai_scan_review.approved:
+            return False
+        if ai_scan_review.suggested_side != signal.side:
+            return False
+        if ai_scan_review.confidence < self.config.exploratory_ai_scan_min_confidence:
+            return False
+        setup = signal.setup_type.lower()
+        return any(
+            token in setup
+            for token in ("ai_", "context_recovery", "smc_reversal", "early_reversal")
+        )
+
+    def _mark_exploratory_signal(
+        self,
+        signal: TradeSignal,
+        review,
+        ai_scan_review: AIScanReview | None,
+        sizing,
+    ) -> TradeSignal:
+        strategy_data = {
+            **signal.strategy_data,
+            "exploratory_live": True,
+            "exploratory_reason": review.reason,
+            "exploratory_ai_confidence": round(review.confidence, 4),
+            "exploratory_bucket": sizing.bucket,
+            "exploratory_followthrough_bars": self.config.exploratory_followthrough_bars,
+            "exploratory_min_progress_r": self.config.exploratory_min_progress_r,
+            "sizing": {
+                **signal.strategy_data.get("sizing", {}),
+                "bucket": sizing.bucket,
+            },
+        }
+        if ai_scan_review is not None:
+            strategy_data["exploratory_scan_confidence"] = round(ai_scan_review.confidence, 4)
+        return TradeSignal(
+            symbol=signal.symbol,
+            side=signal.side,
+            entry_price=signal.entry_price,
+            stop_price=signal.stop_price,
+            target_price=signal.target_price,
+            rr=signal.rr,
+            setup_type=f"exploratory_{signal.setup_type}",
+            entry_profile="exploratory",
+            reason=f"{signal.reason} Exploratory live entry enabled for B-grade setup.",
+            strategy_data=strategy_data,
         )
 
     def _quote_volume_map(self) -> dict[str, float]:

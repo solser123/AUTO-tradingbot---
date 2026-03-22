@@ -28,6 +28,7 @@ class RiskManager:
         review: AIReview,
         account_equity: float,
         now_time: datetime | None = None,
+        exploratory: bool = False,
     ) -> RiskDecision:
         reference_time = (now_time or datetime.now(KST)).astimezone(KST)
         emergency_active, emergency_reason = self.store.is_emergency_stop()
@@ -72,6 +73,8 @@ class RiskManager:
             return RiskDecision(False, "ATR regime is overheated for a safe entry.")
 
         required_ai_confidence = self.config.min_ai_confidence_for_symbol(signal.symbol)
+        if exploratory:
+            required_ai_confidence = min(required_ai_confidence, self.config.exploratory_ai_min_confidence)
         sector_context = signal.strategy_data.get("sector_context", {})
         sector_flow = float(sector_context.get("flow_score", 0.0) or 0.0)
         sector_liquidity = float(sector_context.get("liquidity_usdt", 0.0) or 0.0)

@@ -125,6 +125,11 @@ class BotConfig:
     global_stoploss_limit: int
     exchange_failure_limit: int
     ai_failure_limit: int
+    enable_exploratory_live: bool
+    exploratory_ai_min_confidence: float
+    exploratory_ai_scan_min_confidence: float
+    exploratory_followthrough_bars: int
+    exploratory_min_progress_r: float
     max_slippage_pct: float
     atr_overheat_multiplier: float
     aggressive_entry_score: float
@@ -394,6 +399,11 @@ class BotConfig:
             global_stoploss_limit=_as_int("BOT_GLOBAL_STOPLOSS_LIMIT", 5),
             exchange_failure_limit=_as_int("BOT_EXCHANGE_FAILURE_LIMIT", 3),
             ai_failure_limit=_as_int("BOT_AI_FAILURE_LIMIT", 3),
+            enable_exploratory_live=_as_bool(os.getenv("BOT_ENABLE_EXPLORATORY_LIVE"), True),
+            exploratory_ai_min_confidence=_as_float("BOT_EXPLORATORY_AI_MIN_CONFIDENCE", 0.42),
+            exploratory_ai_scan_min_confidence=_as_float("BOT_EXPLORATORY_AI_SCAN_MIN_CONFIDENCE", 0.52),
+            exploratory_followthrough_bars=_as_int("BOT_EXPLORATORY_FOLLOWTHROUGH_BARS", 3),
+            exploratory_min_progress_r=_as_float("BOT_EXPLORATORY_MIN_PROGRESS_R", 0.15),
             max_slippage_pct=_as_float("BOT_MAX_SLIPPAGE_PCT", 0.0025),
             atr_overheat_multiplier=_as_float("BOT_ATR_OVERHEAT_MULTIPLIER", 2.5),
             aggressive_entry_score=_as_float("BOT_AGGRESSIVE_ENTRY_SCORE", 0.68),
