@@ -22,6 +22,7 @@ class TradeSignal:
 class AIReview:
     approved: bool
     confidence: float
+    recommended_action: str
     reason: str
     committee: dict[str, float | str | bool]
 

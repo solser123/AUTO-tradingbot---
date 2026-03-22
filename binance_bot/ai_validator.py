@@ -60,6 +60,7 @@ class AIValidator:
             return AIReview(
                 approved=True,
                 confidence=0.0,
+                recommended_action="full",
                 reason="AI validation disabled.",
                 committee={},
             )
@@ -74,8 +75,11 @@ class AIValidator:
             "Approve only if the setup has clear edge, not just a signal. "
             "Reject trades that are late, stretched, noisy, reversal-prone, weak on follow-through, "
             "or structurally poor after fees and slippage. "
+            "Choose exactly one recommended_action from: full, exploratory, no_trade. "
+            "Use full for high-quality setups, exploratory for smaller B-grade setups with some edge, "
+            "and no_trade for weak setups. "
             "If advisory mode is true, treat this as a promotion candidate review for a non-core symbol and be stricter. "
-            "Return strict JSON with keys: approved, confidence, reason, trend_score, trend_reason, "
+            "Return strict JSON with keys: approved, confidence, recommended_action, reason, trend_score, trend_reason, "
             "risk_score, risk_reason, execution_score, execution_reason."
         )
         payload = {
@@ -103,6 +107,12 @@ class AIValidator:
             raw = response.choices[0].message.content or "{}"
             parsed = json.loads(raw)
             confidence = _safe_float(parsed.get("confidence", 0.0), 0.0)
+            recommended_action = str(parsed.get("recommended_action", "no_trade")).strip().lower()
+            if recommended_action not in {"full", "exploratory", "no_trade"}:
+                recommended_action = "no_trade"
+            approved = _safe_bool(parsed.get("approved", False), False)
+            if recommended_action == "no_trade":
+                approved = False
             committee = {
                 "trend_score": max(0.0, min(_safe_float(parsed.get("trend_score", 0.0), 0.0), 1.0)),
                 "trend_reason": str(parsed.get("trend_reason", "")),
@@ -113,8 +123,9 @@ class AIValidator:
                 "advisory_mode": advisory,
             }
             return AIReview(
-                approved=_safe_bool(parsed.get("approved", False), False),
+                approved=approved,
                 confidence=max(0.0, min(confidence, 1.0)),
+                recommended_action=recommended_action,
                 reason=str(parsed.get("reason", "No reason provided.")),
                 committee=committee,
             )
@@ -122,6 +133,7 @@ class AIValidator:
             return AIReview(
                 approved=False,
                 confidence=0.0,
+                recommended_action="no_trade",
                 reason=f"AI validation failed: {exc}",
                 committee={},
             )

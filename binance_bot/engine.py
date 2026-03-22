@@ -440,7 +440,7 @@ class TradingEngine:
         opposite_horizons = int(horizon_context.get("opposite_side_count", 0))
         ai_override = self._ai_override_allowed(ai_scan_review, signal)
         exploratory_signal = self._is_exploratory_signal(signal)
-        if opposite_horizons >= 2 and same_side_horizons == 0 and not (ai_override and exploratory_signal):
+        if opposite_horizons >= 2 and same_side_horizons == 0 and not self._exploratory_horizon_soft_pass(signal, horizon_context, ai_scan_review):
             detail = "Multi-horizon context is materially against the short-term entry."
             self.store.log_decision(
                 symbol=symbol,
@@ -588,6 +588,15 @@ class TradingEngine:
                 stage="ai_review",
                 outcome="exploratory_override",
                 detail=f"Exploratory live allowed despite AI rejection: {review.reason}",
+                payload={"signal": signal.strategy_data, "confidence": review.confidence, "committee": review.committee},
+            )
+        elif exploratory_live:
+            self.store.log_decision(
+                symbol=symbol,
+                mode=self.config.mode,
+                stage="ai_review",
+                outcome="exploratory_preferred",
+                detail=f"AI preferred exploratory sizing: {review.reason}",
                 payload={"signal": signal.strategy_data, "confidence": review.confidence, "committee": review.committee},
             )
         if exploratory_live:
@@ -744,13 +753,15 @@ class TradingEngine:
 
     def _manage_position(self, position: Position, reference_time: datetime) -> None:
         current_price = self.exchange.fetch_last_price(position.symbol)
+        exploratory_window_bars = 2 if position.profile_stage == "exploratory" else self.config.exploratory_followthrough_bars
+        exploratory_min_progress = 0.10 if position.profile_stage == "exploratory" else self.config.exploratory_min_progress_r
         exit_reason = should_exit(
             position,
             current_price,
             self.config.max_hold_minutes,
             reference_time.astimezone(timezone.utc),
-            exploratory_window_minutes=self.config.exploratory_followthrough_bars * _timeframe_to_minutes(self.config.timeframe),
-            exploratory_min_progress_r=self.config.exploratory_min_progress_r,
+            exploratory_window_minutes=exploratory_window_bars * _timeframe_to_minutes(self.config.timeframe),
+            exploratory_min_progress_r=exploratory_min_progress,
         )
         if exit_reason is None:
             logging.info("%s: position open, no exit. price=%.4f", position.symbol, current_price)
@@ -1829,12 +1840,12 @@ class TradingEngine:
                 reason="Hot mover scout sizing capped to exploratory notional.",
                 components=sizing.components,
             )
-        if "composite score is below 55" not in sizing.reason.lower():
+        if sizing.score >= 48.0:
             return sizing
         forced_notional = max(self.config.hot_mover_notional, 0.0)
         return SizingDecision(
             allowed=forced_notional > 0,
-            score=max(sizing.score, 55.0),
+            score=max(sizing.score, 48.0),
             bucket="0.25R",
             risk_pct=self.config.sizing_risk_pct_low,
             risk_multiple=0.25,
@@ -1871,6 +1882,10 @@ class TradingEngine:
             return False
         if ai_scan_review.confidence < self.config.exploratory_ai_scan_min_confidence:
             return False
+        if review.recommended_action == "no_trade":
+            return False
+        if review.recommended_action == "exploratory":
+            return True
         return self._is_exploratory_signal(signal)
 
     def _mark_exploratory_signal(
@@ -1886,8 +1901,8 @@ class TradingEngine:
             "exploratory_reason": review.reason,
             "exploratory_ai_confidence": round(review.confidence, 4),
             "exploratory_bucket": sizing.bucket,
-            "exploratory_followthrough_bars": self.config.exploratory_followthrough_bars,
-            "exploratory_min_progress_r": self.config.exploratory_min_progress_r,
+            "exploratory_followthrough_bars": 2 if bool(signal.strategy_data.get("hot_mover_scout", False)) else min(self.config.exploratory_followthrough_bars, 2),
+            "exploratory_min_progress_r": 0.10 if bool(signal.strategy_data.get("hot_mover_scout", False)) else min(self.config.exploratory_min_progress_r, 0.10),
             "sizing": {
                 **signal.strategy_data.get("sizing", {}),
                 "bucket": sizing.bucket,
@@ -1961,18 +1976,48 @@ class TradingEngine:
             required_confidence = max(0.45, self.config.ai_scan_min_confidence - 0.05)
         return review.confidence >= required_confidence
 
+    def _exploratory_soft_pass_allowed(self, signal: TradeSignal, review: AIScanReview | None) -> bool:
+        if not self._is_exploratory_signal(signal):
+            return False
+        if review is None or not review.approved:
+            return False
+        if review.suggested_side != signal.side:
+            return False
+        if bool(signal.strategy_data.get("hot_mover_scout", False)):
+            return review.confidence >= max(0.44, self.config.exploratory_ai_scan_min_confidence - 0.10)
+        return review.confidence >= max(0.46, self.config.exploratory_ai_scan_min_confidence - 0.08)
+
+    def _exploratory_horizon_soft_pass(
+        self,
+        signal: TradeSignal,
+        horizon_context: dict[str, object],
+        review: AIScanReview | None,
+    ) -> bool:
+        if self._ai_override_allowed(review, signal):
+            return True
+        if not self._exploratory_soft_pass_allowed(signal, review):
+            return False
+        same_side_horizons = int(horizon_context.get("same_side_count", 0) or 0)
+        opposite_horizons = int(horizon_context.get("opposite_side_count", 0) or 0)
+        if bool(signal.strategy_data.get("hot_mover_scout", False)):
+            return opposite_horizons <= 2
+        return same_side_horizons >= 1 or opposite_horizons <= 2
+
     def _sector_soft_pass(
         self,
         signal: TradeSignal,
         sector_context: dict[str, object] | None,
         review: AIScanReview | None,
     ) -> bool:
-        if sector_context is None or not self._ai_override_allowed(review, signal):
+        if sector_context is None:
+            return False
+        if not (self._ai_override_allowed(review, signal) or self._exploratory_soft_pass_allowed(signal, review)):
             return False
         flow_score = float(sector_context.get("flow_score", 0.0) or 0.0)
+        multiplier = 2.0 if self._is_exploratory_signal(signal) else 1.5
         if signal.side == "long":
-            return flow_score > (-1.0 * self.config.sector_opposition_gate_threshold * 1.5)
-        return flow_score < (self.config.sector_opposition_gate_threshold * 1.5)
+            return flow_score > (-1.0 * self.config.sector_opposition_gate_threshold * multiplier)
+        return flow_score < (self.config.sector_opposition_gate_threshold * multiplier)
 
     def _microstructure_min_depth(self, symbol: str) -> float:
         stage = self.config.stage_for_symbol(symbol)
@@ -2019,22 +2064,26 @@ class TradingEngine:
         micro: dict[str, object] | None,
         review: AIScanReview | None,
     ) -> bool:
-        if micro is None or not self._ai_override_allowed(review, signal):
+        if micro is None:
+            return False
+        if not (self._ai_override_allowed(review, signal) or self._exploratory_soft_pass_allowed(signal, review)):
             return False
         spread_pct = float(micro.get("spread_pct", 0.0) or 0.0)
         total_depth = float(micro.get("total_depth_usdt", 0.0) or 0.0)
         trade_flow = float(micro.get("trade_flow_score", 0.0) or 0.0)
         depth_imbalance = float(micro.get("depth_imbalance", 0.0) or 0.0)
         trade_count = int(micro.get("trade_count", 0) or 0)
-        if spread_pct > self.config.microstructure_max_spread_pct * 1.1:
+        spread_multiplier = 1.25 if self._is_exploratory_signal(signal) else 1.1
+        if spread_pct > self.config.microstructure_max_spread_pct * spread_multiplier:
             return False
         if total_depth <= 0 and trade_count >= 20:
             return True
-        if total_depth < self._microstructure_min_depth(signal.symbol) * 0.35:
+        depth_ratio = 0.22 if self._is_exploratory_signal(signal) else 0.35
+        if total_depth < self._microstructure_min_depth(signal.symbol) * depth_ratio:
             return False
         if signal.side == "long":
-            return trade_flow > -0.05 and depth_imbalance > -0.25
-        return trade_flow < 0.05 and depth_imbalance < 0.25
+            return trade_flow > -0.12 and depth_imbalance > -0.35
+        return trade_flow < 0.12 and depth_imbalance < 0.35
 
     def _sync_sector_flows(self, reference_time: datetime) -> None:
         if not self.config.enable_sector_flow:

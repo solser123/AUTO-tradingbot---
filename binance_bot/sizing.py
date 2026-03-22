@@ -111,22 +111,22 @@ def build_sizing_decision(
     )
     total_score = _clamp(total_score, 0.0, 100.0)
 
-    if total_score >= 85.0:
+    if total_score >= 80.0:
         bucket = "1.0R"
         risk_multiple = 1.0
         risk_pct = config.sizing_risk_pct_full
         cap_multiplier = 1.0
-    elif total_score >= 75.0:
+    elif total_score >= 70.0:
         bucket = "0.7R"
         risk_multiple = 0.7
         risk_pct = config.sizing_risk_pct_high
         cap_multiplier = 0.7
-    elif total_score >= 65.0:
+    elif total_score >= 60.0:
         bucket = "0.45R"
         risk_multiple = 0.45
         risk_pct = config.sizing_risk_pct_medium
         cap_multiplier = 0.45
-    elif total_score >= 55.0:
+    elif total_score >= 48.0:
         bucket = "0.25R"
         risk_multiple = 0.25
         risk_pct = config.sizing_risk_pct_low
@@ -141,7 +141,7 @@ def build_sizing_decision(
             notional=0.0,
             risk_notional_cap=0.0,
             stage_cap_notional=0.0,
-            reason="Sizing rejected: composite score is below 55.",
+            reason="Sizing rejected: composite score is below 48.",
             components={
                 "strategy_confidence": round(strategy_points, 2),
                 "timeframe_alignment": round(timeframe_points, 2),
