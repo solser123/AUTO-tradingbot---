@@ -133,6 +133,7 @@ def run_doctor() -> int:
     checks.append(("service-pid", True, runtime_flags.get("service_pid", "") or "none"))
     checks.append(("service-started", True, runtime_flags.get("service_started_at", "") or "none"))
     checks.append(("service-stopped", True, runtime_flags.get("service_stopped_at", "") or "none"))
+    checks.append(("service-heartbeat", True, runtime_flags.get("service_heartbeat_at", "") or "none"))
     checks.append(("runtime-recoverable", True, runtime_recoverable))
     checks.append(("runtime-recovery-note", True, runtime_recovery_message))
     if config.research_symbols:
@@ -599,6 +600,20 @@ def run_live_report() -> int:
     return 0
 
 
+def run_ops_report() -> int:
+    from .ops_report import build_ops_report, render_ops_report, write_ops_report
+
+    _configure_logging()
+    config = BotConfig.from_env()
+    store = StateStore(config.database_path)
+    report = build_ops_report(store, lookback_days=7)
+    rendered = render_ops_report(report)
+    print(rendered)
+    output_path = write_ops_report(report, Path("logs"))
+    print(f"\nreport_path: {output_path}")
+    return 0
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description="Binance Bot V2 foundation")
     parser.add_argument("--once", action="store_true", help="Run one bot cycle and exit")
@@ -619,6 +634,7 @@ def main() -> int:
     parser.add_argument("--opportunity-report", action="store_true", help="Backfill and print missed opportunity analysis")
     parser.add_argument("--macro", action="store_true", help="Show upcoming stored macro events")
     parser.add_argument("--live-report", action="store_true", help="Summarize recent live trading strengths and weaknesses")
+    parser.add_argument("--ops-report", action="store_true", help="Summarize operational blockers, reconcile events, and engine usage")
     args = parser.parse_args()
 
     if args.doctor:
@@ -668,6 +684,9 @@ def main() -> int:
 
     if args.live_report:
         return run_live_report()
+
+    if args.ops_report:
+        return run_ops_report()
 
     _configure_logging()
     engine = build_engine()

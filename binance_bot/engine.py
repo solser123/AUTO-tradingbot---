@@ -178,6 +178,7 @@ class TradingEngine:
 
     def run_once(self) -> None:
         reference_time = datetime.now(KST)
+        self.store.set_state("service_heartbeat_at", reference_time.astimezone(timezone.utc).isoformat())
         account_equity = self._account_equity(reference_time)
         self._refresh_reference_equity(account_equity, reference_time)
         self._sync_external_research(reference_time)

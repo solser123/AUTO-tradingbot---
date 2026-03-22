@@ -39,6 +39,7 @@ RUNTIME_KEYS = [
     "service_pid",
     "service_started_at",
     "service_stopped_at",
+    "service_heartbeat_at",
 ]
 
 

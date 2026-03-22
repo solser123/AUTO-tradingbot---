@@ -37,6 +37,19 @@ print(store.get_state("service_pid") or "")
 } catch {
 }
 
+try {
+    @"
+from datetime import datetime, timezone
+from binance_bot.storage import StateStore
+store = StateStore(r"$dbPath")
+store.set_state("service_pid", "")
+store.set_state("service_started_at", "")
+store.set_state("service_heartbeat_at", "")
+store.set_state("service_stopped_at", datetime.now(timezone.utc).isoformat())
+"@ | & $python - | Out-Null
+} catch {
+}
+
 $processes = Get-CimInstance Win32_Process | Where-Object {
     $_.Name -eq "python.exe" -and $_.CommandLine -like "*$mainPath*"
 }

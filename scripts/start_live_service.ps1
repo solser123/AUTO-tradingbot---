@@ -75,6 +75,16 @@ print(store.get_state("service_pid") or "")
 }
 
 $effectivePid = if ($runtimePid) { $runtimePid } else { $process.Id }
+try {
+    @"
+from datetime import datetime, timezone
+from binance_bot.storage import StateStore
+store = StateStore(r"$dbPath")
+store.set_state("service_pid", "$effectivePid")
+store.set_state("service_started_at", datetime.now(timezone.utc).isoformat())
+"@ | & $python - | Out-Null
+} catch {
+}
 $state = [ordered]@{
     pid = $effectivePid
     wrapper_pid = $process.Id
