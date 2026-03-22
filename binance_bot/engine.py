@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import os
 import time
 from datetime import datetime, timezone
 from pathlib import Path
@@ -24,6 +25,7 @@ from .selector import build_exit_roadmap, default_candidate_symbols, rank_scan
 from .sizing import SizingDecision, build_sizing_decision
 from .storage import StateStore, trading_day_anchor, trading_week_anchor
 from .strategy import scan_market, should_exit
+from .strategy_engines import StrategyEngineOrchestrator
 
 
 KST = ZoneInfo("Asia/Seoul")
@@ -60,6 +62,7 @@ class TradingEngine:
         self.execution_router = execution_router or ExecutionRouter(exchange)
         self._scan_symbols_cache: list[str] | None = None
         self._hot_mover_candidates: dict[str, HotMoverCandidate] = {}
+        self.strategy_orchestrator = StrategyEngineOrchestrator()
 
     def _scan_symbols(self) -> list[str]:
         configured_symbols = self.exchange.resolve_symbols(self.config.active_symbols())
@@ -110,6 +113,8 @@ class TradingEngine:
 
     def run_forever(self) -> None:
         self.store.set_state("runtime_stop_requested", "0")
+        self.store.set_state("service_pid", str(os.getpid()))
+        self.store.set_state("service_started_at", datetime.now(timezone.utc).isoformat())
         self._prime_telegram_offset()
         symbols = self._scan_symbols()
         preview = ", ".join(symbols[:5])
@@ -122,18 +127,23 @@ class TradingEngine:
             f"symbols={preview}\n"
             f"cmd=/help /status /positions /pause /resume /rank /stage /research /sectors /research-news /opportunity BTC /scan BTC /summary /closeall /stopbot"
         )
-        while True:
-            if self._process_telegram_commands():
-                break
-            self.run_once()
-            if self._stop_requested():
-                break
-            time.sleep(self.config.loop_seconds)
-        logging.info("Bot loop finished.")
-        self.notifier.send(f"[BOT STOP] mode={self.config.mode} reason=telegram_or_runtime_stop")
+        try:
+            while True:
+                if self._process_telegram_commands():
+                    break
+                self.run_once()
+                if self._stop_requested():
+                    break
+                time.sleep(self.config.loop_seconds)
+        finally:
+            self.store.set_state("service_stopped_at", datetime.now(timezone.utc).isoformat())
+            logging.info("Bot loop finished.")
+            self.notifier.send(f"[BOT STOP] mode={self.config.mode} reason=telegram_or_runtime_stop")
 
     def run_for_duration(self, duration_seconds: int) -> None:
         self.store.set_state("runtime_stop_requested", "0")
+        self.store.set_state("service_pid", str(os.getpid()))
+        self.store.set_state("service_started_at", datetime.now(timezone.utc).isoformat())
         self._prime_telegram_offset()
         end_time = time.time() + max(duration_seconds, 0)
         symbols = self._scan_symbols()
@@ -151,17 +161,20 @@ class TradingEngine:
             f"duration_seconds={duration_seconds} symbols={preview}\n"
             f"cmd=/help /status /positions /pause /resume /rank /stage /research /sectors /research-news /opportunity BTC /scan BTC /summary /closeall /stopbot"
         )
-        while time.time() < end_time:
-            if self._process_telegram_commands():
-                break
-            self.run_once()
-            if time.time() >= end_time:
-                break
-            if self._stop_requested():
-                break
-            time.sleep(self.config.loop_seconds)
-        logging.info("Bounded bot loop finished.")
-        self.notifier.send(f"[BOT STOP] mode={self.config.mode} duration_seconds={duration_seconds}")
+        try:
+            while time.time() < end_time:
+                if self._process_telegram_commands():
+                    break
+                self.run_once()
+                if time.time() >= end_time:
+                    break
+                if self._stop_requested():
+                    break
+                time.sleep(self.config.loop_seconds)
+        finally:
+            self.store.set_state("service_stopped_at", datetime.now(timezone.utc).isoformat())
+            logging.info("Bounded bot loop finished.")
+            self.notifier.send(f"[BOT STOP] mode={self.config.mode} duration_seconds={duration_seconds}")
 
     def run_once(self) -> None:
         reference_time = datetime.now(KST)
@@ -410,6 +423,14 @@ class TradingEngine:
 
         if signal is not None and hot_mover_candidate is not None and symbol not in self.config.live_symbols():
             signal = self._mark_signal_as_hot_mover(signal, hot_mover_candidate)
+
+        engine_assessment = self.strategy_orchestrator.assess(
+            signal=signal,
+            scan=scan,
+            hot_mover_candidate=hot_mover_candidate,
+            ai_scan_review=ai_scan_review,
+        )
+        self.strategy_orchestrator.annotate_signal(signal, engine_assessment)
 
         signal.strategy_data["multi_horizon"] = horizon_context
         if self.config.ai_scan_assist and ai_scan_review is None:

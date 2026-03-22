@@ -130,6 +130,9 @@ def run_doctor() -> int:
     checks.append(("ai-streak", True, runtime_flags.get("ai_failure_streak", "0") or "0"))
     checks.append(("last-exchange-ok", True, runtime_flags.get("last_exchange_ok_at", "") or "none"))
     checks.append(("last-order-error", True, runtime_flags.get("last_order_error_at", "") or "none"))
+    checks.append(("service-pid", True, runtime_flags.get("service_pid", "") or "none"))
+    checks.append(("service-started", True, runtime_flags.get("service_started_at", "") or "none"))
+    checks.append(("service-stopped", True, runtime_flags.get("service_stopped_at", "") or "none"))
     checks.append(("runtime-recoverable", True, runtime_recoverable))
     checks.append(("runtime-recovery-note", True, runtime_recovery_message))
     if config.research_symbols:

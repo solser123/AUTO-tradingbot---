@@ -36,6 +36,9 @@ RUNTIME_KEYS = [
     "last_order_error_at",
     "last_startup_reset_at",
     "last_runtime_recovery_at",
+    "service_pid",
+    "service_started_at",
+    "service_stopped_at",
 ]
 
 
