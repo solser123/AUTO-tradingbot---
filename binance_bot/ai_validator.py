@@ -156,6 +156,10 @@ class AIValidator:
             "Approve only when there is a plausible early edge versus waiting. "
             "If the scan has no signal, you may still approve an exploratory setup with smaller size if the context suggests "
             "the move is starting before rules fully confirm. "
+            "Do not answer vaguely. If you approve, you must choose exactly one side: long or short. "
+            "If the market is broadly bearish with weak bounce attempts, prefer short exploratory over no-trade. "
+            "If the market is broadly bullish with weak pullback recovery attempts, prefer long exploratory over no-trade. "
+            "Use no-trade only when both sides lack edge. "
             "Return strict JSON with keys: approved, confidence, suggested_side, setup_bias, reason, "
             "trend_score, trend_reason, context_score, context_reason, timing_score, timing_reason."
         )

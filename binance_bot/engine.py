@@ -347,7 +347,8 @@ class TradingEngine:
             }
         same_side_horizons = int(horizon_context.get("same_side_count", 0))
         opposite_horizons = int(horizon_context.get("opposite_side_count", 0))
-        if opposite_horizons >= 2 and same_side_horizons == 0:
+        ai_override = self._ai_override_allowed(ai_scan_review, signal.side)
+        if opposite_horizons >= 2 and same_side_horizons == 0 and not ai_override:
             detail = "Multi-horizon context is materially against the short-term entry."
             self.store.log_decision(
                 symbol=symbol,
@@ -358,7 +359,7 @@ class TradingEngine:
                 payload={"multi_horizon": horizon_context, "signal": signal.strategy_data},
             )
             return
-        if self._sector_blocks_signal(signal.side, sector_context):
+        if self._sector_blocks_signal(signal.side, sector_context) and not self._sector_soft_pass(signal, sector_context, ai_scan_review):
             detail = "Sector flow is materially against this trade."
             self.store.log_decision(
                 symbol=symbol,
@@ -370,7 +371,7 @@ class TradingEngine:
             )
             return
         micro_rejection = self._microstructure_rejection(signal.side, microstructure)
-        if micro_rejection:
+        if micro_rejection and not self._microstructure_soft_pass(signal, microstructure, ai_scan_review):
             self.store.log_decision(
                 symbol=symbol,
                 mode=self.config.mode,
@@ -1568,6 +1569,26 @@ class TradingEngine:
             return flow_score <= (-1.0 * self.config.sector_opposition_gate_threshold)
         return flow_score >= self.config.sector_opposition_gate_threshold
 
+    def _ai_override_allowed(self, review: AIScanReview | None, side: str) -> bool:
+        if review is None or not review.approved:
+            return False
+        if review.suggested_side != side:
+            return False
+        return review.confidence >= max(self.config.ai_scan_min_confidence, 0.60)
+
+    def _sector_soft_pass(
+        self,
+        signal: TradeSignal,
+        sector_context: dict[str, object] | None,
+        review: AIScanReview | None,
+    ) -> bool:
+        if sector_context is None or not self._ai_override_allowed(review, signal.side):
+            return False
+        flow_score = float(sector_context.get("flow_score", 0.0) or 0.0)
+        if signal.side == "long":
+            return flow_score > (-1.0 * self.config.sector_opposition_gate_threshold * 1.5)
+        return flow_score < (self.config.sector_opposition_gate_threshold * 1.5)
+
     def _microstructure_rejection(self, side: str, micro: dict[str, object] | None) -> str | None:
         if not self.config.enable_microstructure_filter or not micro:
             return None
@@ -1591,6 +1612,26 @@ class TradingEngine:
             if depth_imbalance >= self.config.microstructure_imbalance_gate_threshold:
                 return "Microstructure rejected: book imbalance is leaning too bullish."
         return None
+
+    def _microstructure_soft_pass(
+        self,
+        signal: TradeSignal,
+        micro: dict[str, object] | None,
+        review: AIScanReview | None,
+    ) -> bool:
+        if micro is None or not self._ai_override_allowed(review, signal.side):
+            return False
+        spread_pct = float(micro.get("spread_pct", 0.0) or 0.0)
+        total_depth = float(micro.get("total_depth_usdt", 0.0) or 0.0)
+        trade_flow = float(micro.get("trade_flow_score", 0.0) or 0.0)
+        depth_imbalance = float(micro.get("depth_imbalance", 0.0) or 0.0)
+        if spread_pct > self.config.microstructure_max_spread_pct * 1.1:
+            return False
+        if total_depth < self.config.microstructure_min_total_depth_usdt * 0.30:
+            return False
+        if signal.side == "long":
+            return trade_flow > -0.05 and depth_imbalance > -0.25
+        return trade_flow < 0.05 and depth_imbalance < 0.25
 
     def _sync_sector_flows(self, reference_time: datetime) -> None:
         if not self.config.enable_sector_flow:
