@@ -150,7 +150,8 @@ class AIValidator:
         prompt = (
             "You are a crypto pre-signal review committee that works before final trade approval. "
             "Use technical metrics, no-entry reasons, multi-horizon bias, sector flow, external/news alignment, "
-            "and microstructure together. "
+            "and microstructure together. Pay special attention to SMC-style structure clues "
+            "(BOS, CHoCH, liquidity sweeps, FVG proximity), squeeze release state, and session VWAP z-score position. "
             "Your job is not to predict perfectly but to detect whether the market is in an actionable early transition "
             "that deserves either: no trade, long exploratory review, short exploratory review, or confirmed signal support. "
             "Approve only when there is a plausible early edge versus waiting. "
