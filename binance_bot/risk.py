@@ -43,8 +43,10 @@ class RiskManager:
         if self.store.count_open_positions(self.config.mode) >= self.config.max_open_positions:
             return RiskDecision(False, "Maximum number of open positions reached.")
 
+        is_hot_mover_scout = bool(signal.strategy_data.get("hot_mover_scout", False))
         if self.config.mode == "live" and signal.symbol not in self.config.live_symbols():
-            return RiskDecision(False, "Live trading is restricted to configured stage symbols only.")
+            if not (exploratory and is_hot_mover_scout):
+                return RiskDecision(False, "Live trading is restricted to configured stage symbols only.")
 
         if self.config.mode == "live" and not self._is_allowed_entry_time(reference_time):
             return RiskDecision(False, "New entries are disabled outside the configured main session windows.")

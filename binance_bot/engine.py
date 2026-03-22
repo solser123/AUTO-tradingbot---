@@ -11,6 +11,7 @@ from .config import BotConfig
 from .execution_router import ExecutionRouter
 from .exchange import BinanceExchange
 from .external_sources import fetch_blockmedia_news, fetch_tradingview_ideas
+from .hot_movers import HotMoverCandidate, discover_hot_movers
 from .models import AIScanReview, Position, TradeSignal
 from .macro import adjust_sizing_for_macro, build_macro_risk_overlay, get_upcoming_macro_events
 from .notifier import TelegramNotifier
@@ -20,7 +21,7 @@ from .risk import RiskManager
 from .runtime_state import set_runtime_flag
 from .sectors import sector_for_symbol, sector_label
 from .selector import build_exit_roadmap, default_candidate_symbols, rank_scan
-from .sizing import build_sizing_decision
+from .sizing import SizingDecision, build_sizing_decision
 from .storage import StateStore, trading_day_anchor, trading_week_anchor
 from .strategy import scan_market, should_exit
 
@@ -58,17 +59,54 @@ class TradingEngine:
         self.risk_manager = risk_manager
         self.execution_router = execution_router or ExecutionRouter(exchange)
         self._scan_symbols_cache: list[str] | None = None
+        self._hot_mover_candidates: dict[str, HotMoverCandidate] = {}
 
     def _scan_symbols(self) -> list[str]:
-        if self._scan_symbols_cache is None:
-            configured_symbols = self.exchange.resolve_symbols(self.config.active_symbols())
-            managed_symbols = self.store.get_open_symbols(self.config.mode)
-            merged = configured_symbols[:]
-            for symbol in managed_symbols:
-                if symbol not in merged:
-                    merged.append(symbol)
-            self._scan_symbols_cache = merged
-        return self._scan_symbols_cache
+        configured_symbols = self.exchange.resolve_symbols(self.config.active_symbols())
+        managed_symbols = self.store.get_open_symbols(self.config.mode)
+        merged = configured_symbols[:]
+        for symbol in managed_symbols:
+            if symbol not in merged:
+                merged.append(symbol)
+        for symbol in self._refresh_hot_mover_candidates():
+            if symbol not in merged:
+                merged.append(symbol)
+        self._scan_symbols_cache = merged
+        return merged
+
+    def _refresh_hot_mover_candidates(self) -> list[str]:
+        if not self.config.enable_hot_mover_scout or not self.config.is_futures:
+            self._hot_mover_candidates = {}
+            return []
+        if self._entries_paused():
+            self._hot_mover_candidates = {}
+            return []
+        if self._open_hot_mover_count() >= self.config.hot_mover_max_positions:
+            self._hot_mover_candidates = {}
+            return []
+
+        excluded = set(self.exchange.resolve_symbols(self.config.active_symbols()))
+        excluded.update(self.store.get_open_symbols(self.config.mode))
+        recent_listings = set(recent_listing_candidates(self.exchange, limit=20, lookback_days=180))
+        candidates = discover_hot_movers(
+            self.exchange,
+            limit=self.config.hot_mover_scan_limit,
+            min_pct_change=self.config.hot_mover_min_24h_pct,
+            min_quote_volume=self.config.hot_mover_min_quote_volume,
+            allow_shorts=self.config.hot_mover_allow_shorts,
+            exclude_symbols=excluded,
+            recent_listing_symbols=recent_listings,
+        )
+        self._hot_mover_candidates = {item.symbol: item for item in candidates}
+        return [item.symbol for item in candidates]
+
+    def _open_hot_mover_count(self) -> int:
+        live_set = set(self.config.live_symbols())
+        return sum(
+            1
+            for position in self.store.get_open_positions(self.config.mode)
+            if position.symbol not in live_set
+        )
 
     def run_forever(self) -> None:
         self.store.set_state("runtime_stop_requested", "0")
@@ -179,6 +217,7 @@ class TradingEngine:
         higher_df = self.exchange.fetch_ohlcv(symbol, self.config.higher_timeframe)
         scan = scan_market(symbol, execution_df, higher_df, self.config)
         signal = scan.signal
+        hot_mover_candidate = self._hot_mover_candidates.get(symbol)
         horizon_context = self._build_horizon_context(symbol, execution_df, higher_df, scan)
         sector_context = self._sector_context(symbol)
         microstructure = self.exchange.fetch_microstructure(
@@ -195,7 +234,16 @@ class TradingEngine:
             recovered_signal = None
             if self.config.enable_context_recovery:
                 recovered_signal = self._build_context_recovery_signal(symbol, scan, horizon_context)
-            if self._should_run_ai_scan(scan, recovered_signal):
+            if hot_mover_candidate is not None and ai_scan_review is None and self.config.ai_scan_assist:
+                ai_scan_review = self.ai_validator.review_scan(
+                    symbol=symbol,
+                    scan=scan,
+                    horizon_context=horizon_context,
+                    external_context=external_context,
+                    sector_context=sector_context,
+                    microstructure=microstructure,
+                )
+            if ai_scan_review is None and self._should_run_ai_scan(scan, recovered_signal):
                 ai_scan_review = self.ai_validator.review_scan(
                     symbol=symbol,
                     scan=scan,
@@ -253,6 +301,46 @@ class TradingEngine:
                                 "reason": ai_scan_review.reason,
                                 "committee": ai_scan_review.committee,
                             },
+                        },
+                    )
+            if signal is None and hot_mover_candidate is not None:
+                signal = self._build_hot_mover_signal(
+                    candidate=hot_mover_candidate,
+                    scan=scan,
+                    ai_scan_review=ai_scan_review,
+                )
+                if signal is not None:
+                    self.store.log_decision(
+                        symbol=symbol,
+                        mode=self.config.mode,
+                        stage="hot_mover_scout",
+                        outcome="triggered",
+                        detail=(
+                            f"Hot mover scout promoted {signal.side} candidate. "
+                            f"24h={hot_mover_candidate.pct_change_24h:.2f}% volume={hot_mover_candidate.quote_volume:.0f}"
+                        ),
+                        payload={
+                            "candidate": {
+                                "direction": hot_mover_candidate.direction,
+                                "pct_change_24h": hot_mover_candidate.pct_change_24h,
+                                "quote_volume": hot_mover_candidate.quote_volume,
+                                "score": hot_mover_candidate.score,
+                                "recent_listing": hot_mover_candidate.recent_listing,
+                            },
+                            "signal": signal.strategy_data,
+                            "reasons": scan.reasons[:8],
+                            "ai_scan_review": (
+                                {
+                                    "approved": ai_scan_review.approved,
+                                    "confidence": ai_scan_review.confidence,
+                                    "suggested_side": ai_scan_review.suggested_side,
+                                    "setup_bias": ai_scan_review.setup_bias,
+                                    "reason": ai_scan_review.reason,
+                                    "committee": ai_scan_review.committee,
+                                }
+                                if ai_scan_review is not None
+                                else {}
+                            ),
                         },
                     )
             else:
@@ -320,6 +408,9 @@ class TradingEngine:
                 )
                 return
 
+        if signal is not None and hot_mover_candidate is not None and symbol not in self.config.live_symbols():
+            signal = self._mark_signal_as_hot_mover(signal, hot_mover_candidate)
+
         signal.strategy_data["multi_horizon"] = horizon_context
         if self.config.ai_scan_assist and ai_scan_review is None:
             ai_scan_review = self.ai_validator.review_scan(
@@ -348,7 +439,7 @@ class TradingEngine:
         same_side_horizons = int(horizon_context.get("same_side_count", 0))
         opposite_horizons = int(horizon_context.get("opposite_side_count", 0))
         ai_override = self._ai_override_allowed(ai_scan_review, signal)
-        exploratory_signal = signal.setup_type.startswith("ai_") or "context_recovery" in signal.setup_type
+        exploratory_signal = self._is_exploratory_signal(signal)
         if opposite_horizons >= 2 and same_side_horizons == 0 and not (ai_override and exploratory_signal):
             detail = "Multi-horizon context is materially against the short-term entry."
             self.store.log_decision(
@@ -434,6 +525,7 @@ class TradingEngine:
             "importance": macro_overlay.importance,
         }
         sizing = adjust_sizing_for_macro(sizing, macro_overlay)
+        sizing = self._maybe_override_hot_mover_sizing(signal, sizing)
         signal.strategy_data["sizing"] = {
             "score": sizing.score,
             "bucket": sizing.bucket,
@@ -501,6 +593,17 @@ class TradingEngine:
         if exploratory_live:
             signal = self._mark_exploratory_signal(signal, review, ai_scan_review, sizing)
 
+        if bool(signal.strategy_data.get("hot_mover_scout", False)) and self._open_hot_mover_count() >= self.config.hot_mover_max_positions:
+            self.store.log_decision(
+                symbol=symbol,
+                mode=self.config.mode,
+                stage="hot_mover_scout",
+                outcome="rejected",
+                detail="Hot mover scout position cap reached.",
+                payload={"signal": signal.strategy_data},
+            )
+            return
+
         decision = self.risk_manager.can_open_trade(signal, review, account_equity, reference_time, exploratory=exploratory_live)
         if not decision.allowed:
             logging.info("%s: risk manager rejected signal. %s", symbol, decision.reason)
@@ -516,12 +619,14 @@ class TradingEngine:
 
         initial_notional = sizing.notional
         quantity_estimate = initial_notional / signal.entry_price
+        leverage_override = self._leverage_override_for_signal(signal)
         order_plan = self.execution_router.prepare_market_order(
             symbol=symbol,
             side="buy" if signal.side == "long" else "sell",
             reference_price=signal.entry_price,
             requested_quantity=quantity_estimate,
             reduce_only=False,
+            leverage_override=leverage_override,
         )
         quantity = order_plan.normalized_quantity
         if quantity <= 0 or order_plan.reason.startswith("Order rejected:"):
@@ -603,6 +708,7 @@ class TradingEngine:
                 "exploratory_live": exploratory_live,
                 "symbol_stage": self.config.stage_for_symbol(symbol),
                 "base_notional": initial_notional,
+                "leverage_override": leverage_override or self.config.leverage_for_symbol(symbol),
                 "execution_plan": {
                     "estimated_fill_price": order_plan.estimated_fill_price,
                     "estimated_notional": order_plan.estimated_notional,
@@ -627,7 +733,10 @@ class TradingEngine:
             },
         )
         logging.info("%s: opened %s position at %.4f", symbol, signal.side, entry_price)
-        tag = "[EXPLORATORY OPEN]" if exploratory_live else "[OPEN]"
+        if bool(signal.strategy_data.get("hot_mover_scout", False)):
+            tag = "[HOT SCOUT OPEN]"
+        else:
+            tag = "[EXPLORATORY OPEN]" if exploratory_live else "[OPEN]"
         self.notifier.send(
             f"{tag} {symbol} s{self.config.stage_for_symbol(symbol)} {signal.side} entry={entry_price:.4f} "
             f"stop={signal.stop_price:.4f} target={signal.target_price:.4f} ai={review.confidence:.2f}"
@@ -1029,6 +1138,7 @@ class TradingEngine:
             f"paused={paused} emergency={emergency_active}\n"
             f"equity={equity}\n"
             f"open={summary['open_positions']} closed={summary['closed_positions']}\n"
+            f"hot_mover_open={self._open_hot_mover_count()} scout_enabled={self.config.enable_hot_mover_scout}\n"
             f"signals={summary['total_signals']} approved={summary['approved_signals']}\n"
             f"realized_pnl={summary['realized_pnl']:.4f} win_rate={summary['win_rate']:.2f}%\n"
             f"sectors={sector_text}\n"
@@ -1243,6 +1353,7 @@ class TradingEngine:
         )
 
     def _rank_rows(self) -> list[dict[str, object]]:
+        self._refresh_hot_mover_candidates()
         volume_map: dict[str, float] = {}
         if self.config.is_futures:
             try:
@@ -1255,7 +1366,8 @@ class TradingEngine:
                 volume_map = {}
 
         ranked_rows: list[dict[str, object]] = []
-        for symbol in default_candidate_symbols(self.config):
+        scout_symbols = list(self._hot_mover_candidates.keys())
+        for symbol in list(dict.fromkeys(default_candidate_symbols(self.config) + scout_symbols)):
             execution_df = self.exchange.fetch_ohlcv(symbol, self.config.timeframe)
             higher_df = self.exchange.fetch_ohlcv(symbol, self.config.higher_timeframe)
             scan = scan_market(symbol, execution_df, higher_df, self.config)
@@ -1548,6 +1660,196 @@ class TradingEngine:
             },
         )
 
+    def _build_hot_mover_signal(
+        self,
+        *,
+        candidate: HotMoverCandidate,
+        scan,
+        ai_scan_review: AIScanReview | None,
+    ) -> TradeSignal | None:
+        metrics = scan.metrics or {}
+        close = float(metrics.get("close", 0.0) or 0.0)
+        atr = float(metrics.get("atr_14", 0.0) or 0.0)
+        support = float(metrics.get("recent_support", 0.0) or 0.0)
+        resistance = float(metrics.get("recent_resistance", 0.0) or 0.0)
+        volume_ratio = float(metrics.get("volume_ratio", 0.0) or 0.0)
+        ema_20 = float(metrics.get("ema_20", 0.0) or 0.0)
+        ema_50 = float(metrics.get("ema_50", 0.0) or 0.0)
+        session_vwap_zscore = float(metrics.get("session_vwap_zscore", 0.0) or 0.0)
+        squeeze_off = bool(metrics.get("squeeze_off", False))
+        bullish_bos = bool(metrics.get("bullish_bos", False))
+        bearish_bos = bool(metrics.get("bearish_bos", False))
+        bullish_choch = bool(metrics.get("bullish_choch", False))
+        bearish_choch = bool(metrics.get("bearish_choch", False))
+        bullish_fvg = bool(metrics.get("recent_bullish_fvg", False))
+        bearish_fvg = bool(metrics.get("recent_bearish_fvg", False))
+        squeeze_momentum = float(metrics.get("squeeze_momentum", 0.0) or 0.0)
+        if min(close, atr) <= 0:
+            return None
+        if ai_scan_review is None or not ai_scan_review.approved:
+            return None
+        if ai_scan_review.suggested_side != candidate.direction:
+            return None
+        if ai_scan_review.confidence < max(0.45, self.config.exploratory_ai_scan_min_confidence - 0.04):
+            return None
+
+        if candidate.direction == "long":
+            trigger_count = sum(
+                [
+                    int(close >= ema_20 >= ema_50 if ema_20 > 0 and ema_50 > 0 else False),
+                    int(bullish_bos or bullish_choch),
+                    int(bullish_fvg),
+                    int(squeeze_off and squeeze_momentum >= 0),
+                    int(session_vwap_zscore >= -1.9),
+                    int(volume_ratio >= max(0.20, self.config.min_volume_ratio * 0.45)),
+                ]
+            )
+            if trigger_count < 2:
+                return None
+            structural_stop = support if 0 < support < close else close - (atr * 1.8)
+            stop = max(structural_stop, close - max(atr * 1.6, close * 0.012))
+            if stop >= close:
+                stop = close - max(atr * 1.4, close * 0.01)
+            risk = close - stop
+            if risk <= 0:
+                return None
+            target = max(close + (risk * max(self.config.min_rr, 1.8)), resistance if resistance > close else 0.0)
+            side = "long"
+        else:
+            trigger_count = sum(
+                [
+                    int(close <= ema_20 <= ema_50 if ema_20 > 0 and ema_50 > 0 else False),
+                    int(bearish_bos or bearish_choch),
+                    int(bearish_fvg),
+                    int(squeeze_off and squeeze_momentum <= 0),
+                    int(session_vwap_zscore <= 1.9),
+                    int(volume_ratio >= max(0.20, self.config.min_volume_ratio * 0.45)),
+                ]
+            )
+            if trigger_count < 2:
+                return None
+            structural_stop = resistance if resistance > close else close + (atr * 1.8)
+            stop = min(structural_stop, close + max(atr * 1.6, close * 0.012))
+            if stop <= close:
+                stop = close + max(atr * 1.4, close * 0.01)
+            risk = stop - close
+            if risk <= 0:
+                return None
+            support_target = support if 0 < support < close else close - (risk * max(self.config.min_rr, 1.8))
+            target = min(close - (risk * max(self.config.min_rr, 1.8)), support_target)
+            side = "short"
+
+        rr = abs(target - close) / risk if risk > 0 else 0.0
+        if rr < 1.2:
+            return None
+
+        entry_score = min(
+            0.74,
+            0.54
+            + min(abs(candidate.pct_change_24h) / 120.0, 0.10)
+            + (0.03 if candidate.recent_listing else 0.0)
+            + (0.03 if volume_ratio >= self.config.min_volume_ratio else 0.0),
+        )
+        return TradeSignal(
+            symbol=candidate.symbol,
+            side=side,
+            entry_price=close,
+            stop_price=stop,
+            target_price=target,
+            rr=rr,
+            setup_type=f"hot_mover_scout_{side}",
+            entry_profile="exploratory",
+            reason=(
+                f"Hot mover scout {side}: 24h move {candidate.pct_change_24h:.2f}% "
+                f"with AI-aligned momentum and breakout context."
+            ),
+            strategy_data={
+                **metrics,
+                "entry_profile_score": round(entry_score, 4),
+                "entry_profile": "exploratory",
+                "hot_mover_scout": True,
+                "hot_mover_score": round(candidate.score, 4),
+                "hot_mover_direction": candidate.direction,
+                "hot_mover_pct_change_24h": round(candidate.pct_change_24h, 4),
+                "hot_mover_quote_volume": round(candidate.quote_volume, 2),
+                "hot_mover_recent_listing": candidate.recent_listing,
+                "hot_mover_force_notional": self.config.hot_mover_notional,
+                "hot_mover_leverage": self.config.hot_mover_leverage,
+            },
+        )
+
+    def _mark_signal_as_hot_mover(self, signal: TradeSignal, candidate: HotMoverCandidate) -> TradeSignal:
+        strategy_data = {
+            **signal.strategy_data,
+            "hot_mover_scout": True,
+            "hot_mover_score": round(candidate.score, 4),
+            "hot_mover_direction": candidate.direction,
+            "hot_mover_pct_change_24h": round(candidate.pct_change_24h, 4),
+            "hot_mover_quote_volume": round(candidate.quote_volume, 2),
+            "hot_mover_recent_listing": candidate.recent_listing,
+            "hot_mover_force_notional": self.config.hot_mover_notional,
+            "hot_mover_leverage": self.config.hot_mover_leverage,
+            "entry_profile_score": round(max(float(signal.strategy_data.get("entry_profile_score", 0.42) or 0.42), 0.56), 4),
+        }
+        setup_type = signal.setup_type if "hot_mover_scout" in signal.setup_type else f"hot_mover_scout_{signal.setup_type}"
+        return TradeSignal(
+            symbol=signal.symbol,
+            side=signal.side,
+            entry_price=signal.entry_price,
+            stop_price=signal.stop_price,
+            target_price=signal.target_price,
+            rr=signal.rr,
+            setup_type=setup_type,
+            entry_profile="exploratory",
+            reason=f"{signal.reason} Hot mover scout routed this symbol through exploratory live mode.",
+            strategy_data=strategy_data,
+        )
+
+    def _is_exploratory_signal(self, signal: TradeSignal) -> bool:
+        setup = signal.setup_type.lower()
+        return any(
+            token in setup
+            for token in ("ai_", "context_recovery", "smc_reversal", "early_reversal", "hot_mover_scout")
+        )
+
+    def _maybe_override_hot_mover_sizing(self, signal: TradeSignal, sizing: SizingDecision) -> SizingDecision:
+        if not bool(signal.strategy_data.get("hot_mover_scout", False)):
+            return sizing
+        if sizing.allowed:
+            target_notional = min(sizing.notional, self.config.hot_mover_notional)
+            return SizingDecision(
+                allowed=True,
+                score=sizing.score,
+                bucket="0.25R",
+                risk_pct=min(sizing.risk_pct, self.config.sizing_risk_pct_low),
+                risk_multiple=0.25,
+                notional=target_notional,
+                risk_notional_cap=sizing.risk_notional_cap,
+                stage_cap_notional=min(sizing.stage_cap_notional, self.config.hot_mover_notional),
+                reason="Hot mover scout sizing capped to exploratory notional.",
+                components=sizing.components,
+            )
+        if "composite score is below 55" not in sizing.reason.lower():
+            return sizing
+        forced_notional = max(self.config.hot_mover_notional, 0.0)
+        return SizingDecision(
+            allowed=forced_notional > 0,
+            score=max(sizing.score, 55.0),
+            bucket="0.25R",
+            risk_pct=self.config.sizing_risk_pct_low,
+            risk_multiple=0.25,
+            notional=forced_notional,
+            risk_notional_cap=forced_notional,
+            stage_cap_notional=forced_notional,
+            reason="Hot mover scout exploratory sizing override.",
+            components=sizing.components,
+        )
+
+    def _leverage_override_for_signal(self, signal: TradeSignal) -> int | None:
+        if bool(signal.strategy_data.get("hot_mover_scout", False)) and self.config.is_futures:
+            return self.config.hot_mover_leverage
+        return None
+
     def _should_open_exploratory_live(
         self,
         signal: TradeSignal,
@@ -1569,11 +1871,7 @@ class TradingEngine:
             return False
         if ai_scan_review.confidence < self.config.exploratory_ai_scan_min_confidence:
             return False
-        setup = signal.setup_type.lower()
-        return any(
-            token in setup
-            for token in ("ai_", "context_recovery", "smc_reversal", "early_reversal")
-        )
+        return self._is_exploratory_signal(signal)
 
     def _mark_exploratory_signal(
         self,
@@ -1659,7 +1957,7 @@ class TradingEngine:
         if review.suggested_side != signal.side:
             return False
         required_confidence = self.config.ai_scan_min_confidence
-        if signal.setup_type.startswith("ai_") or "context_recovery" in signal.setup_type:
+        if self._is_exploratory_signal(signal):
             required_confidence = max(0.45, self.config.ai_scan_min_confidence - 0.05)
         return review.confidence >= required_confidence
 

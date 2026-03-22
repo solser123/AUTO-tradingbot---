@@ -21,6 +21,7 @@ class MarketOrderPlan:
     step_size: float
     min_amount: float
     min_notional: float
+    leverage_override: int | None
     reason: str
 
 
@@ -56,6 +57,7 @@ class ExecutionRouter:
         reference_price: float,
         requested_quantity: float,
         reduce_only: bool = False,
+        leverage_override: int | None = None,
     ) -> MarketOrderPlan:
         rules = self.exchange.market_rules(symbol)
         allowed, normalized_quantity, reason = self.exchange.validate_order_quantity(
@@ -90,6 +92,7 @@ class ExecutionRouter:
             step_size=float(rules.get("step_size") or 0.0),
             min_amount=float(rules.get("min_amount") or 0.0),
             min_notional=float(rules.get("min_cost") or 0.0),
+            leverage_override=leverage_override,
             reason=plan_reason,
         )
 
@@ -118,6 +121,7 @@ class ExecutionRouter:
             plan.side,
             plan.normalized_quantity,
             reduce_only=plan.reduce_only,
+            leverage_override=plan.leverage_override,
         )
         order_id = str(order.get("id") or "")
         resolved_order = self.exchange.fetch_order_snapshot(plan.symbol, order_id, fallback=order)

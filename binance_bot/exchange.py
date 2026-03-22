@@ -74,8 +74,8 @@ class BinanceExchange:
         for symbol in self.resolve_symbols(self.config.symbols):
             self._configure_symbol_risk_profile(symbol)
 
-    def _configure_symbol_risk_profile(self, symbol: str) -> None:
-        leverage = self.config.leverage_for_symbol(symbol)
+    def _configure_symbol_risk_profile(self, symbol: str, leverage_override: int | None = None) -> None:
+        leverage = leverage_override or self.config.leverage_for_symbol(symbol)
         try:
             self.client.set_margin_mode(
                 self.config.futures_margin_mode,
@@ -90,6 +90,11 @@ class BinanceExchange:
         except Exception:
             # Some symbols or account states can reject leverage updates; the order path will surface issues later.
             pass
+
+    def configure_symbol_risk_profile(self, symbol: str, leverage_override: int | None = None) -> None:
+        if not self.config.is_futures:
+            return
+        self._configure_symbol_risk_profile(symbol, leverage_override=leverage_override)
 
     def fetch_balance(self) -> dict:
         if self.config.is_futures:
@@ -289,10 +294,17 @@ class BinanceExchange:
             return True, normalized_amount, f"Adjusted quantity upward to meet exchange minimums. notional={notional:.4f}"
         return True, normalized_amount, "ok"
 
-    def create_market_order(self, symbol: str, side: str, amount: float, reduce_only: bool = False) -> dict:
+    def create_market_order(
+        self,
+        symbol: str,
+        side: str,
+        amount: float,
+        reduce_only: bool = False,
+        leverage_override: int | None = None,
+    ) -> dict:
         params = {}
         if self.config.is_futures:
-            self._configure_symbol_risk_profile(symbol)
+            self._configure_symbol_risk_profile(symbol, leverage_override=leverage_override)
         if self.config.is_futures and reduce_only:
             params["reduceOnly"] = True
         return self.client.create_order(symbol=symbol, type="market", side=side, amount=amount, params=params)

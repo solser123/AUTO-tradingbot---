@@ -130,6 +130,14 @@ class BotConfig:
     exploratory_ai_scan_min_confidence: float
     exploratory_followthrough_bars: int
     exploratory_min_progress_r: float
+    enable_hot_mover_scout: bool
+    hot_mover_scan_limit: int
+    hot_mover_min_24h_pct: float
+    hot_mover_min_quote_volume: float
+    hot_mover_notional: float
+    hot_mover_leverage: int
+    hot_mover_max_positions: int
+    hot_mover_allow_shorts: bool
     max_slippage_pct: float
     atr_overheat_multiplier: float
     aggressive_entry_score: float
@@ -404,6 +412,14 @@ class BotConfig:
             exploratory_ai_scan_min_confidence=_as_float("BOT_EXPLORATORY_AI_SCAN_MIN_CONFIDENCE", 0.52),
             exploratory_followthrough_bars=_as_int("BOT_EXPLORATORY_FOLLOWTHROUGH_BARS", 3),
             exploratory_min_progress_r=_as_float("BOT_EXPLORATORY_MIN_PROGRESS_R", 0.15),
+            enable_hot_mover_scout=_as_bool(os.getenv("BOT_ENABLE_HOT_MOVER_SCOUT"), True),
+            hot_mover_scan_limit=_as_int("BOT_HOT_MOVER_SCAN_LIMIT", 4),
+            hot_mover_min_24h_pct=_as_float("BOT_HOT_MOVER_MIN_24H_PCT", 18.0),
+            hot_mover_min_quote_volume=_as_float("BOT_HOT_MOVER_MIN_QUOTE_VOLUME", 3000000.0),
+            hot_mover_notional=_as_float("BOT_HOT_MOVER_NOTIONAL", 5.0),
+            hot_mover_leverage=_as_int("BOT_HOT_MOVER_LEVERAGE", 10),
+            hot_mover_max_positions=_as_int("BOT_HOT_MOVER_MAX_POSITIONS", 1),
+            hot_mover_allow_shorts=_as_bool(os.getenv("BOT_HOT_MOVER_ALLOW_SHORTS"), True),
             max_slippage_pct=_as_float("BOT_MAX_SLIPPAGE_PCT", 0.0025),
             atr_overheat_multiplier=_as_float("BOT_ATR_OVERHEAT_MULTIPLIER", 2.5),
             aggressive_entry_score=_as_float("BOT_AGGRESSIVE_ENTRY_SCORE", 0.68),
@@ -469,6 +485,10 @@ class BotConfig:
             raise ValueError("BOT_FUTURES_LEVERAGE must be at least 1.")
         if config.core_leverage < 1 or config.liquid_leverage < 1:
             raise ValueError("Leverage values must be at least 1.")
+        if config.hot_mover_leverage < 1:
+            raise ValueError("BOT_HOT_MOVER_LEVERAGE must be at least 1.")
+        if config.hot_mover_scan_limit < 0 or config.hot_mover_max_positions < 0:
+            raise ValueError("Hot mover scout limits must not be negative.")
         if config.max_open_positions < 1 or config.max_open_positions > 3:
             raise ValueError("BOT_MAX_OPEN_POSITIONS must be between 1 and 3.")
         if config.overflow_scan_limit < 0:
