@@ -440,7 +440,8 @@ class TradingEngine:
         opposite_horizons = int(horizon_context.get("opposite_side_count", 0))
         ai_override = self._ai_override_allowed(ai_scan_review, signal)
         exploratory_signal = self._is_exploratory_signal(signal)
-        if opposite_horizons >= 2 and same_side_horizons == 0 and not self._exploratory_horizon_soft_pass(signal, horizon_context, ai_scan_review):
+        horizon_soft_pass = self._exploratory_horizon_soft_pass(signal, horizon_context, ai_scan_review)
+        if opposite_horizons >= 2 and same_side_horizons == 0 and not horizon_soft_pass:
             detail = "Multi-horizon context is materially against the short-term entry."
             self.store.log_decision(
                 symbol=symbol,
@@ -451,7 +452,18 @@ class TradingEngine:
                 payload={"multi_horizon": horizon_context, "signal": signal.strategy_data},
             )
             return
-        if self._sector_blocks_signal(signal.side, sector_context) and not self._sector_soft_pass(signal, sector_context, ai_scan_review):
+        if opposite_horizons >= 2 and same_side_horizons == 0 and horizon_soft_pass:
+            signal.strategy_data["exploratory_horizon_soft_pass"] = True
+            self.store.log_decision(
+                symbol=symbol,
+                mode=self.config.mode,
+                stage="horizon_gate",
+                outcome="soft_pass",
+                detail="Multi-horizon conflict softened for exploratory execution.",
+                payload={"multi_horizon": horizon_context, "signal": signal.strategy_data},
+            )
+        sector_soft_pass = self._sector_soft_pass(signal, sector_context, ai_scan_review)
+        if self._sector_blocks_signal(signal.side, sector_context) and not sector_soft_pass:
             detail = "Sector flow is materially against this trade."
             self.store.log_decision(
                 symbol=symbol,
@@ -462,8 +474,19 @@ class TradingEngine:
                 payload={"sector_context": sector_context, "signal": signal.strategy_data},
             )
             return
+        if self._sector_blocks_signal(signal.side, sector_context) and sector_soft_pass:
+            signal.strategy_data["exploratory_sector_soft_pass"] = True
+            self.store.log_decision(
+                symbol=symbol,
+                mode=self.config.mode,
+                stage="sector_gate",
+                outcome="soft_pass",
+                detail="Sector opposition softened for exploratory execution.",
+                payload={"sector_context": sector_context, "signal": signal.strategy_data},
+            )
         micro_rejection = self._microstructure_rejection(signal.symbol, signal.side, microstructure)
-        if micro_rejection and not self._microstructure_soft_pass(signal, microstructure, ai_scan_review):
+        micro_soft_pass = self._microstructure_soft_pass(signal, microstructure, ai_scan_review)
+        if micro_rejection and not micro_soft_pass:
             self.store.log_decision(
                 symbol=symbol,
                 mode=self.config.mode,
@@ -473,6 +496,16 @@ class TradingEngine:
                 payload={"microstructure": microstructure, "signal": signal.strategy_data},
             )
             return
+        if micro_rejection and micro_soft_pass:
+            signal.strategy_data["exploratory_micro_soft_pass"] = True
+            self.store.log_decision(
+                symbol=symbol,
+                mode=self.config.mode,
+                stage="micro_gate",
+                outcome="soft_pass",
+                detail="Microstructure rejection softened for exploratory execution.",
+                payload={"microstructure": microstructure, "signal": signal.strategy_data},
+            )
         if int(external_alignment.get("count", 0)) >= 4 and float(external_alignment.get("alignment_score", 0.0)) <= -0.25:
             detail = "External news/community alignment is materially against this trade."
             self.store.log_decision(
@@ -526,6 +559,7 @@ class TradingEngine:
         }
         sizing = adjust_sizing_for_macro(sizing, macro_overlay)
         sizing = self._maybe_override_hot_mover_sizing(signal, sizing)
+        sizing = self._maybe_override_exploratory_sizing(signal, sizing, ai_scan_review)
         signal.strategy_data["sizing"] = {
             "score": sizing.score,
             "bucket": sizing.bucket,
@@ -1856,6 +1890,39 @@ class TradingEngine:
             components=sizing.components,
         )
 
+    def _maybe_override_exploratory_sizing(
+        self,
+        signal: TradeSignal,
+        sizing: SizingDecision,
+        review: AIScanReview | None,
+    ) -> SizingDecision:
+        if sizing.allowed:
+            return sizing
+        if not self._is_exploratory_signal(signal):
+            return sizing
+        if review is None or not review.approved or review.suggested_side != signal.side:
+            return sizing
+        floor = 45.0 if bool(signal.strategy_data.get("hot_mover_scout", False)) else 46.0
+        if sizing.score < floor:
+            return sizing
+        if bool(signal.strategy_data.get("hot_mover_scout", False)):
+            forced_notional = max(self.config.hot_mover_notional, 0.0)
+        else:
+            stage_cap = self.config.stage_notional(signal.symbol)
+            forced_notional = min(stage_cap, max(self.config.stage4_notional, self.config.notional_per_trade))
+        return SizingDecision(
+            allowed=forced_notional > 0,
+            score=max(sizing.score, floor),
+            bucket="0.25R",
+            risk_pct=self.config.sizing_risk_pct_low,
+            risk_multiple=0.25,
+            notional=forced_notional,
+            risk_notional_cap=forced_notional,
+            stage_cap_notional=forced_notional,
+            reason="Exploratory sizing override.",
+            components=sizing.components,
+        )
+
     def _leverage_override_for_signal(self, signal: TradeSignal) -> int | None:
         if bool(signal.strategy_data.get("hot_mover_scout", False)) and self.config.is_futures:
             return self.config.hot_mover_leverage
@@ -2000,8 +2067,8 @@ class TradingEngine:
         same_side_horizons = int(horizon_context.get("same_side_count", 0) or 0)
         opposite_horizons = int(horizon_context.get("opposite_side_count", 0) or 0)
         if bool(signal.strategy_data.get("hot_mover_scout", False)):
-            return opposite_horizons <= 2
-        return same_side_horizons >= 1 or opposite_horizons <= 2
+            return opposite_horizons <= 3
+        return same_side_horizons >= 1 or opposite_horizons <= 3
 
     def _sector_soft_pass(
         self,
@@ -2014,7 +2081,7 @@ class TradingEngine:
         if not (self._ai_override_allowed(review, signal) or self._exploratory_soft_pass_allowed(signal, review)):
             return False
         flow_score = float(sector_context.get("flow_score", 0.0) or 0.0)
-        multiplier = 2.0 if self._is_exploratory_signal(signal) else 1.5
+        multiplier = 3.0 if self._is_exploratory_signal(signal) else 1.5
         if signal.side == "long":
             return flow_score > (-1.0 * self.config.sector_opposition_gate_threshold * multiplier)
         return flow_score < (self.config.sector_opposition_gate_threshold * multiplier)
@@ -2073,17 +2140,17 @@ class TradingEngine:
         trade_flow = float(micro.get("trade_flow_score", 0.0) or 0.0)
         depth_imbalance = float(micro.get("depth_imbalance", 0.0) or 0.0)
         trade_count = int(micro.get("trade_count", 0) or 0)
-        spread_multiplier = 1.25 if self._is_exploratory_signal(signal) else 1.1
+        spread_multiplier = 1.4 if self._is_exploratory_signal(signal) else 1.1
         if spread_pct > self.config.microstructure_max_spread_pct * spread_multiplier:
             return False
-        if total_depth <= 0 and trade_count >= 20:
+        if total_depth <= 0 and trade_count >= 12:
             return True
-        depth_ratio = 0.22 if self._is_exploratory_signal(signal) else 0.35
+        depth_ratio = 0.10 if self._is_exploratory_signal(signal) else 0.35
         if total_depth < self._microstructure_min_depth(signal.symbol) * depth_ratio:
             return False
         if signal.side == "long":
-            return trade_flow > -0.12 and depth_imbalance > -0.35
-        return trade_flow < 0.12 and depth_imbalance < 0.35
+            return trade_flow > -0.20 and depth_imbalance > -0.45
+        return trade_flow < 0.20 and depth_imbalance < 0.45
 
     def _sync_sector_flows(self, reference_time: datetime) -> None:
         if not self.config.enable_sector_flow:
