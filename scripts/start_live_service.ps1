@@ -8,6 +8,7 @@ $logDir = Join-Path $root "logs"
 $logPath = Join-Path $logDir "live_service_$timestamp.log"
 $errPath = Join-Path $logDir "live_service_$timestamp.err.log"
 $statePath = Join-Path $logDir "live_service_state.json"
+$dbPath = Join-Path $root "bot_state.db"
 
 if (-not (Test-Path $logDir)) {
     New-Item -ItemType Directory -Path $logDir | Out-Null
@@ -52,8 +53,32 @@ $process = Start-Process `
     -RedirectStandardError $errPath `
     -PassThru
 
+$runtimePid = $null
+for ($i = 0; $i -lt 20; $i++) {
+    Start-Sleep -Seconds 1
+    try {
+        $candidate = @"
+from binance_bot.storage import StateStore
+store = StateStore(r"$dbPath")
+print(store.get_state("service_pid") or "")
+"@ | & $python -
+        $candidate = ($candidate | Out-String).Trim()
+        if ($candidate) {
+            $runtimeProc = Get-Process -Id ([int]$candidate) -ErrorAction SilentlyContinue
+            if ($runtimeProc) {
+                $runtimePid = [int]$candidate
+                break
+            }
+        }
+    } catch {
+    }
+}
+
+$effectivePid = if ($runtimePid) { $runtimePid } else { $process.Id }
 $state = [ordered]@{
-    pid = $process.Id
+    pid = $effectivePid
+    wrapper_pid = $process.Id
+    runtime_pid = $runtimePid
     started_at = (Get-Date).ToString("o")
     root = $root
     log = $logPath
@@ -61,7 +86,9 @@ $state = [ordered]@{
 }
 $state | ConvertTo-Json | Set-Content -Path $statePath -Encoding UTF8
 
-Write-Output "PID=$($process.Id)"
+Write-Output "PID=$effectivePid"
+Write-Output "WRAPPER_PID=$($process.Id)"
+Write-Output "RUNTIME_PID=$runtimePid"
 Write-Output "LOG=$logPath"
 Write-Output "ERR=$errPath"
 Write-Output "STATE=$statePath"

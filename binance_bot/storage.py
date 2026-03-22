@@ -473,6 +473,32 @@ class StateStore:
                 (quantity, profile_stage, position_id),
             )
 
+    def cleanup_zero_quantity_open_positions(
+        self,
+        mode: str,
+        *,
+        reason: str = "zero_quantity_cleanup",
+        quantity_epsilon: float = 1e-9,
+    ) -> list[str]:
+        with self._connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT id, symbol, entry_price, quantity
+                FROM positions
+                WHERE status = 'OPEN'
+                  AND mode = ?
+                  AND ABS(quantity) <= ?
+                ORDER BY id
+                """,
+                (mode, quantity_epsilon),
+            ).fetchall()
+
+        cleaned: list[str] = []
+        for row in rows:
+            self.close_position(int(row["id"]), float(row["entry_price"]), reason)
+            cleaned.append(str(row["symbol"]))
+        return cleaned
+
     def close_position(self, position_id: int, exit_price: float, exit_reason: str) -> None:
         with self._connect() as conn:
             row = conn.execute(

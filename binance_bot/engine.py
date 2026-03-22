@@ -914,6 +914,21 @@ class TradingEngine:
             reduce_qty = execution.executed_quantity or reduce_qty
 
         remaining_qty = max(position.quantity - reduce_qty, 0.0)
+        if remaining_qty <= 1e-9:
+            self.store.close_position(position.id or 0, current_price, "rebalance_flattened")
+            self.store.log_decision(
+                symbol=position.symbol,
+                mode=self.config.mode,
+                stage="position_rebalance",
+                outcome="flattened",
+                detail=f"Rebalance flattened the position while moving to {next_stage}.",
+                payload={"current_price": current_price, "reduced_qty": reduce_qty, "remaining_qty": remaining_qty},
+            )
+            self.notifier.send(
+                f"[REBALANCE CLOSE] {position.symbol} {position.profile_stage}->{next_stage} "
+                f"reduced={reduce_qty:.6f} remaining=0.000000"
+            )
+            return
         self.store.update_position_stage(position.id or 0, remaining_qty, next_stage)
         self.store.log_decision(
             symbol=position.symbol,
@@ -983,6 +998,19 @@ class TradingEngine:
         emergency_active, _ = self.store.is_emergency_stop()
         if emergency_active:
             return
+        cleaned_symbols = self.store.cleanup_zero_quantity_open_positions(
+            self.config.mode,
+            reason="reconcile_zero_quantity_cleanup",
+        )
+        if cleaned_symbols:
+            self.store.log_decision(
+                symbol="SYSTEM",
+                mode=self.config.mode,
+                stage="position_reconcile",
+                outcome="auto_cleanup",
+                detail=f"Auto-closed zero-quantity open positions: {','.join(cleaned_symbols)}",
+                payload={"symbols": cleaned_symbols},
+            )
         try:
             db_symbols = sorted(self.store.get_open_symbols(self.config.mode))
             exchange_symbols = self.exchange.fetch_open_position_symbols()
@@ -996,6 +1024,23 @@ class TradingEngine:
                 payload={},
             )
             return
+        if db_symbols != exchange_symbols:
+            cleaned_missing = self.store.cleanup_zero_quantity_open_positions(
+                self.config.mode,
+                reason="reconcile_missing_on_exchange",
+            )
+            if cleaned_missing:
+                db_symbols = sorted(self.store.get_open_symbols(self.config.mode))
+                if db_symbols == exchange_symbols:
+                    self.store.log_decision(
+                        symbol="SYSTEM",
+                        mode=self.config.mode,
+                        stage="position_reconcile",
+                        outcome="auto_recovered",
+                        detail=f"Recovered mismatch by clearing stale zero-quantity positions: {','.join(cleaned_missing)}",
+                        payload={"symbols": cleaned_missing},
+                    )
+                    return
         if db_symbols != exchange_symbols:
             reason = (
                 "Live/open position mismatch detected. "

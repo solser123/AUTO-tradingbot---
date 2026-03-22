@@ -2,20 +2,39 @@ $ErrorActionPreference = "Stop"
 
 $root = Split-Path -Parent $PSScriptRoot
 $mainPath = Join-Path $root "main.py"
+$python = Join-Path $root ".venv\Scripts\python.exe"
+$dbPath = Join-Path $root "bot_state.db"
 $statePath = Join-Path (Join-Path $root "logs") "live_service_state.json"
 $stopped = $false
 
 if (Test-Path $statePath) {
     try {
         $state = Get-Content $statePath -Raw | ConvertFrom-Json
-        if ($state.pid) {
-            Stop-Process -Id ([int]$state.pid) -Force -ErrorAction Stop
-            Write-Output ("STOPPED=" + $state.pid)
-            $stopped = $true
+        foreach ($pidValue in @($state.runtime_pid, $state.wrapper_pid, $state.pid)) {
+            if ($pidValue) {
+                Stop-Process -Id ([int]$pidValue) -Force -ErrorAction SilentlyContinue
+                Write-Output ("STOPPED=" + $pidValue)
+                $stopped = $true
+            }
         }
     } catch {
     }
     Remove-Item $statePath -Force -ErrorAction SilentlyContinue
+}
+
+try {
+    $runtimePid = @"
+from binance_bot.storage import StateStore
+store = StateStore(r"$dbPath")
+print(store.get_state("service_pid") or "")
+"@ | & $python -
+    $runtimePid = ($runtimePid | Out-String).Trim()
+    if ($runtimePid) {
+        Stop-Process -Id ([int]$runtimePid) -Force -ErrorAction SilentlyContinue
+        Write-Output ("STOPPED=" + $runtimePid)
+        $stopped = $true
+    }
+} catch {
 }
 
 $processes = Get-CimInstance Win32_Process | Where-Object {
