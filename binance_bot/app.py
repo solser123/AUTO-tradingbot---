@@ -120,6 +120,7 @@ def run_doctor() -> int:
     checks.append(("sector-flow", True, f"enabled={config.enable_sector_flow} sync={config.sector_sync_interval_minutes}m boost={config.sector_alignment_notional_boost_pct:.0%}"))
     checks.append(("micro-filter", True, f"enabled={config.enable_microstructure_filter} depth={config.microstructure_orderbook_depth} spread={config.microstructure_max_spread_pct:.3%}"))
     checks.append(("sizing", True, f"risk_full={config.sizing_risk_pct_full:.2%} total_open={config.sizing_max_total_open_risk_pct:.2%} sector_cap={config.sizing_max_same_sector_open_risk_pct:.2%}"))
+    checks.append(("ai-position", True, f"enabled={config.enable_ai_position_manager} interval={config.ai_position_manage_interval_minutes}m target_cap={config.ai_position_target_raise_cap_r:.2f}R"))
     checks.append(("execution-router", True, "market-order planning with exchange rules and fill estimation"))
     checks.append(("order-lifecycle", True, "order_lifecycle table + registry enabled"))
     checks.append(("macro-layer", True, f"upcoming={len(store.get_upcoming_macro_events(hours=48, limit=10))}"))

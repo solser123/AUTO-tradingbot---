@@ -37,6 +37,14 @@ class AIScanReview:
     committee: dict[str, float | str | bool]
 
 
+@dataclass(frozen=True)
+class AIManageDecision:
+    action: str
+    confidence: float
+    reason: str
+    committee: dict[str, float | str | bool]
+
+
 @dataclass
 class Position:
     symbol: str

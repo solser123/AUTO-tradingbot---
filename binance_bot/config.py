@@ -126,6 +126,14 @@ class BotConfig:
     global_stoploss_limit: int
     exchange_failure_limit: int
     ai_failure_limit: int
+    enable_ai_position_manager: bool
+    ai_position_manage_interval_minutes: int
+    ai_position_manage_min_age_minutes: int
+    ai_position_min_confidence: float
+    ai_position_exploratory_min_confidence: float
+    ai_position_daily_profit_target_pct: float
+    ai_position_target_raise_step_r: float
+    ai_position_target_raise_cap_r: float
     enable_exploratory_live: bool
     exploratory_ai_min_confidence: float
     exploratory_ai_scan_min_confidence: float
@@ -412,6 +420,14 @@ class BotConfig:
             global_stoploss_limit=_as_int("BOT_GLOBAL_STOPLOSS_LIMIT", 5),
             exchange_failure_limit=_as_int("BOT_EXCHANGE_FAILURE_LIMIT", 3),
             ai_failure_limit=_as_int("BOT_AI_FAILURE_LIMIT", 3),
+            enable_ai_position_manager=_as_bool(os.getenv("BOT_ENABLE_AI_POSITION_MANAGER"), True),
+            ai_position_manage_interval_minutes=_as_int("BOT_AI_POSITION_MANAGE_INTERVAL_MINUTES", 15),
+            ai_position_manage_min_age_minutes=_as_int("BOT_AI_POSITION_MANAGE_MIN_AGE_MINUTES", 15),
+            ai_position_min_confidence=_as_float("BOT_AI_POSITION_MIN_CONFIDENCE", 0.52),
+            ai_position_exploratory_min_confidence=_as_float("BOT_AI_POSITION_EXPLORATORY_MIN_CONFIDENCE", 0.44),
+            ai_position_daily_profit_target_pct=_as_float("BOT_AI_POSITION_DAILY_PROFIT_TARGET_PCT", 0.01),
+            ai_position_target_raise_step_r=_as_float("BOT_AI_POSITION_TARGET_RAISE_STEP_R", 0.25),
+            ai_position_target_raise_cap_r=_as_float("BOT_AI_POSITION_TARGET_RAISE_CAP_R", 0.75),
             enable_exploratory_live=_as_bool(os.getenv("BOT_ENABLE_EXPLORATORY_LIVE"), True),
             exploratory_ai_min_confidence=_as_float("BOT_EXPLORATORY_AI_MIN_CONFIDENCE", 0.42),
             exploratory_ai_scan_min_confidence=_as_float("BOT_EXPLORATORY_AI_SCAN_MIN_CONFIDENCE", 0.52),

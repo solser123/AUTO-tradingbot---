@@ -463,14 +463,47 @@ class StateStore:
         return position
 
     def update_position_stage(self, position_id: int, quantity: float, profile_stage: str) -> None:
+        self.update_position_management(
+            position_id,
+            quantity=quantity,
+            profile_stage=profile_stage,
+        )
+
+    def update_position_target(self, position_id: int, target_price: float) -> None:
+        self.update_position_management(
+            position_id,
+            target_price=target_price,
+        )
+
+    def update_position_management(
+        self,
+        position_id: int,
+        *,
+        quantity: float | None = None,
+        profile_stage: str | None = None,
+        target_price: float | None = None,
+    ) -> None:
+        updates: list[str] = []
+        params: list[object] = []
+        if quantity is not None:
+            updates.append("quantity = ?")
+            params.append(quantity)
+        if profile_stage is not None:
+            updates.append("profile_stage = ?")
+            params.append(profile_stage)
+        if target_price is not None:
+            updates.append("target_price = ?")
+            params.append(target_price)
+        if not updates:
+            return
         with self._connect() as conn:
             conn.execute(
-                """
+                f"""
                 UPDATE positions
-                SET quantity = ?, profile_stage = ?
+                SET {', '.join(updates)}
                 WHERE id = ?
                 """,
-                (quantity, profile_stage, position_id),
+                (*params, position_id),
             )
 
     def cleanup_zero_quantity_open_positions(

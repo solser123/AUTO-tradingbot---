@@ -7,6 +7,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
+from .ai_position_manager import AIPositionManager
 from .ai_validator import AIValidator
 from .coinglass_client import CoinGlassClient
 from .config import BotConfig
@@ -14,7 +15,7 @@ from .execution_router import ExecutionRouter
 from .exchange import BinanceExchange
 from .external_sources import fetch_blockmedia_news, fetch_tradingview_ideas
 from .hot_movers import HotMoverCandidate, discover_hot_movers
-from .models import AIScanReview, Position, TradeSignal
+from .models import AIManageDecision, AIScanReview, Position, TradeSignal
 from .macro import adjust_sizing_for_macro, build_macro_risk_overlay, get_upcoming_macro_events
 from .notifier import TelegramNotifier
 from .opportunity import analyze_pending_opportunities
@@ -65,6 +66,10 @@ class TradingEngine:
         self._hot_mover_candidates: dict[str, HotMoverCandidate] = {}
         self._coinglass_supported_symbols: set[str] = set()
         self.coinglass = CoinGlassClient(config)
+        self.ai_position_manager = AIPositionManager(
+            config,
+            client=self.ai_validator.client if getattr(self.ai_validator, "enabled", False) else None,
+        )
         self.strategy_orchestrator = StrategyEngineOrchestrator()
 
     def _scan_symbols(self) -> list[str]:
@@ -222,7 +227,7 @@ class TradingEngine:
     def _process_symbol(self, symbol: str, account_equity: float, reference_time: datetime) -> None:
         position = self.store.get_open_position(symbol, self.config.mode)
         if position is not None:
-            self._manage_position(position, reference_time)
+            self._manage_position(position, reference_time, account_equity)
             return
 
         if self._entries_paused():
@@ -812,7 +817,7 @@ class TradingEngine:
             f"stop={signal.stop_price:.4f} target={signal.target_price:.4f} ai={review.confidence:.2f}"
         )
 
-    def _manage_position(self, position: Position, reference_time: datetime) -> None:
+    def _manage_position(self, position: Position, reference_time: datetime, account_equity: float) -> None:
         current_price = self.exchange.fetch_last_price(position.symbol)
         exploratory_window_bars = 2 if position.profile_stage == "exploratory" else self.config.exploratory_followthrough_bars
         exploratory_min_progress = 0.10 if position.profile_stage == "exploratory" else self.config.exploratory_min_progress_r
@@ -825,6 +830,14 @@ class TradingEngine:
             exploratory_min_progress_r=exploratory_min_progress,
         )
         if exit_reason is None:
+            ai_managed = self._maybe_manage_position_with_ai(
+                position=position,
+                current_price=current_price,
+                reference_time=reference_time,
+                account_equity=account_equity,
+            )
+            if ai_managed:
+                return
             logging.info("%s: position open, no exit. price=%.4f", position.symbol, current_price)
             self.store.log_decision(
                 symbol=position.symbol,
@@ -865,6 +878,352 @@ class TradingEngine:
                 self.notifier.send(f"[SYMBOL STOP] {position.symbol} stop-loss streak={symbol_streak}")
             if global_streak >= self.config.global_stoploss_limit:
                 self.notifier.send(f"[REVIEW MODE] global stop-loss streak={global_streak}")
+
+    def _maybe_manage_position_with_ai(
+        self,
+        *,
+        position: Position,
+        current_price: float,
+        reference_time: datetime,
+        account_equity: float,
+    ) -> bool:
+        if not self._should_run_ai_position_management(position, reference_time):
+            return False
+
+        try:
+            execution_df = self.exchange.fetch_ohlcv(position.symbol, self.config.timeframe)
+            higher_df = self.exchange.fetch_ohlcv(position.symbol, self.config.higher_timeframe)
+            scan = scan_market(position.symbol, execution_df, higher_df, self.config)
+            horizon_context = self._build_horizon_context(position.symbol, execution_df, higher_df, scan)
+            sector_context = self._sector_context(position.symbol)
+            microstructure = self.exchange.fetch_microstructure(
+                position.symbol,
+                depth=self.config.microstructure_orderbook_depth,
+                trade_limit=self.config.microstructure_trade_limit,
+            )
+            external_context = {
+                "long": self.store.get_external_alignment(position.symbol, "long", hours=36),
+                "short": self.store.get_external_alignment(position.symbol, "short", hours=36),
+            }
+            daily_realized_pnl = self.store.get_today_realized_pnl(self.config.mode, reference_time)
+            daily_profit_target = max(account_equity * self.config.ai_position_daily_profit_target_pct, 0.0)
+            risk_distance = abs(position.entry_price - position.stop_price)
+            unrealized_pnl = self._position_unrealized_pnl(position, current_price)
+            unrealized_pnl_pct = (
+                unrealized_pnl / max(position.entry_price * position.quantity, 1e-9)
+                if position.entry_price > 0 and position.quantity > 0
+                else 0.0
+            )
+            progress_r = self._position_progress_r(position, current_price, risk_distance)
+            decision = self.ai_position_manager.review_position(
+                position=position,
+                current_price=current_price,
+                current_progress_r=progress_r,
+                unrealized_pnl=unrealized_pnl,
+                unrealized_pnl_pct=unrealized_pnl_pct,
+                daily_realized_pnl=daily_realized_pnl,
+                daily_profit_target=daily_profit_target,
+                scan_metrics=scan.metrics,
+                horizon_context=horizon_context,
+                sector_context=sector_context,
+                external_context=external_context,
+                microstructure=microstructure,
+            )
+            self.store.set_state(
+                self._position_manage_state_key(position.id or 0),
+                reference_time.astimezone(timezone.utc).isoformat(),
+            )
+            if decision.reason.startswith("AI position management failed:"):
+                self.store.increment_state_counter("ai_failure_streak")
+                self.store.log_decision(
+                    symbol=position.symbol,
+                    mode=self.config.mode,
+                    stage="ai_position_manage",
+                    outcome="error",
+                    detail=decision.reason,
+                    payload={"position_id": position.id, "current_price": current_price},
+                )
+                return False
+
+            self.store.reset_state_counter("ai_failure_streak")
+            confidence_floor = self._ai_position_confidence_floor(position)
+            if decision.confidence < confidence_floor:
+                self.store.log_decision(
+                    symbol=position.symbol,
+                    mode=self.config.mode,
+                    stage="ai_position_manage",
+                    outcome="hold",
+                    detail=f"AI management confidence {decision.confidence:.2f} is below floor {confidence_floor:.2f}.",
+                    payload={
+                        "position_id": position.id,
+                        "current_price": current_price,
+                        "decision": {
+                            "action": decision.action,
+                            "confidence": decision.confidence,
+                            "reason": decision.reason,
+                            "committee": decision.committee,
+                        },
+                    },
+                )
+                return True
+            return self._apply_ai_position_decision(
+                position=position,
+                current_price=current_price,
+                decision=decision,
+                daily_realized_pnl=daily_realized_pnl,
+                daily_profit_target=daily_profit_target,
+            )
+        except Exception as exc:
+            self.store.increment_state_counter("ai_failure_streak")
+            self.store.log_decision(
+                symbol=position.symbol,
+                mode=self.config.mode,
+                stage="ai_position_manage",
+                outcome="error",
+                detail=str(exc),
+                payload={"position_id": position.id, "current_price": current_price},
+            )
+            return False
+
+    def _apply_ai_position_decision(
+        self,
+        *,
+        position: Position,
+        current_price: float,
+        decision: AIManageDecision,
+        daily_realized_pnl: float,
+        daily_profit_target: float,
+    ) -> bool:
+        payload = {
+            "position_id": position.id,
+            "current_price": current_price,
+            "confidence": decision.confidence,
+            "reason": decision.reason,
+            "committee": decision.committee,
+            "daily_realized_pnl": daily_realized_pnl,
+            "daily_profit_target": daily_profit_target,
+        }
+        if decision.action == "hold":
+            self.store.log_decision(
+                symbol=position.symbol,
+                mode=self.config.mode,
+                stage="ai_position_manage",
+                outcome="hold",
+                detail=decision.reason,
+                payload=payload,
+            )
+            return True
+        if decision.action == "exit_now":
+            self._close_position(position, current_price, "ai_exit_now")
+            self.store.log_decision(
+                symbol=position.symbol,
+                mode=self.config.mode,
+                stage="ai_position_manage",
+                outcome="exit_now",
+                detail=decision.reason,
+                payload=payload,
+            )
+            self.notifier.send(
+                f"[AI MANAGE] {position.symbol} exit_now price={current_price:.4f} ai={decision.confidence:.2f}"
+            )
+            return True
+        if decision.action == "reduce_25":
+            self._reduce_position(position, current_price, 0.25, "ai_reduce_25")
+            self.store.log_decision(
+                symbol=position.symbol,
+                mode=self.config.mode,
+                stage="ai_position_manage",
+                outcome="reduce_25",
+                detail=decision.reason,
+                payload=payload,
+            )
+            self.notifier.send(
+                f"[AI MANAGE] {position.symbol} reduce_25 price={current_price:.4f} ai={decision.confidence:.2f}"
+            )
+            return True
+        if decision.action == "reduce_50":
+            next_stage = "balanced" if position.profile_stage == "aggressive" else "conservative"
+            self._reduce_position(position, current_price, 0.50, "ai_reduce_50", next_stage=next_stage)
+            self.store.log_decision(
+                symbol=position.symbol,
+                mode=self.config.mode,
+                stage="ai_position_manage",
+                outcome="reduce_50",
+                detail=decision.reason,
+                payload={**payload, "next_stage": next_stage},
+            )
+            self.notifier.send(
+                f"[AI MANAGE] {position.symbol} reduce_50 price={current_price:.4f} ai={decision.confidence:.2f}"
+            )
+            return True
+        if decision.action in {"tighten_to_balanced", "tighten_to_conservative"}:
+            next_stage = "balanced" if decision.action == "tighten_to_balanced" else "conservative"
+            self.store.log_decision(
+                symbol=position.symbol,
+                mode=self.config.mode,
+                stage="ai_position_manage",
+                outcome=decision.action,
+                detail=decision.reason,
+                payload={**payload, "next_stage": next_stage},
+            )
+            self._rebalance_position(position, current_price, next_stage)
+            self.notifier.send(
+                f"[AI MANAGE] {position.symbol} {decision.action} price={current_price:.4f} ai={decision.confidence:.2f}"
+            )
+            return True
+        if decision.action in {"raise_target_small", "raise_target_medium"}:
+            if daily_profit_target > 0 and daily_realized_pnl >= daily_profit_target:
+                self.store.log_decision(
+                    symbol=position.symbol,
+                    mode=self.config.mode,
+                    stage="ai_position_manage",
+                    outcome="hold",
+                    detail="Skipped target raise because daily profitability target is already met.",
+                    payload=payload,
+                )
+                return True
+            multiplier = 1.0 if decision.action == "raise_target_small" else 2.0
+            new_target = self._raise_position_target(position, multiplier)
+            if new_target is None:
+                self.store.log_decision(
+                    symbol=position.symbol,
+                    mode=self.config.mode,
+                    stage="ai_position_manage",
+                    outcome="hold",
+                    detail="Target raise was requested but no bounded room remained.",
+                    payload=payload,
+                )
+                return True
+            self.store.log_decision(
+                symbol=position.symbol,
+                mode=self.config.mode,
+                stage="ai_position_manage",
+                outcome=decision.action,
+                detail=decision.reason,
+                payload={**payload, "new_target": new_target},
+            )
+            self.notifier.send(
+                f"[AI MANAGE] {position.symbol} {decision.action} target={new_target:.4f} ai={decision.confidence:.2f}"
+            )
+            return True
+        return False
+
+    def _should_run_ai_position_management(self, position: Position, reference_time: datetime) -> bool:
+        if not self.config.enable_ai_position_manager:
+            return False
+        if not self.ai_position_manager.enabled:
+            return False
+        if position.id is None:
+            return False
+        age_minutes = (reference_time.astimezone(timezone.utc) - position.opened_at).total_seconds() / 60
+        min_age_minutes = self.config.ai_position_manage_min_age_minutes
+        if position.profile_stage == "exploratory":
+            min_age_minutes = max(5, min_age_minutes // 2)
+        if age_minutes < min_age_minutes:
+            return False
+        last_run_text = self.store.get_state(self._position_manage_state_key(position.id))
+        if not last_run_text:
+            return True
+        try:
+            last_run = datetime.fromisoformat(last_run_text)
+        except ValueError:
+            return True
+        if last_run.tzinfo is None:
+            last_run = last_run.replace(tzinfo=timezone.utc)
+        else:
+            last_run = last_run.astimezone(timezone.utc)
+        interval_minutes = self.config.ai_position_manage_interval_minutes
+        if position.profile_stage == "exploratory":
+            interval_minutes = max(5, interval_minutes // 2)
+        elapsed_minutes = (reference_time.astimezone(timezone.utc) - last_run).total_seconds() / 60
+        return elapsed_minutes >= interval_minutes
+
+    def _ai_position_confidence_floor(self, position: Position) -> float:
+        if position.profile_stage == "exploratory":
+            return self.config.ai_position_exploratory_min_confidence
+        return self.config.ai_position_min_confidence
+
+    def _position_unrealized_pnl(self, position: Position, current_price: float) -> float:
+        if position.side == "long":
+            return (current_price - position.entry_price) * position.quantity
+        return (position.entry_price - current_price) * position.quantity
+
+    def _position_progress_r(self, position: Position, current_price: float, risk_distance: float) -> float:
+        if risk_distance <= 0:
+            return 0.0
+        if position.side == "long":
+            return (current_price - position.entry_price) / risk_distance
+        return (position.entry_price - current_price) / risk_distance
+
+    def _position_manage_state_key(self, position_id: int) -> str:
+        return f"ai_position_manage:{position_id}"
+
+    def _raise_position_target(self, position: Position, multiplier: float) -> float | None:
+        risk_distance = abs(position.entry_price - position.stop_price)
+        if risk_distance <= 0:
+            return None
+        raise_step = risk_distance * self.config.ai_position_target_raise_step_r * max(multiplier, 1.0)
+        cap_extension = risk_distance * self.config.ai_position_target_raise_cap_r
+        if position.side == "long":
+            base_target = position.entry_price + (risk_distance * self.config.min_rr)
+            max_target = base_target + cap_extension
+            new_target = min(position.target_price + raise_step, max_target)
+            if new_target <= position.target_price + 1e-9:
+                return None
+        else:
+            base_target = position.entry_price - (risk_distance * self.config.min_rr)
+            max_target = base_target - cap_extension
+            new_target = max(position.target_price - raise_step, max_target)
+            if new_target >= position.target_price - 1e-9:
+                return None
+        self.store.update_position_target(position.id or 0, new_target)
+        return new_target
+
+    def _reduce_position(
+        self,
+        position: Position,
+        current_price: float,
+        reduction_ratio: float,
+        exit_reason: str,
+        *,
+        next_stage: str | None = None,
+    ) -> None:
+        reduce_qty = round(position.quantity * reduction_ratio, 12)
+        if reduce_qty <= 0:
+            return
+        if self.config.mode == "live":
+            order_plan = self.execution_router.prepare_market_order(
+                symbol=position.symbol,
+                side="sell" if position.side == "long" else "buy",
+                reference_price=current_price,
+                requested_quantity=reduce_qty,
+                reduce_only=self.config.is_futures,
+            )
+            execution = self._execute_order_plan(order_plan)
+            reduce_qty = execution.executed_quantity or reduce_qty
+            current_price = execution.average_price or current_price
+        remaining_qty = max(position.quantity - reduce_qty, 0.0)
+        if remaining_qty <= 1e-9:
+            self.store.close_position(position.id or 0, current_price, exit_reason)
+            return
+        self.store.update_position_management(
+            position.id or 0,
+            quantity=remaining_qty,
+            profile_stage=next_stage or position.profile_stage,
+        )
+
+    def _close_position(self, position: Position, current_price: float, exit_reason: str) -> None:
+        if self.config.mode == "live":
+            order_plan = self.execution_router.prepare_market_order(
+                symbol=position.symbol,
+                side="sell" if position.side == "long" else "buy",
+                reference_price=current_price,
+                requested_quantity=position.quantity,
+                reduce_only=self.config.is_futures,
+            )
+            execution = self._execute_order_plan(order_plan)
+            current_price = execution.average_price or current_price
+        self.store.close_position(position.id or 0, current_price, exit_reason)
 
     def _notional_for_profile(
         self,
