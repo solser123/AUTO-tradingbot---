@@ -89,11 +89,98 @@ class TradingEngine:
         pnl_pct = (amount / basis * 100) if basis > 0 else 0.0
         return f"{amount:+.4f} USDT ({pnl_pct:+.2f}%)"
 
+    def _humanize_code(self, value: str) -> str:
+        return str(value).replace("_", " ").replace("-", " ").strip()
+
     def _short_reason(self, reason: str, limit: int = 140) -> str:
         compact = " ".join(str(reason).split())
         if len(compact) <= limit:
             return compact
         return f"{compact[: limit - 3]}..."
+
+    def _label_mode(self, mode: str) -> str:
+        return {"live": "실거래", "paper": "모의"}.get(mode, mode)
+
+    def _label_market(self) -> str:
+        return "USDT-M 선물" if self.config.is_futures else "현물"
+
+    def _label_side(self, side: str) -> str:
+        return {"long": "롱", "short": "숏"}.get(side, side)
+
+    def _label_profile(self, profile: str) -> str:
+        return {
+            "aggressive": "공격형",
+            "balanced": "균형형",
+            "conservative": "보수형",
+            "exploratory": "탐색형",
+        }.get(profile, self._humanize_code(profile))
+
+    def _label_title(self, title: str) -> str:
+        return {
+            "BOT START": "봇 시작",
+            "BOT STOP": "봇 종료",
+            "EMERGENCY STOP": "긴급 정지",
+            "LOOP FAIL": "루프 오류",
+            "OPEN": "진입",
+            "EXPLORATORY OPEN": "탐색 진입",
+            "HOT SCOUT OPEN": "급등주 진입",
+            "CLOSE": "청산",
+            "SYMBOL STOP": "심볼 거래 중지",
+            "REVIEW MODE": "검토 모드",
+            "AI MANAGE": "AI 사후관리",
+            "REBALANCE": "리밸런싱",
+            "REBALANCE CLOSE": "리밸런싱 종료",
+            "OVERFLOW CANDIDATE": "확장 후보",
+        }.get(title, title)
+
+    def _label_setup(self, setup: str) -> str:
+        mapping = {
+            "continuation": "추세 지속",
+            "reversal": "반전",
+            "hot_mover": "급등주",
+            "scout": "탐색",
+            "early_reversal": "초기 반전",
+            "smc_reversal": "구조 반전",
+            "context_recovery": "문맥 회복",
+            "breakout": "돌파",
+            "pullback": "되돌림",
+        }
+        return mapping.get(setup, self._humanize_code(setup))
+
+    def _label_exit_reason(self, reason: str) -> str:
+        mapping = {
+            "stop_loss": "손절",
+            "take_profit": "익절",
+            "max_hold": "보유 시간 종료",
+            "exploratory_timeout": "탐색 진입 시간 종료",
+            "ai_exit_now": "AI 즉시 청산",
+            "rebalance_flattened": "리밸런싱 종료",
+            "telegram_closeall": "텔레그램 전체 청산",
+            "auto_reconcile_missing_on_exchange": "거래소-DB 정합성 복구 청산",
+        }
+        return mapping.get(reason, self._humanize_code(reason))
+
+    def _label_ai_action(self, action: str) -> str:
+        mapping = {
+            "exit_now": "즉시 청산",
+            "reduce_25": "25% 축소",
+            "reduce_50": "50% 축소",
+            "tighten_to_balanced": "균형형으로 축소",
+            "tighten_to_conservative": "보수형으로 축소",
+            "raise_target_small": "목표 소폭 상향",
+            "raise_target_medium": "목표 중간 상향",
+            "hold": "보유 유지",
+        }
+        return mapping.get(action, self._humanize_code(action))
+
+    def _label_emergency_type(self, value: str) -> str:
+        mapping = {
+            "runtime": "런타임",
+            "ai_validation": "AI 검증",
+            "slippage": "슬리피지",
+            "position_reconcile": "포지션 정합성",
+        }
+        return mapping.get(value, self._humanize_code(value))
 
     def _scan_symbols(self) -> list[str]:
         configured_symbols = self.exchange.resolve_symbols(self.config.active_symbols())
@@ -155,11 +242,11 @@ class TradingEngine:
             preview = f"{preview} ... (+{len(symbols) - 5} more)"
         logging.info("Starting bot loop in %s mode", self.config.mode)
         self._notify_event(
-            "BOT START",
-            f"mode: {self.config.mode}",
-            f"market: {'USDT-M futures' if self.config.is_futures else 'spot'}",
-            f"symbols: {preview or 'none'}",
-            "commands: /status /positions /rank /scan BTC /summary",
+            self._label_title("BOT START"),
+            f"모드: {self._label_mode(self.config.mode)}",
+            f"시장: {self._label_market()}",
+            f"감시 종목: {preview or '없음'}",
+            "명령어: /status /positions /rank /scan BTC /summary",
         )
         try:
             while True:
@@ -173,9 +260,9 @@ class TradingEngine:
             self.store.set_state("service_stopped_at", datetime.now(timezone.utc).isoformat())
             logging.info("Bot loop finished.")
             self._notify_event(
-                "BOT STOP",
-                f"mode: {self.config.mode}",
-                "reason: telegram_or_runtime_stop",
+                self._label_title("BOT STOP"),
+                f"모드: {self._label_mode(self.config.mode)}",
+                "사유: 텔레그램 또는 런타임 종료 요청",
             )
 
     def run_for_duration(self, duration_seconds: int) -> None:
@@ -194,12 +281,12 @@ class TradingEngine:
             duration_seconds,
         )
         self._notify_event(
-            "BOT START",
-            f"mode: {self.config.mode}",
-            f"market: {'USDT-M futures' if self.config.is_futures else 'spot'}",
-            f"duration: {duration_seconds}s",
-            f"symbols: {preview or 'none'}",
-            "commands: /status /positions /rank /scan BTC /summary",
+            self._label_title("BOT START"),
+            f"모드: {self._label_mode(self.config.mode)}",
+            f"시장: {self._label_market()}",
+            f"가동 시간: {duration_seconds}초",
+            f"감시 종목: {preview or '없음'}",
+            "명령어: /status /positions /rank /scan BTC /summary",
         )
         try:
             while time.time() < end_time:
@@ -215,9 +302,9 @@ class TradingEngine:
             self.store.set_state("service_stopped_at", datetime.now(timezone.utc).isoformat())
             logging.info("Bounded bot loop finished.")
             self._notify_event(
-                "BOT STOP",
-                f"mode: {self.config.mode}",
-                f"duration: {duration_seconds}s",
+                self._label_title("BOT STOP"),
+                f"모드: {self._label_mode(self.config.mode)}",
+                f"가동 시간: {duration_seconds}초",
             )
 
     def run_once(self) -> None:
@@ -255,14 +342,14 @@ class TradingEngine:
                         severity="transient",
                     )
                     self._notify_event(
-                        "EMERGENCY STOP",
-                        "type: runtime",
-                        f"detail: exchange/runtime failure streak={streak}",
+                        self._label_title("EMERGENCY STOP"),
+                        f"유형: {self._label_emergency_type('runtime')}",
+                        f"내용: 거래소/런타임 실패 누적 {streak}회",
                     )
                 self._notify_event(
-                    "LOOP FAIL",
-                    f"symbol: {symbol}",
-                    f"error: {self._short_reason(str(exc), limit=180)}",
+                    self._label_title("LOOP FAIL"),
+                    f"종목: {symbol}",
+                    f"오류: {self._short_reason(str(exc), limit=180)}",
                 )
         self._review_overflow_candidates(reference_time)
 
@@ -666,9 +753,9 @@ class TradingEngine:
                     severity="transient",
                 )
                 self._notify_event(
-                    "EMERGENCY STOP",
-                    "type: ai_validation",
-                    f"detail: failure streak={streak}",
+                    self._label_title("EMERGENCY STOP"),
+                    f"유형: {self._label_emergency_type('ai_validation')}",
+                    f"내용: AI 검증 실패 누적 {streak}회",
                 )
             self.store.log_decision(
                 symbol=symbol,
@@ -787,10 +874,10 @@ class TradingEngine:
                     severity="transient",
                 )
                 self._notify_event(
-                    "EMERGENCY STOP",
-                    f"symbol: {symbol}",
-                    "type: slippage",
-                    f"detail: {slippage_pct * 100:.2f}% exceeded {self.config.max_slippage_pct * 100:.2f}%",
+                    self._label_title("EMERGENCY STOP"),
+                    f"종목: {symbol}",
+                    f"유형: {self._label_emergency_type('slippage')}",
+                    f"내용: 슬리피지 {slippage_pct * 100:.2f}%가 한도 {self.config.max_slippage_pct * 100:.2f}% 초과",
                 )
         else:
             execution = None
@@ -858,16 +945,18 @@ class TradingEngine:
         )
         logging.info("%s: opened %s position at %.4f", symbol, signal.side, entry_price)
         if bool(signal.strategy_data.get("hot_mover_scout", False)):
-            title = "HOT SCOUT OPEN"
+            title = self._label_title("HOT SCOUT OPEN")
         else:
-            title = "EXPLORATORY OPEN" if exploratory_live else "OPEN"
+            title = self._label_title("EXPLORATORY OPEN" if exploratory_live else "OPEN")
         self._notify_event(
             title,
-            f"symbol: {symbol}",
-            f"trade: {signal.side} | s{self.config.stage_for_symbol(symbol)} | {signal.entry_profile}",
-            f"entry: {self._fmt_price(entry_price)} | stop: {self._fmt_price(signal.stop_price)} | target: {self._fmt_price(signal.target_price)}",
-            f"size: {self._fmt_qty(quantity)} | notional: {initial_notional:.2f} USDT",
-            f"ai: {review.confidence:.2f} | setup: {signal.setup_type}",
+            f"종목: {symbol}",
+            f"방향: {self._label_side(signal.side)} | 단계: S{self.config.stage_for_symbol(symbol)} | 프로필: {self._label_profile(position.profile_stage)}",
+            f"진입: {self._fmt_price(entry_price)} | 손절: {self._fmt_price(signal.stop_price)} | 목표: {self._fmt_price(signal.target_price)}",
+            f"수량: {self._fmt_qty(quantity)} | 투입금: {initial_notional:.2f} USDT",
+            f"세팅: {self._label_setup(signal.setup_type)} | AI 신뢰도: {review.confidence:.2f}",
+            f"진입 근거: {self._short_reason(signal.reason)}",
+            f"AI 판단: {self._short_reason(review.reason)}",
         )
 
     def _manage_position(self, position: Position, reference_time: datetime, account_equity: float) -> None:
@@ -923,11 +1012,12 @@ class TradingEngine:
         self.store.close_position(position.id or 0, current_price, exit_reason)
         logging.info("%s: closed position at %.4f (%s)", position.symbol, current_price, exit_reason)
         self._notify_event(
-            "CLOSE",
-            f"symbol: {position.symbol}",
-            f"trade: {position.side} | stage: {position.profile_stage}",
-            f"exit: {self._fmt_price(current_price)} | pnl: {self._fmt_pnl(gross_pnl, position_basis)}",
-            f"reason: {exit_reason}",
+            self._label_title("CLOSE"),
+            f"종목: {position.symbol}",
+            f"방향: {self._label_side(position.side)} | 프로필: {self._label_profile(position.profile_stage)}",
+            f"진입: {self._fmt_price(position.entry_price)} | 청산: {self._fmt_price(current_price)}",
+            f"결과: {self._fmt_pnl(gross_pnl, position_basis)}",
+            f"청산 이유: {self._label_exit_reason(exit_reason)} ({exit_reason})",
         )
 
         if exit_reason == "stop_loss":
@@ -935,14 +1025,14 @@ class TradingEngine:
             global_streak = self.store.get_global_stoploss_streak(self.config.mode)
             if symbol_streak >= self.config.same_symbol_stoploss_limit:
                 self._notify_event(
-                    "SYMBOL STOP",
-                    f"symbol: {position.symbol}",
-                    f"stop-loss streak: {symbol_streak}",
+                    self._label_title("SYMBOL STOP"),
+                    f"종목: {position.symbol}",
+                    f"손절 연속 횟수: {symbol_streak}",
                 )
             if global_streak >= self.config.global_stoploss_limit:
                 self._notify_event(
-                    "REVIEW MODE",
-                    f"global stop-loss streak: {global_streak}",
+                    self._label_title("REVIEW MODE"),
+                    f"전역 손절 연속 횟수: {global_streak}",
                 )
 
     def _maybe_manage_position_with_ai(
@@ -1098,11 +1188,11 @@ class TradingEngine:
                 payload=payload,
             )
             self._notify_event(
-                "AI MANAGE",
-                f"symbol: {position.symbol}",
-                "action: exit_now",
-                f"price: {self._fmt_price(current_price)} | ai: {decision.confidence:.2f}",
-                f"reason: {self._short_reason(decision.reason)}",
+                self._label_title("AI MANAGE"),
+                f"종목: {position.symbol}",
+                f"조치: {self._label_ai_action('exit_now')}",
+                f"현재가: {self._fmt_price(current_price)} | AI 신뢰도: {decision.confidence:.2f}",
+                f"관리 이유: {self._short_reason(decision.reason)}",
             )
             return True
         if decision.action == "reduce_25":
@@ -1116,11 +1206,11 @@ class TradingEngine:
                 payload=payload,
             )
             self._notify_event(
-                "AI MANAGE",
-                f"symbol: {position.symbol}",
-                "action: reduce_25",
-                f"price: {self._fmt_price(current_price)} | ai: {decision.confidence:.2f}",
-                f"reason: {self._short_reason(decision.reason)}",
+                self._label_title("AI MANAGE"),
+                f"종목: {position.symbol}",
+                f"조치: {self._label_ai_action('reduce_25')}",
+                f"현재가: {self._fmt_price(current_price)} | AI 신뢰도: {decision.confidence:.2f}",
+                f"관리 이유: {self._short_reason(decision.reason)}",
             )
             return True
         if decision.action == "reduce_50":
@@ -1135,11 +1225,11 @@ class TradingEngine:
                 payload={**payload, "next_stage": next_stage},
             )
             self._notify_event(
-                "AI MANAGE",
-                f"symbol: {position.symbol}",
-                f"action: reduce_50 | next stage: {next_stage}",
-                f"price: {self._fmt_price(current_price)} | ai: {decision.confidence:.2f}",
-                f"reason: {self._short_reason(decision.reason)}",
+                self._label_title("AI MANAGE"),
+                f"종목: {position.symbol}",
+                f"조치: {self._label_ai_action('reduce_50')} | 다음 단계: {self._label_profile(next_stage)}",
+                f"현재가: {self._fmt_price(current_price)} | AI 신뢰도: {decision.confidence:.2f}",
+                f"관리 이유: {self._short_reason(decision.reason)}",
             )
             return True
         if decision.action in {"tighten_to_balanced", "tighten_to_conservative"}:
@@ -1154,11 +1244,11 @@ class TradingEngine:
             )
             self._rebalance_position(position, current_price, next_stage)
             self._notify_event(
-                "AI MANAGE",
-                f"symbol: {position.symbol}",
-                f"action: {decision.action}",
-                f"price: {self._fmt_price(current_price)} | ai: {decision.confidence:.2f}",
-                f"reason: {self._short_reason(decision.reason)}",
+                self._label_title("AI MANAGE"),
+                f"종목: {position.symbol}",
+                f"조치: {self._label_ai_action(decision.action)}",
+                f"현재가: {self._fmt_price(current_price)} | AI 신뢰도: {decision.confidence:.2f}",
+                f"관리 이유: {self._short_reason(decision.reason)}",
             )
             return True
         if decision.action in {"raise_target_small", "raise_target_medium"}:
@@ -1194,11 +1284,11 @@ class TradingEngine:
                 payload={**payload, "new_target": new_target},
             )
             self._notify_event(
-                "AI MANAGE",
-                f"symbol: {position.symbol}",
-                f"action: {decision.action}",
-                f"target: {self._fmt_price(old_target)} -> {self._fmt_price(new_target)} | ai: {decision.confidence:.2f}",
-                f"reason: {self._short_reason(decision.reason)}",
+                self._label_title("AI MANAGE"),
+                f"종목: {position.symbol}",
+                f"조치: {self._label_ai_action(decision.action)}",
+                f"목표가: {self._fmt_price(old_target)} -> {self._fmt_price(new_target)} | AI 신뢰도: {decision.confidence:.2f}",
+                f"관리 이유: {self._short_reason(decision.reason)}",
             )
             return True
         return False
@@ -1396,11 +1486,11 @@ class TradingEngine:
                 payload={"current_price": current_price, "reduced_qty": reduce_qty, "remaining_qty": remaining_qty},
             )
             self._notify_event(
-                "REBALANCE CLOSE",
-                f"symbol: {position.symbol}",
-                f"stage: {position.profile_stage} -> {next_stage}",
-                f"reduced: {self._fmt_qty(reduce_qty)} | remaining: 0.000000",
-                f"price: {self._fmt_price(current_price)}",
+                self._label_title("REBALANCE CLOSE"),
+                f"종목: {position.symbol}",
+                f"단계 변경: {self._label_profile(position.profile_stage)} -> {self._label_profile(next_stage)}",
+                f"축소 수량: {self._fmt_qty(reduce_qty)} | 잔여 수량: 0.000000",
+                f"기준가: {self._fmt_price(current_price)}",
             )
             return
         self.store.update_position_stage(position.id or 0, remaining_qty, next_stage)
@@ -1413,11 +1503,11 @@ class TradingEngine:
             payload={"current_price": current_price, "reduced_qty": reduce_qty, "remaining_qty": remaining_qty},
         )
         self._notify_event(
-            "REBALANCE",
-            f"symbol: {position.symbol}",
-            f"stage: {position.profile_stage} -> {next_stage}",
-            f"reduced: {self._fmt_qty(reduce_qty)} | remaining: {self._fmt_qty(remaining_qty)}",
-            f"price: {self._fmt_price(current_price)}",
+            self._label_title("REBALANCE"),
+            f"종목: {position.symbol}",
+            f"단계 변경: {self._label_profile(position.profile_stage)} -> {self._label_profile(next_stage)}",
+            f"축소 수량: {self._fmt_qty(reduce_qty)} | 잔여 수량: {self._fmt_qty(remaining_qty)}",
+            f"기준가: {self._fmt_price(current_price)}",
         )
 
     def _execute_order_plan(self, order_plan):
@@ -1575,9 +1665,9 @@ class TradingEngine:
             )
             self.store.set_emergency_stop(reason, severity="fatal")
             self._notify_event(
-                "EMERGENCY STOP",
-                "type: position_reconcile",
-                f"detail: {reason}",
+                self._label_title("EMERGENCY STOP"),
+                f"유형: {self._label_emergency_type('position_reconcile')}",
+                f"내용: {reason}",
             )
 
     def _sync_opportunity_reviews(self, reference_time: datetime) -> None:
@@ -3025,10 +3115,10 @@ class TradingEngine:
                 )
                 if review.approved:
                     self._notify_event(
-                        "OVERFLOW CANDIDATE",
-                        f"symbol: {symbol}",
-                        f"score: {score:.2f} | ai: {review.confidence:.2f}",
-                        f"reason: {self._short_reason(review.reason)}",
+                        self._label_title("OVERFLOW CANDIDATE"),
+                        f"종목: {symbol}",
+                        f"점수: {score:.2f} | AI 신뢰도: {review.confidence:.2f}",
+                        f"승격 이유: {self._short_reason(review.reason)}",
                     )
             except Exception as exc:
                 self.store.log_decision(
