@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+from html import escape
 
 try:
     import requests
@@ -13,18 +14,25 @@ class TelegramNotifier:
         self.token = token
         self.chat_id = chat_id
 
-    def send(self, message: str) -> None:
-        self.send_to_chat(self.chat_id, message)
+    def send(self, message: str, parse_mode: str | None = None) -> None:
+        self.send_to_chat(self.chat_id, message, parse_mode=parse_mode)
 
-    def send_to_chat(self, chat_id: str | int, message: str) -> None:
+    def send_to_chat(self, chat_id: str | int, message: str, parse_mode: str | None = None) -> None:
         if not self.token or not self.chat_id or requests is None:
             return
 
         url = f"https://api.telegram.org/bot{self.token}/sendMessage"
         try:
+            payload: dict[str, object] = {
+                "chat_id": chat_id,
+                "text": message,
+                "disable_web_page_preview": True,
+            }
+            if parse_mode:
+                payload["parse_mode"] = parse_mode
             response = requests.post(
                 url,
-                json={"chat_id": chat_id, "text": message},
+                json=payload,
                 timeout=10,
             )
             if not response.ok:
@@ -35,6 +43,14 @@ class TelegramNotifier:
                 )
         except Exception as exc:
             logging.warning("Telegram send failed: %s", exc)
+
+    def send_lines(self, title: str, lines: list[str]) -> None:
+        rendered = [f"<b>{escape(str(title).strip())}</b>"]
+        for line in lines:
+            text = str(line).strip()
+            if text:
+                rendered.append(escape(text))
+        self.send("\n".join(rendered), parse_mode="HTML")
 
     def validate_chat(self) -> tuple[bool, str]:
         if not self.token or not self.chat_id:

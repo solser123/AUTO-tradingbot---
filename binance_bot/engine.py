@@ -72,6 +72,29 @@ class TradingEngine:
         )
         self.strategy_orchestrator = StrategyEngineOrchestrator()
 
+    def _notify_event(self, title: str, *lines: str) -> None:
+        self.notifier.send_lines(title, [line for line in lines if str(line).strip()])
+
+    def _fmt_price(self, value: float | None) -> str:
+        if value is None:
+            return "-"
+        return f"{float(value):.4f}"
+
+    def _fmt_qty(self, value: float | None) -> str:
+        if value is None:
+            return "-"
+        return f"{float(value):.6f}"
+
+    def _fmt_pnl(self, amount: float, basis: float) -> str:
+        pnl_pct = (amount / basis * 100) if basis > 0 else 0.0
+        return f"{amount:+.4f} USDT ({pnl_pct:+.2f}%)"
+
+    def _short_reason(self, reason: str, limit: int = 140) -> str:
+        compact = " ".join(str(reason).split())
+        if len(compact) <= limit:
+            return compact
+        return f"{compact[: limit - 3]}..."
+
     def _scan_symbols(self) -> list[str]:
         configured_symbols = self.exchange.resolve_symbols(self.config.active_symbols())
         managed_symbols = self.store.get_open_symbols(self.config.mode)
@@ -131,11 +154,12 @@ class TradingEngine:
         if len(symbols) > 5:
             preview = f"{preview} ... (+{len(symbols) - 5} more)"
         logging.info("Starting bot loop in %s mode", self.config.mode)
-        self.notifier.send(
-            f"[BOT START] mode={self.config.mode} "
-            f"market={'USDT-M futures' if self.config.is_futures else 'spot'} "
-            f"symbols={preview}\n"
-            f"cmd=/help /status /positions /pause /resume /rank /stage /research /sectors /research-news /opportunity BTC /scan BTC /summary /closeall /stopbot"
+        self._notify_event(
+            "BOT START",
+            f"mode: {self.config.mode}",
+            f"market: {'USDT-M futures' if self.config.is_futures else 'spot'}",
+            f"symbols: {preview or 'none'}",
+            "commands: /status /positions /rank /scan BTC /summary",
         )
         try:
             while True:
@@ -148,7 +172,11 @@ class TradingEngine:
         finally:
             self.store.set_state("service_stopped_at", datetime.now(timezone.utc).isoformat())
             logging.info("Bot loop finished.")
-            self.notifier.send(f"[BOT STOP] mode={self.config.mode} reason=telegram_or_runtime_stop")
+            self._notify_event(
+                "BOT STOP",
+                f"mode: {self.config.mode}",
+                "reason: telegram_or_runtime_stop",
+            )
 
     def run_for_duration(self, duration_seconds: int) -> None:
         self.store.set_state("runtime_stop_requested", "0")
@@ -165,11 +193,13 @@ class TradingEngine:
             self.config.mode,
             duration_seconds,
         )
-        self.notifier.send(
-            f"[BOT START] mode={self.config.mode} "
-            f"market={'USDT-M futures' if self.config.is_futures else 'spot'} "
-            f"duration_seconds={duration_seconds} symbols={preview}\n"
-            f"cmd=/help /status /positions /pause /resume /rank /stage /research /sectors /research-news /opportunity BTC /scan BTC /summary /closeall /stopbot"
+        self._notify_event(
+            "BOT START",
+            f"mode: {self.config.mode}",
+            f"market: {'USDT-M futures' if self.config.is_futures else 'spot'}",
+            f"duration: {duration_seconds}s",
+            f"symbols: {preview or 'none'}",
+            "commands: /status /positions /rank /scan BTC /summary",
         )
         try:
             while time.time() < end_time:
@@ -184,7 +214,11 @@ class TradingEngine:
         finally:
             self.store.set_state("service_stopped_at", datetime.now(timezone.utc).isoformat())
             logging.info("Bounded bot loop finished.")
-            self.notifier.send(f"[BOT STOP] mode={self.config.mode} duration_seconds={duration_seconds}")
+            self._notify_event(
+                "BOT STOP",
+                f"mode: {self.config.mode}",
+                f"duration: {duration_seconds}s",
+            )
 
     def run_once(self) -> None:
         reference_time = datetime.now(KST)
@@ -220,8 +254,16 @@ class TradingEngine:
                         f"Exchange/runtime failure streak reached {streak}.",
                         severity="transient",
                     )
-                    self.notifier.send(f"[EMERGENCY STOP] Exchange/runtime failure streak reached {streak}.")
-                self.notifier.send(f"[{symbol}] loop failed: {exc}")
+                    self._notify_event(
+                        "EMERGENCY STOP",
+                        "type: runtime",
+                        f"detail: exchange/runtime failure streak={streak}",
+                    )
+                self._notify_event(
+                    "LOOP FAIL",
+                    f"symbol: {symbol}",
+                    f"error: {self._short_reason(str(exc), limit=180)}",
+                )
         self._review_overflow_candidates(reference_time)
 
     def _process_symbol(self, symbol: str, account_equity: float, reference_time: datetime) -> None:
@@ -623,7 +665,11 @@ class TradingEngine:
                     f"AI validation failure streak reached {streak}.",
                     severity="transient",
                 )
-                self.notifier.send(f"[EMERGENCY STOP] AI validation failure streak reached {streak}.")
+                self._notify_event(
+                    "EMERGENCY STOP",
+                    "type: ai_validation",
+                    f"detail: failure streak={streak}",
+                )
             self.store.log_decision(
                 symbol=symbol,
                 mode=self.config.mode,
@@ -740,8 +786,11 @@ class TradingEngine:
                     f"Abnormal slippage detected on {symbol}: {slippage_pct * 100:.2f}%.",
                     severity="transient",
                 )
-                self.notifier.send(
-                    f"[EMERGENCY STOP] {symbol} slippage {slippage_pct * 100:.2f}% exceeded limit."
+                self._notify_event(
+                    "EMERGENCY STOP",
+                    f"symbol: {symbol}",
+                    "type: slippage",
+                    f"detail: {slippage_pct * 100:.2f}% exceeded {self.config.max_slippage_pct * 100:.2f}%",
                 )
         else:
             execution = None
@@ -809,12 +858,16 @@ class TradingEngine:
         )
         logging.info("%s: opened %s position at %.4f", symbol, signal.side, entry_price)
         if bool(signal.strategy_data.get("hot_mover_scout", False)):
-            tag = "[HOT SCOUT OPEN]"
+            title = "HOT SCOUT OPEN"
         else:
-            tag = "[EXPLORATORY OPEN]" if exploratory_live else "[OPEN]"
-        self.notifier.send(
-            f"{tag} {symbol} s{self.config.stage_for_symbol(symbol)} {signal.side} entry={entry_price:.4f} "
-            f"stop={signal.stop_price:.4f} target={signal.target_price:.4f} ai={review.confidence:.2f}"
+            title = "EXPLORATORY OPEN" if exploratory_live else "OPEN"
+        self._notify_event(
+            title,
+            f"symbol: {symbol}",
+            f"trade: {signal.side} | s{self.config.stage_for_symbol(symbol)} | {signal.entry_profile}",
+            f"entry: {self._fmt_price(entry_price)} | stop: {self._fmt_price(signal.stop_price)} | target: {self._fmt_price(signal.target_price)}",
+            f"size: {self._fmt_qty(quantity)} | notional: {initial_notional:.2f} USDT",
+            f"ai: {review.confidence:.2f} | setup: {signal.setup_type}",
         )
 
     def _manage_position(self, position: Position, reference_time: datetime, account_equity: float) -> None:
@@ -865,19 +918,32 @@ class TradingEngine:
             execution = self._execute_order_plan(order_plan)
             current_price = execution.average_price or current_price
 
+        gross_pnl = self._position_unrealized_pnl(position, current_price)
+        position_basis = position.entry_price * position.quantity
         self.store.close_position(position.id or 0, current_price, exit_reason)
         logging.info("%s: closed position at %.4f (%s)", position.symbol, current_price, exit_reason)
-        self.notifier.send(
-            f"[CLOSE] {position.symbol} {position.side} exit={current_price:.4f} reason={exit_reason}"
+        self._notify_event(
+            "CLOSE",
+            f"symbol: {position.symbol}",
+            f"trade: {position.side} | stage: {position.profile_stage}",
+            f"exit: {self._fmt_price(current_price)} | pnl: {self._fmt_pnl(gross_pnl, position_basis)}",
+            f"reason: {exit_reason}",
         )
 
         if exit_reason == "stop_loss":
             symbol_streak = self.store.get_symbol_stoploss_streak(position.symbol, self.config.mode)
             global_streak = self.store.get_global_stoploss_streak(self.config.mode)
             if symbol_streak >= self.config.same_symbol_stoploss_limit:
-                self.notifier.send(f"[SYMBOL STOP] {position.symbol} stop-loss streak={symbol_streak}")
+                self._notify_event(
+                    "SYMBOL STOP",
+                    f"symbol: {position.symbol}",
+                    f"stop-loss streak: {symbol_streak}",
+                )
             if global_streak >= self.config.global_stoploss_limit:
-                self.notifier.send(f"[REVIEW MODE] global stop-loss streak={global_streak}")
+                self._notify_event(
+                    "REVIEW MODE",
+                    f"global stop-loss streak: {global_streak}",
+                )
 
     def _maybe_manage_position_with_ai(
         self,
@@ -1031,8 +1097,12 @@ class TradingEngine:
                 detail=decision.reason,
                 payload=payload,
             )
-            self.notifier.send(
-                f"[AI MANAGE] {position.symbol} exit_now price={current_price:.4f} ai={decision.confidence:.2f}"
+            self._notify_event(
+                "AI MANAGE",
+                f"symbol: {position.symbol}",
+                "action: exit_now",
+                f"price: {self._fmt_price(current_price)} | ai: {decision.confidence:.2f}",
+                f"reason: {self._short_reason(decision.reason)}",
             )
             return True
         if decision.action == "reduce_25":
@@ -1045,8 +1115,12 @@ class TradingEngine:
                 detail=decision.reason,
                 payload=payload,
             )
-            self.notifier.send(
-                f"[AI MANAGE] {position.symbol} reduce_25 price={current_price:.4f} ai={decision.confidence:.2f}"
+            self._notify_event(
+                "AI MANAGE",
+                f"symbol: {position.symbol}",
+                "action: reduce_25",
+                f"price: {self._fmt_price(current_price)} | ai: {decision.confidence:.2f}",
+                f"reason: {self._short_reason(decision.reason)}",
             )
             return True
         if decision.action == "reduce_50":
@@ -1060,8 +1134,12 @@ class TradingEngine:
                 detail=decision.reason,
                 payload={**payload, "next_stage": next_stage},
             )
-            self.notifier.send(
-                f"[AI MANAGE] {position.symbol} reduce_50 price={current_price:.4f} ai={decision.confidence:.2f}"
+            self._notify_event(
+                "AI MANAGE",
+                f"symbol: {position.symbol}",
+                f"action: reduce_50 | next stage: {next_stage}",
+                f"price: {self._fmt_price(current_price)} | ai: {decision.confidence:.2f}",
+                f"reason: {self._short_reason(decision.reason)}",
             )
             return True
         if decision.action in {"tighten_to_balanced", "tighten_to_conservative"}:
@@ -1075,8 +1153,12 @@ class TradingEngine:
                 payload={**payload, "next_stage": next_stage},
             )
             self._rebalance_position(position, current_price, next_stage)
-            self.notifier.send(
-                f"[AI MANAGE] {position.symbol} {decision.action} price={current_price:.4f} ai={decision.confidence:.2f}"
+            self._notify_event(
+                "AI MANAGE",
+                f"symbol: {position.symbol}",
+                f"action: {decision.action}",
+                f"price: {self._fmt_price(current_price)} | ai: {decision.confidence:.2f}",
+                f"reason: {self._short_reason(decision.reason)}",
             )
             return True
         if decision.action in {"raise_target_small", "raise_target_medium"}:
@@ -1091,6 +1173,7 @@ class TradingEngine:
                 )
                 return True
             multiplier = 1.0 if decision.action == "raise_target_small" else 2.0
+            old_target = position.target_price
             new_target = self._raise_position_target(position, multiplier)
             if new_target is None:
                 self.store.log_decision(
@@ -1110,8 +1193,12 @@ class TradingEngine:
                 detail=decision.reason,
                 payload={**payload, "new_target": new_target},
             )
-            self.notifier.send(
-                f"[AI MANAGE] {position.symbol} {decision.action} target={new_target:.4f} ai={decision.confidence:.2f}"
+            self._notify_event(
+                "AI MANAGE",
+                f"symbol: {position.symbol}",
+                f"action: {decision.action}",
+                f"target: {self._fmt_price(old_target)} -> {self._fmt_price(new_target)} | ai: {decision.confidence:.2f}",
+                f"reason: {self._short_reason(decision.reason)}",
             )
             return True
         return False
@@ -1308,9 +1395,12 @@ class TradingEngine:
                 detail=f"Rebalance flattened the position while moving to {next_stage}.",
                 payload={"current_price": current_price, "reduced_qty": reduce_qty, "remaining_qty": remaining_qty},
             )
-            self.notifier.send(
-                f"[REBALANCE CLOSE] {position.symbol} {position.profile_stage}->{next_stage} "
-                f"reduced={reduce_qty:.6f} remaining=0.000000"
+            self._notify_event(
+                "REBALANCE CLOSE",
+                f"symbol: {position.symbol}",
+                f"stage: {position.profile_stage} -> {next_stage}",
+                f"reduced: {self._fmt_qty(reduce_qty)} | remaining: 0.000000",
+                f"price: {self._fmt_price(current_price)}",
             )
             return
         self.store.update_position_stage(position.id or 0, remaining_qty, next_stage)
@@ -1322,9 +1412,12 @@ class TradingEngine:
             detail=f"Position rebalanced from {position.profile_stage} to {next_stage}.",
             payload={"current_price": current_price, "reduced_qty": reduce_qty, "remaining_qty": remaining_qty},
         )
-        self.notifier.send(
-            f"[REBALANCE] {position.symbol} {position.profile_stage}->{next_stage} "
-            f"reduced={reduce_qty:.6f} remaining={remaining_qty:.6f}"
+        self._notify_event(
+            "REBALANCE",
+            f"symbol: {position.symbol}",
+            f"stage: {position.profile_stage} -> {next_stage}",
+            f"reduced: {self._fmt_qty(reduce_qty)} | remaining: {self._fmt_qty(remaining_qty)}",
+            f"price: {self._fmt_price(current_price)}",
         )
 
     def _execute_order_plan(self, order_plan):
@@ -1481,7 +1574,11 @@ class TradingEngine:
                 f"db={','.join(db_symbols) or 'none'} exchange={','.join(exchange_symbols) or 'none'}"
             )
             self.store.set_emergency_stop(reason, severity="fatal")
-            self.notifier.send(f"[EMERGENCY STOP] {reason}")
+            self._notify_event(
+                "EMERGENCY STOP",
+                "type: position_reconcile",
+                f"detail: {reason}",
+            )
 
     def _sync_opportunity_reviews(self, reference_time: datetime) -> None:
         last_sync_text = self.store.get_state("opportunity_sync_at")
@@ -2927,9 +3024,11 @@ class TradingEngine:
                     },
                 )
                 if review.approved:
-                    self.notifier.send(
-                        f"[OVERFLOW CANDIDATE] {symbol} looks promotable "
-                        f"score={score:.2f} ai={review.confidence:.2f} reason={review.reason}"
+                    self._notify_event(
+                        "OVERFLOW CANDIDATE",
+                        f"symbol: {symbol}",
+                        f"score: {score:.2f} | ai: {review.confidence:.2f}",
+                        f"reason: {self._short_reason(review.reason)}",
                     )
             except Exception as exc:
                 self.store.log_decision(
