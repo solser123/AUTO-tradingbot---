@@ -123,6 +123,11 @@ def run_doctor() -> int:
     checks.append(("execution-router", True, "market-order planning with exchange rules and fill estimation"))
     checks.append(("order-lifecycle", True, "order_lifecycle table + registry enabled"))
     checks.append(("macro-layer", True, f"upcoming={len(store.get_upcoming_macro_events(hours=48, limit=10))}"))
+    if config.coinglass_api_key:
+        checks.append(("coinglass-key", True, "COINGLASS_API_KEY configured"))
+        checks.append(("coinglass-plan", True, store.get_state("coinglass_plan_status") or "pending"))
+        checks.append(("coinglass-supported", True, store.get_state("coinglass_supported_count") or "0"))
+        checks.append(("coinglass-last-ok", True, store.get_state("coinglass_last_ok_at") or "none"))
     checks.append(("emergency-stop", True, runtime_flags.get("emergency_stop", "0") or "0"))
     checks.append(("emergency-severity", True, runtime_flags.get("emergency_severity", "") or "none"))
     checks.append(("emergency-reason", True, runtime_flags.get("emergency_reason", "") or "none"))

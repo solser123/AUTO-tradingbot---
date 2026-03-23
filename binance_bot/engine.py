@@ -8,6 +8,7 @@ from pathlib import Path
 from zoneinfo import ZoneInfo
 
 from .ai_validator import AIValidator
+from .coinglass_client import CoinGlassClient
 from .config import BotConfig
 from .execution_router import ExecutionRouter
 from .exchange import BinanceExchange
@@ -62,6 +63,8 @@ class TradingEngine:
         self.execution_router = execution_router or ExecutionRouter(exchange)
         self._scan_symbols_cache: list[str] | None = None
         self._hot_mover_candidates: dict[str, HotMoverCandidate] = {}
+        self._coinglass_supported_symbols: set[str] = set()
+        self.coinglass = CoinGlassClient(config)
         self.strategy_orchestrator = StrategyEngineOrchestrator()
 
     def _scan_symbols(self) -> list[str]:
@@ -91,6 +94,7 @@ class TradingEngine:
         excluded = set(self.exchange.resolve_symbols(self.config.active_symbols()))
         excluded.update(self.store.get_open_symbols(self.config.mode))
         recent_listings = set(recent_listing_candidates(self.exchange, limit=20, lookback_days=180))
+        allowed_symbols = self._coinglass_supported_symbols or None
         candidates = discover_hot_movers(
             self.exchange,
             limit=self.config.hot_mover_scan_limit,
@@ -99,6 +103,7 @@ class TradingEngine:
             allow_shorts=self.config.hot_mover_allow_shorts,
             exclude_symbols=excluded,
             recent_listing_symbols=recent_listings,
+            allowed_symbols=allowed_symbols,
         )
         self._hot_mover_candidates = {item.symbol: item for item in candidates}
         return [item.symbol for item in candidates]
@@ -2571,6 +2576,13 @@ class TradingEngine:
                 pass
         try:
             inserted = 0
+            probe = self.coinglass.probe()
+            self.store.set_state("coinglass_plan_status", probe.plan_status)
+            self.store.set_state("coinglass_detail", probe.detail)
+            self.store.set_state("coinglass_supported_count", str(probe.supported_count))
+            if probe.supported_ok:
+                self._coinglass_supported_symbols = self.coinglass.fetch_supported_futures_symbols()
+                self.store.set_state("coinglass_last_ok_at", datetime.now(timezone.utc).isoformat())
             inserted += self.store.upsert_external_items(fetch_tradingview_ideas(limit=15))
             inserted += self.store.upsert_external_items(fetch_blockmedia_news(limit=15))
             self.store.set_state("external_sync_at", datetime.now(timezone.utc).isoformat())
@@ -2580,7 +2592,11 @@ class TradingEngine:
                 stage="external_sync",
                 outcome="updated",
                 detail=f"External sync completed with {inserted} new items.",
-                payload={"inserted": inserted},
+                payload={
+                    "inserted": inserted,
+                    "coinglass_plan_status": probe.plan_status,
+                    "coinglass_supported_count": probe.supported_count,
+                },
             )
         except Exception as exc:
             self.store.log_decision(

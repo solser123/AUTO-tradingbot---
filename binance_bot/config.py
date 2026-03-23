@@ -64,6 +64,7 @@ class BotConfig:
     api_key: str
     secret_key: str
     openai_api_key: str
+    coinglass_api_key: str
     telegram_token: str
     telegram_chat_id: str
     mode: str
@@ -266,7 +267,10 @@ class BotConfig:
 
     @classmethod
     def from_env(cls) -> "BotConfig":
-        load_dotenv()
+        try:
+            load_dotenv(override=True)
+        except TypeError:
+            load_dotenv()
         mode = os.getenv("BOT_MODE", "paper").strip().lower()
         if mode not in {"paper", "live"}:
             raise ValueError("BOT_MODE must be either 'paper' or 'live'.")
@@ -346,6 +350,7 @@ class BotConfig:
             api_key=os.getenv("BINANCE_API_KEY", "").strip(),
             secret_key=os.getenv("BINANCE_SECRET_KEY", "").strip(),
             openai_api_key=os.getenv("OPENAI_API_KEY", "").strip(),
+            coinglass_api_key=os.getenv("COINGLASS_API_KEY", "").strip(),
             telegram_token=os.getenv("TELEGRAM_TOKEN", "").strip(),
             telegram_chat_id=os.getenv("TELEGRAM_CHAT_ID", "").strip(),
             mode=mode,

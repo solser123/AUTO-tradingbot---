@@ -26,12 +26,14 @@ def discover_hot_movers(
     allow_shorts: bool,
     exclude_symbols: set[str] | None = None,
     recent_listing_symbols: set[str] | None = None,
+    allowed_symbols: set[str] | None = None,
 ) -> list[HotMoverCandidate]:
     if not exchange.config.is_futures:
         return []
 
     excluded = exclude_symbols or set()
     recent_listings = recent_listing_symbols or set()
+    allowed = allowed_symbols or set()
     candidates: list[HotMoverCandidate] = []
     try:
         rows = exchange.client.fapiPublicGetTicker24hr()
@@ -44,6 +46,8 @@ def discover_hot_movers(
             continue
         market_symbol = f"{symbol_id[:-4]}/USDT:USDT"
         if market_symbol in excluded:
+            continue
+        if allowed and market_symbol not in allowed:
             continue
 
         try:
