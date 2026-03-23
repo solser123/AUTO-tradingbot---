@@ -895,20 +895,34 @@ class StateStore:
         limit: int = 50,
     ) -> list[sqlite3.Row]:
         anchor = datetime.now(timezone.utc) - timedelta(minutes=max(min_age_minutes, 1))
+        stages = (
+            "scan",
+            "horizon_gate",
+            "micro_gate",
+            "sector_gate",
+            "external_gate",
+            "ai_scan_gate",
+            "sizing_model",
+            "ai_review",
+            "risk_gate",
+        )
+        outcomes = ("no_entry", "rejected", "watch_only")
+        stage_placeholders = ",".join("?" for _ in stages)
+        outcome_placeholders = ",".join("?" for _ in outcomes)
         query = """
                 SELECT dl.*
                 FROM decision_log dl
                 LEFT JOIN opportunity_reviews opr ON opr.decision_log_id = dl.id
                 WHERE dl.mode = ?
-                  AND dl.outcome = 'no_entry'
-                  AND dl.stage = 'scan'
+                  AND dl.outcome IN (""" + outcome_placeholders + """)
+                  AND dl.stage IN (""" + stage_placeholders + """)
                   AND dl.created_at <= ?
                   AND opr.decision_log_id IS NULL
                 ORDER BY dl.created_at ASC, dl.id ASC
                 LIMIT ?
                 """
         with self._connect() as conn:
-            return conn.execute(query, (mode, anchor.isoformat(), limit)).fetchall()
+            return conn.execute(query, (mode, *outcomes, *stages, anchor.isoformat(), limit)).fetchall()
 
     def log_opportunity_review(self, review: dict) -> None:
         with self._connect() as conn:
@@ -1049,6 +1063,10 @@ class StateStore:
             row = conn.execute("SELECT value FROM runtime_state WHERE key = ?", (key,)).fetchone()
         return None if row is None else str(row["value"])
 
+    def delete_state(self, key: str) -> None:
+        with self._connect() as conn:
+            conn.execute("DELETE FROM runtime_state WHERE key = ?", (key,))
+
     def get_state_record(self, key: str) -> dict[str, str] | None:
         with self._connect() as conn:
             row = conn.execute(
@@ -1084,6 +1102,34 @@ class StateStore:
         current = int(self.get_state(key) or "0") + 1
         self.set_state(key, str(current))
         return current
+
+    def count_recent_decisions(
+        self,
+        *,
+        within_minutes: int,
+        symbol: str | None = None,
+        mode: str | None = None,
+        stage: str | None = None,
+        outcome: str | None = None,
+    ) -> int:
+        anchor = datetime.now(timezone.utc) - timedelta(minutes=max(within_minutes, 1))
+        query = "SELECT COUNT(*) AS count FROM decision_log WHERE created_at >= ?"
+        params: list[object] = [anchor.isoformat()]
+        if symbol is not None:
+            query += " AND symbol = ?"
+            params.append(symbol)
+        if mode is not None:
+            query += " AND mode = ?"
+            params.append(mode)
+        if stage is not None:
+            query += " AND stage = ?"
+            params.append(stage)
+        if outcome is not None:
+            query += " AND outcome = ?"
+            params.append(outcome)
+        with self._connect() as conn:
+            row = conn.execute(query, tuple(params)).fetchone()
+        return int(row["count"] if row else 0)
 
     def reset_state_counter(self, key: str) -> None:
         self.set_state(key, "0")

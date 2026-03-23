@@ -109,6 +109,8 @@ class BotConfig:
     symbol_cooldown_minutes: int
     ai_validation: bool
     ai_scan_assist: bool
+    ai_scan_hourly_budget_total: int
+    ai_scan_hourly_budget_per_symbol: int
     ai_scan_min_confidence: float
     ai_scan_trigger_score: float
     min_ai_confidence: float
@@ -116,6 +118,8 @@ class BotConfig:
     stage2_min_ai_confidence: float
     stage3_min_ai_confidence: float
     stage4_min_ai_confidence: float
+    ai_review_hourly_budget_total: int
+    ai_review_hourly_budget_per_symbol: int
     max_daily_loss: float
     max_daily_loss_pct: float
     max_weekly_loss_pct: float
@@ -141,6 +145,8 @@ class BotConfig:
     exploratory_ai_scan_min_confidence: float
     exploratory_followthrough_bars: int
     exploratory_min_progress_r: float
+    signal_max_age_aggressive_seconds: int
+    signal_max_age_exploratory_seconds: int
     enable_hot_mover_scout: bool
     hot_mover_scan_limit: int
     hot_mover_min_24h_pct: float
@@ -405,6 +411,8 @@ class BotConfig:
             symbol_cooldown_minutes=_as_int("BOT_SYMBOL_COOLDOWN_MINUTES", 240),
             ai_validation=_as_bool(os.getenv("BOT_AI_VALIDATION"), True),
             ai_scan_assist=_as_bool(os.getenv("BOT_AI_SCAN_ASSIST"), True),
+            ai_scan_hourly_budget_total=_as_int("BOT_AI_SCAN_HOURLY_BUDGET_TOTAL", 240),
+            ai_scan_hourly_budget_per_symbol=_as_int("BOT_AI_SCAN_HOURLY_BUDGET_PER_SYMBOL", 2),
             ai_scan_min_confidence=_as_float("BOT_AI_SCAN_MIN_CONFIDENCE", 0.58),
             ai_scan_trigger_score=_as_float("BOT_AI_SCAN_TRIGGER_SCORE", 4.0),
             min_ai_confidence=_as_float("BOT_MIN_AI_CONFIDENCE", 0.55),
@@ -412,6 +420,8 @@ class BotConfig:
             stage2_min_ai_confidence=_as_float("BOT_STAGE2_MIN_AI_CONFIDENCE", 0.55),
             stage3_min_ai_confidence=_as_float("BOT_STAGE3_MIN_AI_CONFIDENCE", 0.50),
             stage4_min_ai_confidence=_as_float("BOT_STAGE4_MIN_AI_CONFIDENCE", 0.46),
+            ai_review_hourly_budget_total=_as_int("BOT_AI_REVIEW_HOURLY_BUDGET_TOTAL", 120),
+            ai_review_hourly_budget_per_symbol=_as_int("BOT_AI_REVIEW_HOURLY_BUDGET_PER_SYMBOL", 2),
             max_daily_loss=_as_float("BOT_MAX_DAILY_LOSS", 50.0),
             max_daily_loss_pct=_as_float("BOT_MAX_DAILY_LOSS_PCT", 0.10),
             max_weekly_loss_pct=_as_float("BOT_MAX_WEEKLY_LOSS_PCT", 0.10),
@@ -437,6 +447,8 @@ class BotConfig:
             exploratory_ai_scan_min_confidence=_as_float("BOT_EXPLORATORY_AI_SCAN_MIN_CONFIDENCE", 0.52),
             exploratory_followthrough_bars=_as_int("BOT_EXPLORATORY_FOLLOWTHROUGH_BARS", 3),
             exploratory_min_progress_r=_as_float("BOT_EXPLORATORY_MIN_PROGRESS_R", 0.15),
+            signal_max_age_aggressive_seconds=_as_int("BOT_SIGNAL_MAX_AGE_AGGRESSIVE_SECONDS", 180),
+            signal_max_age_exploratory_seconds=_as_int("BOT_SIGNAL_MAX_AGE_EXPLORATORY_SECONDS", 420),
             enable_hot_mover_scout=_as_bool(os.getenv("BOT_ENABLE_HOT_MOVER_SCOUT"), True),
             hot_mover_scan_limit=_as_int("BOT_HOT_MOVER_SCAN_LIMIT", 4),
             hot_mover_min_24h_pct=_as_float("BOT_HOT_MOVER_MIN_24H_PCT", 18.0),
@@ -518,6 +530,15 @@ class BotConfig:
             raise ValueError("BOT_MAX_OPEN_POSITIONS must be between 1 and 3.")
         if config.overflow_scan_limit < 0:
             raise ValueError("BOT_OVERFLOW_SCAN_LIMIT must not be negative.")
+        if (
+            config.ai_scan_hourly_budget_total < 1
+            or config.ai_scan_hourly_budget_per_symbol < 1
+            or config.ai_review_hourly_budget_total < 1
+            or config.ai_review_hourly_budget_per_symbol < 1
+        ):
+            raise ValueError("AI hourly budget values must be at least 1.")
+        if config.signal_max_age_aggressive_seconds < 30 or config.signal_max_age_exploratory_seconds < 30:
+            raise ValueError("Signal freshness limits must be at least 30 seconds.")
         if config.max_daily_loss_pct <= 0 or config.max_weekly_loss_pct <= 0:
             raise ValueError("Loss percentage limits must be positive.")
         if not (

@@ -1,9 +1,10 @@
 from __future__ import annotations
 
+import json
 import logging
 import os
 import time
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
@@ -15,7 +16,7 @@ from .execution_router import ExecutionRouter
 from .exchange import BinanceExchange
 from .external_sources import fetch_blockmedia_news, fetch_tradingview_ideas
 from .hot_movers import HotMoverCandidate, discover_hot_movers
-from .models import AIManageDecision, AIScanReview, Position, TradeSignal
+from .models import AIManageDecision, AIReview, AIScanReview, Position, TradeSignal
 from .macro import adjust_sizing_for_macro, build_macro_risk_overlay, get_upcoming_macro_events
 from .notifier import TelegramNotifier
 from .opportunity import analyze_pending_opportunities
@@ -182,6 +183,196 @@ class TradingEngine:
         }
         return mapping.get(value, self._humanize_code(value))
 
+    def _signal_window_key(self, symbol: str) -> str:
+        return f"signal_window:{self.config.mode}:{symbol}"
+
+    def _signal_signature(self, signal: TradeSignal) -> str:
+        engine_family = str(signal.strategy_data.get("engine_family", "") or "unknown")
+        return "|".join(
+            [
+                signal.side,
+                engine_family,
+                signal.setup_type,
+                signal.entry_profile,
+            ]
+        )
+
+    def _clear_signal_window(self, symbol: str) -> None:
+        self.store.delete_state(self._signal_window_key(symbol))
+
+    def _stamp_signal_timing(
+        self,
+        symbol: str,
+        signal: TradeSignal,
+        reference_time: datetime,
+    ) -> TradeSignal:
+        signal_time = reference_time.astimezone(timezone.utc)
+        key = self._signal_window_key(symbol)
+        signature = self._signal_signature(signal)
+        first_seen = signal_time
+        record = self.store.get_state(key)
+        if record:
+            payload = None
+            try:
+                candidate = json.loads(record)
+                if isinstance(candidate, dict):
+                    payload = candidate
+            except Exception:
+                payload = None
+
+            if payload and str(payload.get("signature", "")) == signature:
+                raw_first_seen = payload.get("first_seen_at")
+                if raw_first_seen:
+                    try:
+                        parsed = datetime.fromisoformat(str(raw_first_seen))
+                        first_seen = parsed if parsed.tzinfo is not None else parsed.replace(tzinfo=timezone.utc)
+                    except ValueError:
+                        first_seen = signal_time
+            else:
+                self.store.set_state(
+                    key,
+                    json.dumps(
+                        {
+                            "signature": signature,
+                            "first_seen_at": signal_time.isoformat(),
+                        }
+                    ),
+                )
+        else:
+            self.store.set_state(
+                key,
+                json.dumps(
+                    {
+                        "signature": signature,
+                        "first_seen_at": signal_time.isoformat(),
+                    }
+                ),
+            )
+        strategy_data = {
+            **signal.strategy_data,
+            "signal_generated_at": signal_time.isoformat(),
+            "signal_first_seen_at": first_seen.astimezone(timezone.utc).isoformat(),
+            "signal_signature": signature,
+        }
+        return TradeSignal(
+            symbol=signal.symbol,
+            side=signal.side,
+            entry_price=signal.entry_price,
+            stop_price=signal.stop_price,
+            target_price=signal.target_price,
+            rr=signal.rr,
+            setup_type=signal.setup_type,
+            entry_profile=signal.entry_profile,
+            reason=signal.reason,
+            strategy_data=strategy_data,
+        )
+
+    def _signal_age_seconds(self, signal: TradeSignal, reference_time: datetime) -> float:
+        raw = signal.strategy_data.get("signal_first_seen_at") or signal.strategy_data.get("signal_generated_at")
+        if not raw:
+            return 0.0
+        try:
+            created_at = datetime.fromisoformat(str(raw))
+        except ValueError:
+            return 0.0
+        if created_at.tzinfo is None:
+            created_at = created_at.replace(tzinfo=timezone.utc)
+        else:
+            created_at = created_at.astimezone(timezone.utc)
+        return max((reference_time.astimezone(timezone.utc) - created_at).total_seconds(), 0.0)
+
+    def _signal_freshness_limit_seconds(self, signal: TradeSignal) -> int:
+        if signal.entry_profile == "exploratory" or self._is_exploratory_signal(signal):
+            return self.config.signal_max_age_exploratory_seconds
+        return self.config.signal_max_age_aggressive_seconds
+
+    def _ai_budget_limits(self, kind: str) -> tuple[int, int]:
+        if kind == "scan":
+            return self.config.ai_scan_hourly_budget_total, self.config.ai_scan_hourly_budget_per_symbol
+        return self.config.ai_review_hourly_budget_total, self.config.ai_review_hourly_budget_per_symbol
+
+    def _consume_ai_budget(self, kind: str, symbol: str, reference_time: datetime) -> bool:
+        bucket = reference_time.astimezone(timezone.utc).strftime("%Y%m%d%H")
+        total_key = f"ai_budget:{kind}:total:{bucket}"
+        symbol_key = f"ai_budget:{kind}:symbol:{bucket}:{symbol}"
+        total_limit, symbol_limit = self._ai_budget_limits(kind)
+        total_used = int(self.store.get_state(total_key) or "0")
+        symbol_used = int(self.store.get_state(symbol_key) or "0")
+        if total_used >= total_limit or symbol_used >= symbol_limit:
+            return False
+        self.store.set_state(total_key, str(total_used + 1))
+        self.store.set_state(symbol_key, str(symbol_used + 1))
+        return True
+
+    def _review_scan_with_budget(
+        self,
+        *,
+        symbol: str,
+        scan,
+        horizon_context: dict[str, object],
+        external_context: dict[str, dict[str, float | int]],
+        sector_context: dict[str, object],
+        microstructure: dict[str, object],
+        reference_time: datetime,
+        advisory: bool = False,
+    ) -> AIScanReview | None:
+        if not self._consume_ai_budget("scan", symbol, reference_time):
+            self.store.log_decision(
+                symbol=symbol,
+                mode=self.config.mode,
+                stage="ai_scan_budget",
+                outcome="rejected",
+                detail="AI scan budget exceeded. Falling back to deterministic rules only.",
+                payload={"kind": "scan"},
+            )
+            return None
+        return self.ai_validator.review_scan(
+            symbol=symbol,
+            scan=scan,
+            horizon_context=horizon_context,
+            external_context=external_context,
+            sector_context=sector_context,
+            microstructure=microstructure,
+            advisory=advisory,
+        )
+
+    def _review_signal_with_budget(
+        self,
+        signal: TradeSignal,
+        reference_time: datetime,
+    ) -> AIReview:
+        if self._consume_ai_budget("review", signal.symbol, reference_time):
+            return self.ai_validator.review(signal)
+        self.store.log_decision(
+            symbol=signal.symbol,
+            mode=self.config.mode,
+            stage="ai_review_budget",
+            outcome="skipped",
+            detail="AI review budget exceeded. Deterministic approval path used only for non-exploratory setups.",
+            payload={"setup_type": signal.setup_type, "entry_profile": signal.entry_profile},
+        )
+        score = float(signal.strategy_data.get("entry_profile_score", 0.0) or 0.0)
+        if self._is_exploratory_signal(signal) or bool(signal.strategy_data.get("hot_mover_scout", False)):
+            return AIReview(
+                approved=False,
+                confidence=0.0,
+                recommended_action="no_trade",
+                reason="AI review budget exceeded for exploratory setup.",
+                committee={},
+            )
+        approved = score >= self.config.balanced_entry_score
+        return AIReview(
+            approved=approved,
+            confidence=0.0,
+            recommended_action="full" if approved else "no_trade",
+            reason=(
+                "AI review budget exceeded; deterministic structured setup allowed."
+                if approved
+                else "AI review budget exceeded and deterministic score was not strong enough."
+            ),
+            committee={"budget_mode": True, "entry_profile_score": score},
+        )
+
     def _scan_symbols(self) -> list[str]:
         configured_symbols = self.exchange.resolve_symbols(self.config.active_symbols())
         managed_symbols = self.store.get_open_symbols(self.config.mode)
@@ -319,6 +510,19 @@ class TradingEngine:
         emergency_active, emergency_reason = self.store.is_emergency_stop()
         if emergency_active:
             logging.warning("Emergency stop active: %s", emergency_reason)
+            for position in self.store.get_open_positions(self.config.mode):
+                try:
+                    self._manage_position(position, reference_time, account_equity)
+                except Exception as exc:
+                    logging.exception("Emergency position management failed for %s: %s", position.symbol, exc)
+                    self.store.log_decision(
+                        symbol=position.symbol,
+                        mode=self.config.mode,
+                        stage="emergency_position_manage",
+                        outcome="error",
+                        detail=str(exc),
+                        payload={},
+                    )
             return
 
         for symbol in self._scan_symbols():
@@ -356,6 +560,7 @@ class TradingEngine:
     def _process_symbol(self, symbol: str, account_equity: float, reference_time: datetime) -> None:
         position = self.store.get_open_position(symbol, self.config.mode)
         if position is not None:
+            self._clear_signal_window(symbol)
             self._manage_position(position, reference_time, account_equity)
             return
 
@@ -388,22 +593,24 @@ class TradingEngine:
             if self.config.enable_context_recovery:
                 recovered_signal = self._build_context_recovery_signal(symbol, scan, horizon_context)
             if hot_mover_candidate is not None and ai_scan_review is None and self.config.ai_scan_assist:
-                ai_scan_review = self.ai_validator.review_scan(
+                ai_scan_review = self._review_scan_with_budget(
                     symbol=symbol,
                     scan=scan,
                     horizon_context=horizon_context,
                     external_context=external_context,
                     sector_context=sector_context,
                     microstructure=microstructure,
+                    reference_time=reference_time,
                 )
             if ai_scan_review is None and self._should_run_ai_scan(scan, recovered_signal):
-                ai_scan_review = self.ai_validator.review_scan(
+                ai_scan_review = self._review_scan_with_budget(
                     symbol=symbol,
                     scan=scan,
                     horizon_context=horizon_context,
                     external_context=external_context,
                     sector_context=sector_context,
                     microstructure=microstructure,
+                    reference_time=reference_time,
                 )
             if recovered_signal is not None and ai_scan_review is not None and ai_scan_review.approved:
                 signal = self._apply_ai_scan_signal_overrides(recovered_signal, ai_scan_review, scan)
@@ -534,6 +741,7 @@ class TradingEngine:
                             },
                         },
                     )
+                self._clear_signal_window(symbol)
                 return
             if signal is None:
                 detail = (
@@ -559,6 +767,7 @@ class TradingEngine:
                         },
                     },
                 )
+                self._clear_signal_window(symbol)
                 return
 
         if signal is not None and hot_mover_candidate is not None and symbol not in self.config.live_symbols():
@@ -571,16 +780,18 @@ class TradingEngine:
             ai_scan_review=ai_scan_review,
         )
         self.strategy_orchestrator.annotate_signal(signal, engine_assessment)
+        signal = self._stamp_signal_timing(symbol, signal, reference_time)
 
         signal.strategy_data["multi_horizon"] = horizon_context
         if self.config.ai_scan_assist and ai_scan_review is None:
-            ai_scan_review = self.ai_validator.review_scan(
+            ai_scan_review = self._review_scan_with_budget(
                 symbol=symbol,
                 scan=scan,
                 horizon_context=horizon_context,
                 external_context=external_context,
                 sector_context=sector_context,
                 microstructure=microstructure,
+                reference_time=reference_time,
             )
         external_alignment = external_context.get(signal.side, self.store.get_external_alignment(symbol, signal.side, hours=36))
         signal.strategy_data["external_alignment"] = external_alignment
@@ -742,7 +953,25 @@ class TradingEngine:
             )
             return
 
-        review = self.ai_validator.review(signal)
+        signal_age_seconds = self._signal_age_seconds(signal, reference_time)
+        freshness_limit_seconds = self._signal_freshness_limit_seconds(signal)
+        signal.strategy_data["signal_age_seconds"] = round(signal_age_seconds, 3)
+        signal.strategy_data["signal_freshness_limit_seconds"] = freshness_limit_seconds
+        if signal_age_seconds > freshness_limit_seconds:
+            self.store.log_decision(
+                symbol=symbol,
+                mode=self.config.mode,
+                stage="signal_freshness",
+                outcome="rejected",
+                detail=(
+                    f"Signal became stale before entry: age={signal_age_seconds:.1f}s "
+                    f"limit={freshness_limit_seconds}s."
+                ),
+                payload={"signal": signal.strategy_data},
+            )
+            return
+
+        review = self._review_signal_with_budget(signal, reference_time)
         self.store.log_signal(signal, review.approved, review.confidence, review.reason)
         if review.reason.startswith("AI validation failed"):
             set_runtime_flag(self.store, "last_ai_error_at", datetime.now(timezone.utc).isoformat())
@@ -902,8 +1131,13 @@ class TradingEngine:
             opened_at=datetime.now(timezone.utc),
             mode=self.config.mode,
         )
+        entry_opened_at = position.opened_at.astimezone(timezone.utc)
+        signal_generated_at = str(signal.strategy_data.get("signal_generated_at", ""))
+        signal_first_seen_at = str(signal.strategy_data.get("signal_first_seen_at", signal_generated_at))
+        entry_lag_seconds = signal_age_seconds
 
         self.store.open_position(position)
+        self._clear_signal_window(symbol)
         self.store.log_decision(
             symbol=symbol,
             mode=self.config.mode,
@@ -940,6 +1174,13 @@ class TradingEngine:
                 "sector_context": sector_context,
                 "ai_confidence": review.confidence,
                 "committee": review.committee,
+                "engine_family": signal.strategy_data.get("engine_family", ""),
+                "engine_key": signal.strategy_data.get("engine_key", ""),
+                "setup_type": signal.setup_type,
+                "signal_generated_at": signal_generated_at,
+                "signal_first_seen_at": signal_first_seen_at,
+                "entry_opened_at": entry_opened_at.isoformat(),
+                "entry_lag_seconds": round(entry_lag_seconds, 3),
                 "signal": signal.strategy_data,
             },
         )
@@ -3098,6 +3339,16 @@ class TradingEngine:
                     )
                     continue
 
+                if not self._consume_ai_budget("review", symbol, reference_time):
+                    self.store.log_decision(
+                        symbol=symbol,
+                        mode=self.config.mode,
+                        stage="overflow_budget",
+                        outcome="skipped",
+                        detail="Skipped overflow committee review because AI review budget was exhausted.",
+                        payload={"score": score, "status": status},
+                    )
+                    continue
                 review = self.ai_validator.review(scan.signal, advisory=True)
                 self.store.log_decision(
                     symbol=symbol,
