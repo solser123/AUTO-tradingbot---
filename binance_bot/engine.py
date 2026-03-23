@@ -906,7 +906,11 @@ class TradingEngine:
                 "short": self.store.get_external_alignment(position.symbol, "short", hours=36),
             }
             daily_realized_pnl = self.store.get_today_realized_pnl(self.config.mode, reference_time)
-            daily_profit_target = max(account_equity * self.config.ai_position_daily_profit_target_pct, 0.0)
+            desired_daily_profit_target = self._desired_daily_profit_target_usdt()
+            practical_daily_profit_target = self._practical_daily_profit_target_usdt(
+                account_equity,
+                desired_daily_profit_target,
+            )
             risk_distance = abs(position.entry_price - position.stop_price)
             unrealized_pnl = self._position_unrealized_pnl(position, current_price)
             unrealized_pnl_pct = (
@@ -922,7 +926,8 @@ class TradingEngine:
                 unrealized_pnl=unrealized_pnl,
                 unrealized_pnl_pct=unrealized_pnl_pct,
                 daily_realized_pnl=daily_realized_pnl,
-                daily_profit_target=daily_profit_target,
+                practical_daily_profit_target=practical_daily_profit_target,
+                desired_daily_profit_target=desired_daily_profit_target,
                 scan_metrics=scan.metrics,
                 horizon_context=horizon_context,
                 sector_context=sector_context,
@@ -971,7 +976,8 @@ class TradingEngine:
                 current_price=current_price,
                 decision=decision,
                 daily_realized_pnl=daily_realized_pnl,
-                daily_profit_target=daily_profit_target,
+                practical_daily_profit_target=practical_daily_profit_target,
+                desired_daily_profit_target=desired_daily_profit_target,
             )
         except Exception as exc:
             self.store.increment_state_counter("ai_failure_streak")
@@ -992,7 +998,8 @@ class TradingEngine:
         current_price: float,
         decision: AIManageDecision,
         daily_realized_pnl: float,
-        daily_profit_target: float,
+        practical_daily_profit_target: float,
+        desired_daily_profit_target: float,
     ) -> bool:
         payload = {
             "position_id": position.id,
@@ -1001,7 +1008,8 @@ class TradingEngine:
             "reason": decision.reason,
             "committee": decision.committee,
             "daily_realized_pnl": daily_realized_pnl,
-            "daily_profit_target": daily_profit_target,
+            "practical_daily_profit_target": practical_daily_profit_target,
+            "desired_daily_profit_target": desired_daily_profit_target,
         }
         if decision.action == "hold":
             self.store.log_decision(
@@ -1072,7 +1080,7 @@ class TradingEngine:
             )
             return True
         if decision.action in {"raise_target_small", "raise_target_medium"}:
-            if daily_profit_target > 0 and daily_realized_pnl >= daily_profit_target:
+            if practical_daily_profit_target > 0 and daily_realized_pnl >= practical_daily_profit_target:
                 self.store.log_decision(
                     symbol=position.symbol,
                     mode=self.config.mode,
@@ -1157,6 +1165,17 @@ class TradingEngine:
 
     def _position_manage_state_key(self, position_id: int) -> str:
         return f"ai_position_manage:{position_id}"
+
+    def _desired_daily_profit_target_usdt(self) -> float:
+        if self.config.monthly_living_cost_krw <= 0 or self.config.usdkrw_reference_rate <= 0:
+            return 0.0
+        return max(self.config.monthly_living_cost_krw / self.config.usdkrw_reference_rate / 30.0, 0.0)
+
+    def _practical_daily_profit_target_usdt(self, account_equity: float, desired_target: float) -> float:
+        equity_based_target = max(account_equity * self.config.ai_position_daily_profit_target_pct, 0.0)
+        if desired_target <= 0:
+            return equity_based_target
+        return min(desired_target, equity_based_target)
 
     def _raise_position_target(self, position: Position, multiplier: float) -> float | None:
         risk_distance = abs(position.entry_price - position.stop_price)

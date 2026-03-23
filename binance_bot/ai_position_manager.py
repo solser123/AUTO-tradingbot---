@@ -44,7 +44,8 @@ class AIPositionManager:
         unrealized_pnl: float,
         unrealized_pnl_pct: float,
         daily_realized_pnl: float,
-        daily_profit_target: float,
+        practical_daily_profit_target: float,
+        desired_daily_profit_target: float,
         scan_metrics: dict[str, object],
         horizon_context: dict[str, object],
         sector_context: dict[str, object],
@@ -65,11 +66,13 @@ class AIPositionManager:
             "The stop-loss basis is fixed and must not be widened or removed. "
             "Your goal is not to find the perfect top or bottom. "
             "Your goal is to improve steady daily profitability by managing open risk and letting strong trends continue modestly. "
+            "You will receive both a desired daily profit target and a practical daily profit target. "
+            "Use the practical target for immediate trade management and treat the desired target as a long-term context only. "
             "Never propose unlimited target raising. "
             "You may only choose exactly one action from: hold, exit_now, reduce_25, reduce_50, "
             "tighten_to_balanced, tighten_to_conservative, raise_target_small, raise_target_medium. "
             "Use raise_target actions only when trend continuation is still healthy and there is room to continue. "
-            "Use reduce/exit when the move is losing quality, daily profit is already close to target, or reversal risk is rising. "
+            "Use reduce/exit when the move is losing quality, practical daily profit is already close to target, or reversal risk is rising. "
             "Return strict JSON with keys: action, confidence, reason, trend_score, trend_reason, "
             "risk_score, risk_reason, management_score, management_reason."
         )
@@ -92,7 +95,8 @@ class AIPositionManager:
             "unrealized_pnl": unrealized_pnl,
             "unrealized_pnl_pct": unrealized_pnl_pct,
             "daily_realized_pnl": daily_realized_pnl,
-            "daily_profit_target": daily_profit_target,
+            "practical_daily_profit_target": practical_daily_profit_target,
+            "desired_daily_profit_target": desired_daily_profit_target,
             "scan_metrics": scan_metrics,
             "horizon_context": horizon_context,
             "sector_context": sector_context,

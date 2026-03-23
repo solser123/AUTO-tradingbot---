@@ -134,6 +134,8 @@ class BotConfig:
     ai_position_daily_profit_target_pct: float
     ai_position_target_raise_step_r: float
     ai_position_target_raise_cap_r: float
+    monthly_living_cost_krw: float
+    usdkrw_reference_rate: float
     enable_exploratory_live: bool
     exploratory_ai_min_confidence: float
     exploratory_ai_scan_min_confidence: float
@@ -428,6 +430,8 @@ class BotConfig:
             ai_position_daily_profit_target_pct=_as_float("BOT_AI_POSITION_DAILY_PROFIT_TARGET_PCT", 0.01),
             ai_position_target_raise_step_r=_as_float("BOT_AI_POSITION_TARGET_RAISE_STEP_R", 0.25),
             ai_position_target_raise_cap_r=_as_float("BOT_AI_POSITION_TARGET_RAISE_CAP_R", 0.75),
+            monthly_living_cost_krw=_as_float("BOT_MONTHLY_LIVING_COST_KRW", 0.0),
+            usdkrw_reference_rate=_as_float("BOT_USDKRW_REFERENCE_RATE", 1480.0),
             enable_exploratory_live=_as_bool(os.getenv("BOT_ENABLE_EXPLORATORY_LIVE"), True),
             exploratory_ai_min_confidence=_as_float("BOT_EXPLORATORY_AI_MIN_CONFIDENCE", 0.42),
             exploratory_ai_scan_min_confidence=_as_float("BOT_EXPLORATORY_AI_SCAN_MIN_CONFIDENCE", 0.52),
