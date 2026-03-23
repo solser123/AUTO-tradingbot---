@@ -5,7 +5,21 @@ $mainPath = Join-Path $root "main.py"
 $python = Join-Path $root ".venv\Scripts\python.exe"
 $dbPath = Join-Path $root "bot_state.db"
 $statePath = Join-Path (Join-Path $root "logs") "live_service_state.json"
+$supervisorStatePath = Join-Path (Join-Path $root "logs") "live_supervisor_state.json"
 $stopped = $false
+
+if (Test-Path $supervisorStatePath) {
+    try {
+        $supervisorState = Get-Content $supervisorStatePath -Raw | ConvertFrom-Json
+        if ($supervisorState.pid) {
+            Stop-Process -Id ([int]$supervisorState.pid) -Force -ErrorAction SilentlyContinue
+            Write-Output ("STOPPED_SUPERVISOR=" + $supervisorState.pid)
+            $stopped = $true
+        }
+    } catch {
+    }
+    Remove-Item $supervisorStatePath -Force -ErrorAction SilentlyContinue
+}
 
 if (Test-Path $statePath) {
     try {

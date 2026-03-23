@@ -996,8 +996,9 @@ class TradingEngine:
     def _reconcile_live_positions(self) -> None:
         if self.config.mode != "live" or not self.config.is_futures:
             return
-        emergency_active, _ = self.store.is_emergency_stop()
-        if emergency_active:
+        emergency_active, emergency_reason = self.store.is_emergency_stop()
+        mismatch_emergency = emergency_active and (emergency_reason or "").startswith("Live/open position mismatch detected.")
+        if emergency_active and not mismatch_emergency:
             return
         cleaned_symbols = self.store.cleanup_zero_quantity_open_positions(
             self.config.mode,
@@ -1041,6 +1042,55 @@ class TradingEngine:
                         detail=f"Recovered mismatch by clearing stale zero-quantity positions: {','.join(cleaned_missing)}",
                         payload={"symbols": cleaned_missing},
                     )
+                    if mismatch_emergency:
+                        self.store.clear_emergency_stop()
+                    return
+        if db_symbols != exchange_symbols:
+            missing_on_exchange = [symbol for symbol in db_symbols if symbol not in exchange_symbols]
+            auto_reconciled: list[str] = []
+            for missing_symbol in missing_on_exchange:
+                position = self.store.get_open_position(missing_symbol, self.config.mode)
+                if position is None:
+                    continue
+                try:
+                    exit_price = self.exchange.fetch_last_price(missing_symbol)
+                except Exception as exc:
+                    self.store.log_decision(
+                        symbol=missing_symbol,
+                        mode=self.config.mode,
+                        stage="position_reconcile",
+                        outcome="error",
+                        detail=f"Auto-reconcile price fetch failed: {exc}",
+                        payload={"symbol": missing_symbol},
+                    )
+                    continue
+                self.store.close_position(position.id, exit_price, "auto_reconcile_missing_on_exchange")
+                auto_reconciled.append(missing_symbol)
+                self.store.log_decision(
+                    symbol=missing_symbol,
+                    mode=self.config.mode,
+                    stage="position_reconcile",
+                    outcome="auto_recovered",
+                    detail="Auto-closed stale DB position missing on exchange.",
+                    payload={
+                        "symbol": missing_symbol,
+                        "quantity": position.quantity,
+                        "exit_price": exit_price,
+                    },
+                )
+            if auto_reconciled:
+                db_symbols = sorted(self.store.get_open_symbols(self.config.mode))
+                if db_symbols == exchange_symbols:
+                    self.store.log_decision(
+                        symbol="SYSTEM",
+                        mode=self.config.mode,
+                        stage="position_reconcile",
+                        outcome="auto_recovered",
+                        detail=f"Recovered mismatch by reconciling stale DB positions: {','.join(auto_reconciled)}",
+                        payload={"symbols": auto_reconciled},
+                    )
+                    if mismatch_emergency:
+                        self.store.clear_emergency_stop()
                     return
         if db_symbols != exchange_symbols:
             reason = (
