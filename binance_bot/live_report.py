@@ -20,6 +20,8 @@ class LiveReport:
     blocker_counts: dict[str, int]
     stage_counts: dict[str, int]
     opportunity: dict[str, float | int]
+    ai_efficiency: dict[str, float | int]
+    entry_timing: dict[str, float | int]
     weaknesses: list[str]
 
 
@@ -94,9 +96,24 @@ def build_live_report(store: StateStore, *, lookback_hours: int = 48) -> LiveRep
 
     blocker_counts: Counter[str] = Counter()
     stage_counts: Counter[str] = Counter()
+    ai_efficiency_counts: Counter[str] = Counter()
+    entry_lags: list[float] = []
     for row in decisions:
         stage = str(row["stage"])
         stage_counts[stage] += 1
+        if stage.startswith("ai_") or stage in {"overflow_budget", "signal_freshness"}:
+            ai_efficiency_counts[f"{stage}:{row['outcome']}"] += 1
+        if stage == "entry" and str(row["outcome"]) == "opened":
+            try:
+                payload = json.loads(str(row["payload_json"] or "{}"))
+            except Exception:
+                payload = {}
+            try:
+                lag = float(payload.get("entry_lag_seconds", 0.0) or 0.0)
+            except Exception:
+                lag = 0.0
+            if lag > 0:
+                entry_lags.append(lag)
         if row["outcome"] != "rejected":
             continue
         detail = str(row["detail"] or "")
@@ -134,6 +151,30 @@ def build_live_report(store: StateStore, *, lookback_hours: int = 48) -> LiveRep
             else 0.0
         ),
     }
+    ai_scan_calls = sum(
+        count for key, count in ai_efficiency_counts.items() if key.startswith("ai_scan_assist:")
+    )
+    ai_review_calls = sum(
+        count for key, count in ai_efficiency_counts.items() if key.startswith("ai_review:")
+    )
+    ai_position_actions = sum(
+        count for key, count in ai_efficiency_counts.items() if key.startswith("ai_position_manage:")
+    )
+    ai_efficiency = {
+        "ai_scan_events": ai_scan_calls,
+        "ai_review_events": ai_review_calls,
+        "ai_position_manage_events": ai_position_actions,
+        "ai_scan_budget_hits": int(ai_efficiency_counts.get("ai_scan_budget:rejected", 0)),
+        "ai_review_budget_hits": int(ai_efficiency_counts.get("ai_review_budget:skipped", 0)),
+        "signal_freshness_rejections": int(ai_efficiency_counts.get("signal_freshness:rejected", 0)),
+        "entries_opened": int(stage_counts.get("entry", 0)),
+        "scan_events_per_entry": (ai_scan_calls / max(int(stage_counts.get("entry", 0)), 1)),
+    }
+    entry_timing = {
+        "entries_with_lag": len(entry_lags),
+        "avg_entry_lag_seconds": (sum(entry_lags) / len(entry_lags)) if entry_lags else 0.0,
+        "max_entry_lag_seconds": max(entry_lags) if entry_lags else 0.0,
+    }
 
     weaknesses: list[str] = []
     top_blockers = blocker_counts.most_common(5)
@@ -147,6 +188,10 @@ def build_live_report(store: StateStore, *, lookback_hours: int = 48) -> LiveRep
         weaknesses.append("No closed live trades in the lookback window; the system is still learning more from decisions than executions.")
     if opportunity["missed_notional_pnl"] > max(total_realized, 0.0) * 2:
         weaknesses.append("Missed opportunity cost remains materially larger than realized pnl.")
+    if ai_efficiency["scan_events_per_entry"] > 15:
+        weaknesses.append("AI is still being spent too heavily at the scan layer relative to actual entries.")
+    if entry_timing["avg_entry_lag_seconds"] > 300:
+        weaknesses.append("Average entry lag is still too slow for live execution quality.")
     if blocker_counts.get("Long rejected: higher timeframe bias is still too weak.", 0) > 10:
         weaknesses.append("Higher-timeframe bias remains the dominant long-side blocker.")
     if blocker_counts.get("Short rejected: higher timeframe bias is still too strong for a short.", 0) > 10:
@@ -171,6 +216,8 @@ def build_live_report(store: StateStore, *, lookback_hours: int = 48) -> LiveRep
         blocker_counts=dict(top_blockers),
         stage_counts=dict(stage_counts.most_common(10)),
         opportunity=opportunity,
+        ai_efficiency=ai_efficiency,
+        entry_timing=entry_timing,
         weaknesses=weaknesses,
     )
 
@@ -220,6 +267,20 @@ def render_live_report(report: LiveReport) -> str:
     lines.append(f"- material_reviews: {int(report.opportunity['material_reviews'])}")
     lines.append(f"- missed_notional_pnl: {float(report.opportunity['missed_notional_pnl']):.4f}")
     lines.append(f"- avg_move_pct: {float(report.opportunity['avg_move_pct']):.2f}%")
+
+    lines.extend(["", "## AI Efficiency"])
+    lines.append(f"- ai_scan_events: {int(report.ai_efficiency['ai_scan_events'])}")
+    lines.append(f"- ai_review_events: {int(report.ai_efficiency['ai_review_events'])}")
+    lines.append(f"- ai_position_manage_events: {int(report.ai_efficiency['ai_position_manage_events'])}")
+    lines.append(f"- ai_scan_budget_hits: {int(report.ai_efficiency['ai_scan_budget_hits'])}")
+    lines.append(f"- ai_review_budget_hits: {int(report.ai_efficiency['ai_review_budget_hits'])}")
+    lines.append(f"- signal_freshness_rejections: {int(report.ai_efficiency['signal_freshness_rejections'])}")
+    lines.append(f"- scan_events_per_entry: {float(report.ai_efficiency['scan_events_per_entry']):.2f}")
+
+    lines.extend(["", "## Entry Timing"])
+    lines.append(f"- entries_with_lag: {int(report.entry_timing['entries_with_lag'])}")
+    lines.append(f"- avg_entry_lag_seconds: {float(report.entry_timing['avg_entry_lag_seconds']):.2f}")
+    lines.append(f"- max_entry_lag_seconds: {float(report.entry_timing['max_entry_lag_seconds']):.2f}")
 
     lines.extend(["", "## Weaknesses"])
     if report.weaknesses:

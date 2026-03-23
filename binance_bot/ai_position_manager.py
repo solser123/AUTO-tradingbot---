@@ -51,6 +51,7 @@ class AIPositionManager:
         sector_context: dict[str, object],
         external_context: dict[str, object],
         microstructure: dict[str, object],
+        expert_context: dict[str, object] | None = None,
     ) -> AIManageDecision:
         if not self.enabled or self.client is None:
             return AIManageDecision(
@@ -66,6 +67,8 @@ class AIPositionManager:
             "The stop-loss basis is fixed and must not be widened or removed. "
             "Your goal is not to find the perfect top or bottom. "
             "Your goal is to improve steady daily profitability by managing open risk and letting strong trends continue modestly. "
+            "Use the provided expert_context to compare the live position with recent same-symbol outcomes, "
+            "recent missed opportunities, repeated blockers, current headlines, and upcoming macro events. "
             "You will receive both a desired daily profit target and a practical daily profit target. "
             "Use the practical target for immediate trade management and treat the desired target as a long-term context only. "
             "Never propose unlimited target raising. "
@@ -73,8 +76,9 @@ class AIPositionManager:
             "tighten_to_balanced, tighten_to_conservative, raise_target_small, raise_target_medium. "
             "Use raise_target actions only when trend continuation is still healthy and there is room to continue. "
             "Use reduce/exit when the move is losing quality, practical daily profit is already close to target, or reversal risk is rising. "
+            "Write every natural-language field in Korean. "
             "Return strict JSON with keys: action, confidence, reason, trend_score, trend_reason, "
-            "risk_score, risk_reason, management_score, management_reason."
+            "risk_score, risk_reason, management_score, management_reason, analog_note, macro_note, hidden_risk."
         )
         payload = {
             "position": {
@@ -102,6 +106,7 @@ class AIPositionManager:
             "sector_context": sector_context,
             "external_context": external_context,
             "microstructure": microstructure,
+            "expert_context": expert_context or {},
         }
         try:
             response = self.client.chat.completions.create(
@@ -134,6 +139,9 @@ class AIPositionManager:
                 "risk_reason": str(parsed.get("risk_reason", "")),
                 "management_score": max(0.0, min(_safe_float(parsed.get("management_score", 0.0), 0.0), 1.0)),
                 "management_reason": str(parsed.get("management_reason", "")),
+                "analog_note": str(parsed.get("analog_note", "")),
+                "macro_note": str(parsed.get("macro_note", "")),
+                "hidden_risk": str(parsed.get("hidden_risk", "")),
             }
             return AIManageDecision(
                 action=action,

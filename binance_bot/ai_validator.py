@@ -55,7 +55,12 @@ class AIValidator:
             except Exception:
                 self.enabled = False
 
-    def review(self, signal: TradeSignal, advisory: bool = False) -> AIReview:
+    def review(
+        self,
+        signal: TradeSignal,
+        advisory: bool = False,
+        expert_context: dict[str, object] | None = None,
+    ) -> AIReview:
         if not self.enabled or self.client is None:
             return AIReview(
                 approved=True,
@@ -72,6 +77,9 @@ class AIValidator:
             "Use short-term, medium-term, and long-term horizon context together. "
             "Also use sector flow / capital rotation context if it is present in strategy_data. "
             "Short-term is for timing, medium-term is for continuation quality, long-term is for structural bias. "
+            "Use the provided expert_context to compare this setup with recent same-symbol trade outcomes, "
+            "recent missed opportunities, repeated blockers, upcoming macro events, and current external headlines. "
+            "When possible, explain whether this setup resembles a historically favorable or unfavorable local pattern. "
             "Approve only if the setup has clear edge, not just a signal. "
             "Reject trades that are late, stretched, noisy, reversal-prone, weak on follow-through, "
             "or structurally poor after fees and slippage. "
@@ -79,8 +87,10 @@ class AIValidator:
             "Use full for high-quality setups, exploratory for smaller B-grade setups with some edge, "
             "and no_trade for weak setups. "
             "If advisory mode is true, treat this as a promotion candidate review for a non-core symbol and be stricter. "
+            "Write every natural-language field in Korean. "
             "Return strict JSON with keys: approved, confidence, recommended_action, reason, trend_score, trend_reason, "
-            "risk_score, risk_reason, execution_score, execution_reason."
+            "risk_score, risk_reason, execution_score, execution_reason, thesis, analog_reason, "
+            "macro_reason, hidden_risk, execution_plan."
         )
         payload = {
             "advisory_mode": advisory,
@@ -93,6 +103,7 @@ class AIValidator:
             "setup_type": signal.setup_type,
             "reason": signal.reason,
             "strategy_data": signal.strategy_data,
+            "expert_context": expert_context or {},
         }
 
         try:
@@ -120,6 +131,11 @@ class AIValidator:
                 "risk_reason": str(parsed.get("risk_reason", "")),
                 "execution_score": max(0.0, min(_safe_float(parsed.get("execution_score", 0.0), 0.0), 1.0)),
                 "execution_reason": str(parsed.get("execution_reason", "")),
+                "thesis": str(parsed.get("thesis", "")),
+                "analog_reason": str(parsed.get("analog_reason", "")),
+                "macro_reason": str(parsed.get("macro_reason", "")),
+                "hidden_risk": str(parsed.get("hidden_risk", "")),
+                "execution_plan": str(parsed.get("execution_plan", "")),
                 "advisory_mode": advisory,
             }
             return AIReview(
@@ -173,6 +189,7 @@ class AIValidator:
             "If the market is broadly bearish with weak bounce attempts, prefer short exploratory over no-trade. "
             "If the market is broadly bullish with weak pullback recovery attempts, prefer long exploratory over no-trade. "
             "Use no-trade only when both sides lack edge. "
+            "Write every natural-language field in Korean. "
             "Return strict JSON with keys: approved, confidence, suggested_side, setup_bias, reason, "
             "trend_score, trend_reason, context_score, context_reason, timing_score, timing_reason."
         )

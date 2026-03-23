@@ -661,6 +661,69 @@ class StateStore:
         with self._connect() as conn:
             return conn.execute(query, tuple(params)).fetchall()
 
+    def get_recent_closed_trade_rows(
+        self,
+        *,
+        mode: str,
+        hours: int = 168,
+        symbol: str | None = None,
+        side: str | None = None,
+        limit: int = 50,
+    ) -> list[sqlite3.Row]:
+        anchor = datetime.now(timezone.utc) - timedelta(hours=max(hours, 1))
+        query = """
+                SELECT symbol, side, entry_profile, profile_stage, entry_price, exit_price, realized_pnl,
+                       exit_reason, opened_at, closed_at
+                FROM positions
+                WHERE status = 'CLOSED'
+                  AND mode = ?
+                  AND closed_at IS NOT NULL
+                  AND closed_at >= ?
+                """
+        params: list[object] = [mode, anchor.isoformat()]
+        if symbol is not None:
+            query += " AND symbol = ?"
+            params.append(symbol)
+        if side is not None:
+            query += " AND side = ?"
+            params.append(side)
+        query += " ORDER BY closed_at DESC LIMIT ?"
+        params.append(limit)
+        with self._connect() as conn:
+            return conn.execute(query, tuple(params)).fetchall()
+
+    def get_recent_decision_rows(
+        self,
+        *,
+        mode: str,
+        hours: int = 168,
+        symbol: str | None = None,
+        stage: str | None = None,
+        outcome: str | None = None,
+        limit: int = 100,
+    ) -> list[sqlite3.Row]:
+        anchor = datetime.now(timezone.utc) - timedelta(hours=max(hours, 1))
+        query = """
+                SELECT created_at, symbol, stage, outcome, detail, payload_json
+                FROM decision_log
+                WHERE mode = ?
+                  AND created_at >= ?
+                """
+        params: list[object] = [mode, anchor.isoformat()]
+        if symbol is not None:
+            query += " AND symbol = ?"
+            params.append(symbol)
+        if stage is not None:
+            query += " AND stage = ?"
+            params.append(stage)
+        if outcome is not None:
+            query += " AND outcome = ?"
+            params.append(outcome)
+        query += " ORDER BY id DESC LIMIT ?"
+        params.append(limit)
+        with self._connect() as conn:
+            return conn.execute(query, tuple(params)).fetchall()
+
     def get_trade_metrics(self, mode: str | None = None) -> dict[str, float | int]:
         rows = self.get_closed_positions(mode)
         pnls = [float(row["realized_pnl"] or 0.0) for row in rows]

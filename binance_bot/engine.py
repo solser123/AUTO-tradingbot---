@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections import Counter
 import json
 import logging
 import os
@@ -98,6 +99,12 @@ class TradingEngine:
         if len(compact) <= limit:
             return compact
         return f"{compact[: limit - 3]}..."
+
+    def _committee_note_line(self, committee: dict[str, object], key: str, prefix: str, limit: int = 120) -> str:
+        raw = str(committee.get(key, "") or "").strip()
+        if not raw:
+            return ""
+        return f"{prefix}: {self._short_reason(raw, limit=limit)}"
 
     def _label_mode(self, mode: str) -> str:
         return {"live": "실거래", "paper": "모의"}.get(mode, mode)
@@ -342,7 +349,8 @@ class TradingEngine:
         reference_time: datetime,
     ) -> AIReview:
         if self._consume_ai_budget("review", signal.symbol, reference_time):
-            return self.ai_validator.review(signal)
+            expert_context = self._build_signal_expert_context(signal, reference_time)
+            return self.ai_validator.review(signal, expert_context=expert_context)
         self.store.log_decision(
             symbol=signal.symbol,
             mode=self.config.mode,
@@ -370,8 +378,138 @@ class TradingEngine:
                 if approved
                 else "AI review budget exceeded and deterministic score was not strong enough."
             ),
-            committee={"budget_mode": True, "entry_profile_score": score},
+            committee={
+                "budget_mode": True,
+                "entry_profile_score": score,
+                "expert_context_hint": "AI skipped due to budget. Deterministic fallback used.",
+            },
         )
+
+    def _top_recent_blockers(self, symbol: str, *, hours: int = 96, limit: int = 80) -> list[str]:
+        rows = self.store.get_recent_decision_rows(
+            mode=self.config.mode,
+            symbol=symbol,
+            hours=hours,
+            limit=limit,
+        )
+        counts: Counter[str] = Counter()
+        for row in rows:
+            if str(row["outcome"]) not in {"rejected", "watch_only"}:
+                continue
+            detail = " ".join(str(row["detail"] or "").split())
+            if not detail:
+                continue
+            counts[detail[:120]] += 1
+        return [f"{text} x{count}" for text, count in counts.most_common(3)]
+
+    def _summarize_recent_entry_analogs(self, signal: TradeSignal, *, hours: int = 336) -> dict[str, object]:
+        rows = self.store.get_recent_decision_rows(
+            mode=self.config.mode,
+            symbol=signal.symbol,
+            stage="entry",
+            outcome="opened",
+            hours=hours,
+            limit=40,
+        )
+        engine_family = str(signal.strategy_data.get("engine_family", "") or "")
+        setup_type = signal.setup_type
+        matched = 0
+        lag_seconds: list[float] = []
+        for row in rows:
+            try:
+                payload = json.loads(str(row["payload_json"] or "{}"))
+            except Exception:
+                payload = {}
+            if str(payload.get("setup_type", "")) != setup_type:
+                continue
+            if engine_family and str(payload.get("engine_family", "")) != engine_family:
+                continue
+            matched += 1
+            try:
+                lag = float(payload.get("entry_lag_seconds", 0.0) or 0.0)
+            except Exception:
+                lag = 0.0
+            if lag > 0:
+                lag_seconds.append(lag)
+        return {
+            "matched_entries": matched,
+            "avg_entry_lag_seconds": round(sum(lag_seconds) / len(lag_seconds), 2) if lag_seconds else 0.0,
+            "max_entry_lag_seconds": round(max(lag_seconds), 2) if lag_seconds else 0.0,
+        }
+
+    def _summarize_symbol_trade_history(self, symbol: str, side: str, *, hours: int = 336) -> dict[str, object]:
+        rows = self.store.get_recent_closed_trade_rows(
+            mode=self.config.mode,
+            symbol=symbol,
+            side=side,
+            hours=hours,
+            limit=20,
+        )
+        pnls = [float(row["realized_pnl"] or 0.0) for row in rows]
+        wins = [pnl for pnl in pnls if pnl > 0]
+        exit_counts: Counter[str] = Counter(str(row["exit_reason"] or "") for row in rows if str(row["exit_reason"] or ""))
+        return {
+            "trade_count": len(rows),
+            "win_rate_pct": round((len(wins) / len(rows) * 100.0), 2) if rows else 0.0,
+            "avg_pnl": round(sum(pnls) / len(pnls), 4) if pnls else 0.0,
+            "total_pnl": round(sum(pnls), 4) if pnls else 0.0,
+            "top_exits": [f"{name} x{count}" for name, count in exit_counts.most_common(3)],
+        }
+
+    def _summarize_symbol_opportunity_history(self, symbol: str, side: str, *, hours: int = 336) -> dict[str, object]:
+        rows = self.store.get_opportunity_reviews(symbol=symbol, hours=hours, only_material=False, limit=30)
+        filtered = [row for row in rows if str(row["dominant_side"] or "") == side]
+        moves = [float(row["dominant_move_pct"] or 0.0) for row in filtered]
+        missed = [float(row["missed_notional_pnl"] or 0.0) for row in filtered]
+        material = sum(1 for row in filtered if int(row["is_material"] or 0) == 1)
+        return {
+            "review_count": len(filtered),
+            "material_count": material,
+            "avg_move_pct": round(sum(moves) / len(moves), 2) if moves else 0.0,
+            "avg_missed_notional_pnl": round(sum(missed) / len(missed), 4) if missed else 0.0,
+        }
+
+    def _recent_headline_summary(self, symbol: str, *, hours: int = 72, limit: int = 4) -> list[str]:
+        rows = self.store.get_recent_external_items(limit=limit, symbol=symbol, hours=hours)
+        return [
+            f"{row['source']} {row['direction']} | {str(row['title'])[:90]}"
+            for row in rows
+        ]
+
+    def _upcoming_macro_summary(self, *, reference_time: datetime, hours: int = 48) -> list[str]:
+        events = get_upcoming_macro_events(self.store, hours=hours)
+        lines: list[str] = []
+        for event in events[:4]:
+            try:
+                scheduled = datetime.fromisoformat(str(event["scheduled_at"]))
+                if scheduled.tzinfo is None:
+                    scheduled = scheduled.replace(tzinfo=timezone.utc)
+                scheduled_text = scheduled.astimezone(KST).strftime("%m-%d %H:%M KST")
+            except Exception:
+                scheduled_text = str(event["scheduled_at"])
+            lines.append(
+                f"{event['importance']} | {event['title']} | {scheduled_text}"
+            )
+        return lines
+
+    def _build_signal_expert_context(self, signal: TradeSignal, reference_time: datetime) -> dict[str, object]:
+        return {
+            "symbol_trade_history": self._summarize_symbol_trade_history(signal.symbol, signal.side),
+            "symbol_opportunity_history": self._summarize_symbol_opportunity_history(signal.symbol, signal.side),
+            "entry_analog_history": self._summarize_recent_entry_analogs(signal),
+            "recent_blockers": self._top_recent_blockers(signal.symbol),
+            "recent_headlines": self._recent_headline_summary(signal.symbol),
+            "upcoming_macro": self._upcoming_macro_summary(reference_time=reference_time),
+        }
+
+    def _build_position_expert_context(self, position: Position, reference_time: datetime) -> dict[str, object]:
+        return {
+            "symbol_trade_history": self._summarize_symbol_trade_history(position.symbol, position.side),
+            "symbol_opportunity_history": self._summarize_symbol_opportunity_history(position.symbol, position.side),
+            "recent_blockers": self._top_recent_blockers(position.symbol),
+            "recent_headlines": self._recent_headline_summary(position.symbol),
+            "upcoming_macro": self._upcoming_macro_summary(reference_time=reference_time),
+        }
 
     def _scan_symbols(self) -> list[str]:
         configured_symbols = self.exchange.resolve_symbols(self.config.active_symbols())
@@ -1198,6 +1336,9 @@ class TradingEngine:
             f"세팅: {self._label_setup(signal.setup_type)} | AI 신뢰도: {review.confidence:.2f}",
             f"진입 근거: {self._short_reason(signal.reason)}",
             f"AI 판단: {self._short_reason(review.reason)}",
+            self._committee_note_line(review.committee, "thesis", "핵심 해석"),
+            self._committee_note_line(review.committee, "analog_reason", "유사 패턴"),
+            self._committee_note_line(review.committee, "hidden_risk", "숨은 리스크"),
         )
 
     def _manage_position(self, position: Position, reference_time: datetime, account_equity: float) -> None:
@@ -1308,6 +1449,7 @@ class TradingEngine:
                 account_equity,
                 desired_daily_profit_target,
             )
+            expert_context = self._build_position_expert_context(position, reference_time)
             risk_distance = abs(position.entry_price - position.stop_price)
             unrealized_pnl = self._position_unrealized_pnl(position, current_price)
             unrealized_pnl_pct = (
@@ -1330,6 +1472,7 @@ class TradingEngine:
                 sector_context=sector_context,
                 external_context=external_context,
                 microstructure=microstructure,
+                expert_context=expert_context,
             )
             self.store.set_state(
                 self._position_manage_state_key(position.id or 0),
@@ -1434,6 +1577,9 @@ class TradingEngine:
                 f"조치: {self._label_ai_action('exit_now')}",
                 f"현재가: {self._fmt_price(current_price)} | AI 신뢰도: {decision.confidence:.2f}",
                 f"관리 이유: {self._short_reason(decision.reason)}",
+                self._committee_note_line(decision.committee, "analog_note", "유사 사례"),
+                self._committee_note_line(decision.committee, "macro_note", "거시 메모"),
+                self._committee_note_line(decision.committee, "hidden_risk", "숨은 리스크"),
             )
             return True
         if decision.action == "reduce_25":
@@ -1452,6 +1598,9 @@ class TradingEngine:
                 f"조치: {self._label_ai_action('reduce_25')}",
                 f"현재가: {self._fmt_price(current_price)} | AI 신뢰도: {decision.confidence:.2f}",
                 f"관리 이유: {self._short_reason(decision.reason)}",
+                self._committee_note_line(decision.committee, "analog_note", "유사 사례"),
+                self._committee_note_line(decision.committee, "macro_note", "거시 메모"),
+                self._committee_note_line(decision.committee, "hidden_risk", "숨은 리스크"),
             )
             return True
         if decision.action == "reduce_50":
@@ -1471,6 +1620,9 @@ class TradingEngine:
                 f"조치: {self._label_ai_action('reduce_50')} | 다음 단계: {self._label_profile(next_stage)}",
                 f"현재가: {self._fmt_price(current_price)} | AI 신뢰도: {decision.confidence:.2f}",
                 f"관리 이유: {self._short_reason(decision.reason)}",
+                self._committee_note_line(decision.committee, "analog_note", "유사 사례"),
+                self._committee_note_line(decision.committee, "macro_note", "거시 메모"),
+                self._committee_note_line(decision.committee, "hidden_risk", "숨은 리스크"),
             )
             return True
         if decision.action in {"tighten_to_balanced", "tighten_to_conservative"}:
@@ -1490,6 +1642,9 @@ class TradingEngine:
                 f"조치: {self._label_ai_action(decision.action)}",
                 f"현재가: {self._fmt_price(current_price)} | AI 신뢰도: {decision.confidence:.2f}",
                 f"관리 이유: {self._short_reason(decision.reason)}",
+                self._committee_note_line(decision.committee, "analog_note", "유사 사례"),
+                self._committee_note_line(decision.committee, "macro_note", "거시 메모"),
+                self._committee_note_line(decision.committee, "hidden_risk", "숨은 리스크"),
             )
             return True
         if decision.action in {"raise_target_small", "raise_target_medium"}:
@@ -1530,6 +1685,9 @@ class TradingEngine:
                 f"조치: {self._label_ai_action(decision.action)}",
                 f"목표가: {self._fmt_price(old_target)} -> {self._fmt_price(new_target)} | AI 신뢰도: {decision.confidence:.2f}",
                 f"관리 이유: {self._short_reason(decision.reason)}",
+                self._committee_note_line(decision.committee, "analog_note", "유사 사례"),
+                self._committee_note_line(decision.committee, "macro_note", "거시 메모"),
+                self._committee_note_line(decision.committee, "hidden_risk", "숨은 리스크"),
             )
             return True
         return False
@@ -2523,15 +2681,33 @@ class TradingEngine:
     def _should_run_ai_scan(self, scan, recovered_signal: TradeSignal | None) -> bool:
         if not self.config.ai_scan_assist:
             return False
-        if scan.signal is not None or recovered_signal is not None:
+        if recovered_signal is not None:
             return True
+        metrics = scan.metrics or {}
+        if scan.signal is not None:
+            setup = scan.signal.setup_type.lower()
+            signal_score = float(scan.signal.strategy_data.get("entry_profile_score", 0.0) or 0.0)
+            early_or_ambiguous = any(
+                token in setup
+                for token in ("reversal", "context_recovery", "breakout", "hot_mover", "ai_")
+            )
+            structure_release = any(
+                bool(metrics.get(flag, False))
+                for flag in ("squeeze_off", "bullish_choch", "bearish_choch", "bullish_bos", "bearish_bos")
+            )
+            return early_or_ambiguous and (
+                signal_score >= max(self.config.balanced_entry_score - 0.06, 0.46) or structure_release
+            )
         _, score = rank_scan(scan, 0.0)
         if score >= self.config.ai_scan_trigger_score:
             return True
-        metrics = scan.metrics or {}
         volume_ratio = float(metrics.get("volume_ratio", 0.0) or 0.0)
         atr_ratio = float(metrics.get("atr_regime_ratio", 0.0) or 0.0)
-        return bool(metrics) and volume_ratio >= 0.45 and atr_ratio >= 0.65
+        structure_release = any(
+            bool(metrics.get(flag, False))
+            for flag in ("squeeze_off", "bullish_choch", "bearish_choch", "recent_bullish_fvg", "recent_bearish_fvg")
+        )
+        return bool(metrics) and volume_ratio >= 0.60 and atr_ratio >= 0.85 and structure_release
 
     def _apply_ai_scan_signal_overrides(self, signal: TradeSignal, review: AIScanReview, scan) -> TradeSignal:
         confidence_score = max(signal.strategy_data.get("entry_profile_score", 0.44), 0.45 + (review.confidence * 0.18))
