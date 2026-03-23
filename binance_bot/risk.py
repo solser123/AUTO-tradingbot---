@@ -40,8 +40,31 @@ class RiskManager:
         if self.store.get_open_position(signal.symbol, self.config.mode) is not None:
             return RiskDecision(False, "There is already an open position for this symbol.")
 
-        if self.store.count_open_positions(self.config.mode) >= self.config.max_open_positions:
-            return RiskDecision(False, "Maximum number of open positions reached.")
+        dynamic_open_cap = self._dynamic_open_position_cap(
+            signal=signal,
+            review=review,
+            account_equity=account_equity,
+            exploratory=exploratory,
+        )
+        current_open_positions = self.store.count_open_positions(self.config.mode)
+        dynamic_cap_meta = self._dynamic_open_cap_meta(
+            signal=signal,
+            review=review,
+            account_equity=account_equity,
+            exploratory=exploratory,
+            dynamic_open_cap=dynamic_open_cap,
+            current_open_positions=current_open_positions,
+        )
+        signal.strategy_data["dynamic_open_cap"] = dynamic_cap_meta
+        if current_open_positions >= dynamic_open_cap:
+            return RiskDecision(
+                False,
+                (
+                    f"Dynamic open position cap reached ({current_open_positions}/{dynamic_open_cap}). "
+                    f"urgent={dynamic_cap_meta['urgent_signal']} remaining_risk_budget_pct="
+                    f"{dynamic_cap_meta['remaining_risk_budget_pct']:.4f}"
+                ),
+            )
 
         is_hot_mover_scout = bool(signal.strategy_data.get("hot_mover_scout", False))
         if self.config.mode == "live" and signal.symbol not in self.config.live_symbols():
@@ -120,6 +143,70 @@ class RiskManager:
 
         return RiskDecision(True, "Trade allowed.")
 
+    def _dynamic_open_position_cap(
+        self,
+        *,
+        signal: TradeSignal,
+        review: AIReview,
+        account_equity: float,
+        exploratory: bool,
+    ) -> int:
+        base_cap = max(self.config.max_open_positions, 2)
+        cap = base_cap
+        open_risk = self._open_risk_pct(account_equity, self.config.mode)
+        remaining_risk_budget = max(self.config.sizing_max_total_open_risk_pct - open_risk, 0.0)
+        engine_family = str(signal.strategy_data.get("engine_family", "") or "").lower()
+        engine_key = str(signal.strategy_data.get("engine_key", "") or "").lower()
+        urgent_signal = bool(signal.strategy_data.get("hot_mover_scout", False)) or engine_family in {"reversal", "scout"} or engine_key in {"reversal", "scout"}
+        strong_signal = (
+            not exploratory
+            and review.approved
+            and review.confidence >= max(self.config.min_ai_confidence_for_symbol(signal.symbol), 0.62)
+        )
+        if remaining_risk_budget >= self.config.max_trade_risk_pct * 1.5:
+            cap += 1
+        if urgent_signal and remaining_risk_budget >= self.config.max_trade_risk_pct:
+            cap += 1
+        if strong_signal and remaining_risk_budget >= self.config.max_trade_risk_pct * 2.0:
+            cap += 1
+        if self._open_sector_position_count(signal.symbol, self.config.mode) >= 2 and not urgent_signal:
+            cap = max(base_cap, cap - 1)
+        return min(cap, 6)
+
+    def _dynamic_open_cap_meta(
+        self,
+        *,
+        signal: TradeSignal,
+        review: AIReview,
+        account_equity: float,
+        exploratory: bool,
+        dynamic_open_cap: int,
+        current_open_positions: int,
+    ) -> dict[str, float | int | bool | str]:
+        open_risk = self._open_risk_pct(account_equity, self.config.mode)
+        remaining_risk_budget = max(self.config.sizing_max_total_open_risk_pct - open_risk, 0.0)
+        engine_family = str(signal.strategy_data.get("engine_family", "") or "").lower()
+        engine_key = str(signal.strategy_data.get("engine_key", "") or "").lower()
+        urgent_signal = bool(signal.strategy_data.get("hot_mover_scout", False)) or engine_family in {"reversal", "scout"} or engine_key in {"reversal", "scout"}
+        strong_signal = (
+            not exploratory
+            and review.approved
+            and review.confidence >= max(self.config.min_ai_confidence_for_symbol(signal.symbol), 0.62)
+        )
+        return {
+            "current_open_positions": current_open_positions,
+            "dynamic_open_cap": dynamic_open_cap,
+            "base_cap": max(self.config.max_open_positions, 2),
+            "open_risk_pct": round(open_risk, 6),
+            "remaining_risk_budget_pct": round(remaining_risk_budget, 6),
+            "urgent_signal": urgent_signal,
+            "strong_signal": strong_signal,
+            "exploratory": exploratory,
+            "engine_family": engine_family,
+            "engine_key": engine_key,
+            "same_sector_positions": self._open_sector_position_count(signal.symbol, self.config.mode),
+        }
+
     def _trade_risk_pct(self, signal: TradeSignal, account_equity: float) -> float:
         if account_equity <= 0:
             return 1.0
@@ -149,6 +236,14 @@ class RiskManager:
         return sum(
             self._position_risk_pct(position, account_equity)
             for position in positions
+            if sector_for_symbol(position.symbol) == target_sector
+        )
+
+    def _open_sector_position_count(self, symbol: str, mode: str) -> int:
+        target_sector = sector_for_symbol(symbol)
+        return sum(
+            1
+            for position in self.store.get_open_positions(mode)
             if sector_for_symbol(position.symbol) == target_sector
         )
 

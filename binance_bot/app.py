@@ -132,6 +132,8 @@ def run_doctor() -> int:
         checks.append(("coinglass-plan", True, store.get_state("coinglass_plan_status") or "pending"))
         checks.append(("coinglass-supported", True, store.get_state("coinglass_supported_count") or "0"))
         checks.append(("coinglass-last-ok", True, store.get_state("coinglass_last_ok_at") or "none"))
+    checks.append(("dynamic-hot-cap", True, store.get_state("dynamic_hot_mover_cap") or "pending"))
+    checks.append(("adaptive-ai", True, store.get_state(f"adaptive_ai_profile_latest:{config.mode}") or "pending"))
     checks.append(("emergency-stop", True, runtime_flags.get("emergency_stop", "0") or "0"))
     checks.append(("emergency-severity", True, runtime_flags.get("emergency_severity", "") or "none"))
     checks.append(("emergency-reason", True, runtime_flags.get("emergency_reason", "") or "none"))

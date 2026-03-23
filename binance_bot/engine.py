@@ -293,10 +293,108 @@ class TradingEngine:
             return self.config.signal_max_age_exploratory_seconds
         return self.config.signal_max_age_aggressive_seconds
 
+    def _adaptive_ai_profile(self, reference_time: datetime) -> dict[str, object]:
+        bucket = reference_time.astimezone(timezone.utc).strftime("%Y%m%d%H")
+        key = f"adaptive_ai_profile:{self.config.mode}:{bucket}"
+        cached = self.store.get_state(key)
+        if cached:
+            try:
+                payload = json.loads(cached)
+                if isinstance(payload, dict):
+                    return payload
+            except Exception:
+                pass
+
+        signal_stats = self.store.get_recent_signal_stats(hours=6)
+        opened_entries = self.store.count_decisions(
+            mode=self.config.mode,
+            stage="entry",
+            outcome="opened",
+            hours=6,
+        )
+        ai_rejections = self.store.count_decisions(
+            mode=self.config.mode,
+            stage="ai_review",
+            outcome="rejected",
+            hours=6,
+        )
+        approved_signals = int(signal_stats.get("approved_signals", 0.0) or 0.0)
+        total_signals = int(signal_stats.get("total_signals", 0.0) or 0.0)
+        entry_conversion = opened_entries / max(approved_signals, 1)
+        signal_conversion = opened_entries / max(total_signals, 1)
+
+        if approved_signals < 4 or entry_conversion < 0.12:
+            regime = "exploration"
+        elif entry_conversion < 0.30:
+            regime = "balanced"
+        else:
+            regime = "strict"
+
+        scan_trigger_score = self.config.ai_scan_trigger_score
+        volume_floor = 0.60
+        atr_floor = 0.85
+        signal_score_floor = max(self.config.balanced_entry_score - 0.06, 0.46)
+        review_relief = 0.0
+        scan_relief = 0.0
+        if regime == "exploration":
+            scan_trigger_score = max(self.config.ai_scan_trigger_score - 0.45, 2.6)
+            volume_floor = 0.42
+            atr_floor = 0.72
+            signal_score_floor = max(self.config.conservative_entry_score - 0.03, 0.40)
+            review_relief = 0.04
+            scan_relief = 0.04
+        elif regime == "strict":
+            scan_trigger_score = self.config.ai_scan_trigger_score + 0.25
+            volume_floor = 0.72
+            atr_floor = 0.95
+            signal_score_floor = max(self.config.aggressive_entry_score - 0.04, 0.54)
+            review_relief = -0.02
+            scan_relief = -0.02
+
+        payload = {
+            "regime": regime,
+            "approved_signals_6h": approved_signals,
+            "total_signals_6h": total_signals,
+            "opened_entries_6h": opened_entries,
+            "ai_rejections_6h": ai_rejections,
+            "entry_conversion_6h": round(entry_conversion, 4),
+            "signal_conversion_6h": round(signal_conversion, 4),
+            "scan_trigger_score": round(scan_trigger_score, 4),
+            "scan_volume_floor": round(volume_floor, 4),
+            "scan_atr_floor": round(atr_floor, 4),
+            "signal_score_floor": round(signal_score_floor, 4),
+            "review_confidence_relief": round(review_relief, 4),
+            "scan_confidence_relief": round(scan_relief, 4),
+        }
+        self.store.set_state(key, json.dumps(payload))
+        self.store.set_state(
+            f"adaptive_ai_profile_latest:{self.config.mode}",
+            json.dumps(payload),
+        )
+        return payload
+
     def _ai_budget_limits(self, kind: str) -> tuple[int, int]:
+        profile = self._adaptive_ai_profile(datetime.now(KST))
+        regime = str(profile.get("regime", "balanced"))
         if kind == "scan":
-            return self.config.ai_scan_hourly_budget_total, self.config.ai_scan_hourly_budget_per_symbol
-        return self.config.ai_review_hourly_budget_total, self.config.ai_review_hourly_budget_per_symbol
+            total_limit = self.config.ai_scan_hourly_budget_total
+            symbol_limit = self.config.ai_scan_hourly_budget_per_symbol
+            if regime == "exploration":
+                total_limit = int(round(total_limit * 1.10))
+                symbol_limit += 1
+            elif regime == "strict":
+                total_limit = max(1, int(round(total_limit * 0.90)))
+                symbol_limit = max(1, symbol_limit - 1)
+            return total_limit, symbol_limit
+        total_limit = self.config.ai_review_hourly_budget_total
+        symbol_limit = self.config.ai_review_hourly_budget_per_symbol
+        if regime == "exploration":
+            total_limit = int(round(total_limit * 1.05))
+            symbol_limit += 1
+        elif regime == "strict":
+            total_limit = max(1, int(round(total_limit * 0.95)))
+            symbol_limit = max(1, symbol_limit - 1)
+        return total_limit, symbol_limit
 
     def _consume_ai_budget(self, kind: str, symbol: str, reference_time: datetime) -> bool:
         bucket = reference_time.astimezone(timezone.utc).strftime("%Y%m%d%H")
@@ -350,6 +448,7 @@ class TradingEngine:
     ) -> AIReview:
         if self._consume_ai_budget("review", signal.symbol, reference_time):
             expert_context = self._build_signal_expert_context(signal, reference_time)
+            expert_context["adaptive_ai_profile"] = self._adaptive_ai_profile(reference_time)
             return self.ai_validator.review(signal, expert_context=expert_context)
         self.store.log_decision(
             symbol=signal.symbol,
@@ -531,7 +630,9 @@ class TradingEngine:
         if self._entries_paused():
             self._hot_mover_candidates = {}
             return []
-        if self._open_hot_mover_count() >= self.config.hot_mover_max_positions:
+        dynamic_hot_mover_cap = self._dynamic_hot_mover_cap()
+        self.store.set_state("dynamic_hot_mover_cap", str(dynamic_hot_mover_cap))
+        if self._open_hot_mover_count() >= dynamic_hot_mover_cap:
             self._hot_mover_candidates = {}
             return []
 
@@ -559,6 +660,30 @@ class TradingEngine:
             for position in self.store.get_open_positions(self.config.mode)
             if position.symbol not in live_set
         )
+
+    def _dynamic_hot_mover_cap(self, account_equity: float | None = None) -> int:
+        base_cap = max(self.config.hot_mover_max_positions, 1)
+        cap = base_cap
+        if account_equity is None:
+            try:
+                account_equity = float(self.store.get_state("last_known_equity") or 0.0)
+            except Exception:
+                account_equity = 0.0
+        recent_entries = self.store.count_decisions(
+            mode=self.config.mode,
+            stage="entry",
+            outcome="opened",
+            hours=6,
+        )
+        open_positions = self.store.count_open_positions(self.config.mode)
+        profile = self._adaptive_ai_profile(datetime.now(KST))
+        if account_equity >= max(self.config.hot_mover_notional * 10.0, 50.0):
+            cap += 1
+        if open_positions <= 1 and recent_entries <= 8:
+            cap += 1
+        if str(profile.get("regime", "")) == "exploration":
+            cap += 1
+        return min(cap, max(base_cap + 1, 3))
 
     def run_forever(self) -> None:
         self.store.set_state("runtime_stop_requested", "0")
@@ -740,7 +865,7 @@ class TradingEngine:
                     microstructure=microstructure,
                     reference_time=reference_time,
                 )
-            if ai_scan_review is None and self._should_run_ai_scan(scan, recovered_signal):
+            if ai_scan_review is None and self._should_run_ai_scan(scan, recovered_signal, reference_time):
                 ai_scan_review = self._review_scan_with_budget(
                     symbol=symbol,
                     scan=scan,
@@ -919,6 +1044,7 @@ class TradingEngine:
         )
         self.strategy_orchestrator.annotate_signal(signal, engine_assessment)
         signal = self._stamp_signal_timing(symbol, signal, reference_time)
+        signal.strategy_data["adaptive_ai_profile"] = self._adaptive_ai_profile(reference_time)
 
         signal.strategy_data["multi_horizon"] = horizon_context
         if self.config.ai_scan_assist and ai_scan_review is None:
@@ -1168,13 +1294,15 @@ class TradingEngine:
         if exploratory_live:
             signal = self._mark_exploratory_signal(signal, review, ai_scan_review, sizing)
 
-        if bool(signal.strategy_data.get("hot_mover_scout", False)) and self._open_hot_mover_count() >= self.config.hot_mover_max_positions:
+        dynamic_hot_mover_cap = self._dynamic_hot_mover_cap(account_equity)
+        signal.strategy_data["dynamic_hot_mover_cap"] = dynamic_hot_mover_cap
+        if bool(signal.strategy_data.get("hot_mover_scout", False)) and self._open_hot_mover_count() >= dynamic_hot_mover_cap:
             self.store.log_decision(
                 symbol=symbol,
                 mode=self.config.mode,
                 stage="hot_mover_scout",
                 outcome="rejected",
-                detail="Hot mover scout position cap reached.",
+                detail=f"Hot mover scout position cap reached ({self._open_hot_mover_count()}/{dynamic_hot_mover_cap}).",
                 payload={"signal": signal.strategy_data},
             )
             return
@@ -2678,9 +2806,16 @@ class TradingEngine:
                 )
         return None
 
-    def _should_run_ai_scan(self, scan, recovered_signal: TradeSignal | None) -> bool:
+    def _should_run_ai_scan(
+        self,
+        scan,
+        recovered_signal: TradeSignal | None,
+        reference_time: datetime,
+    ) -> bool:
         if not self.config.ai_scan_assist:
             return False
+        profile = self._adaptive_ai_profile(reference_time)
+        signal_score_floor = float(profile.get("signal_score_floor", max(self.config.balanced_entry_score - 0.06, 0.46)) or 0.46)
         if recovered_signal is not None:
             return True
         metrics = scan.metrics or {}
@@ -2696,10 +2831,10 @@ class TradingEngine:
                 for flag in ("squeeze_off", "bullish_choch", "bearish_choch", "bullish_bos", "bearish_bos")
             )
             return early_or_ambiguous and (
-                signal_score >= max(self.config.balanced_entry_score - 0.06, 0.46) or structure_release
+                signal_score >= signal_score_floor or structure_release
             )
         _, score = rank_scan(scan, 0.0)
-        if score >= self.config.ai_scan_trigger_score:
+        if score >= float(profile.get("scan_trigger_score", self.config.ai_scan_trigger_score) or self.config.ai_scan_trigger_score):
             return True
         volume_ratio = float(metrics.get("volume_ratio", 0.0) or 0.0)
         atr_ratio = float(metrics.get("atr_regime_ratio", 0.0) or 0.0)
@@ -2707,7 +2842,12 @@ class TradingEngine:
             bool(metrics.get(flag, False))
             for flag in ("squeeze_off", "bullish_choch", "bearish_choch", "recent_bullish_fvg", "recent_bearish_fvg")
         )
-        return bool(metrics) and volume_ratio >= 0.60 and atr_ratio >= 0.85 and structure_release
+        return (
+            bool(metrics)
+            and volume_ratio >= float(profile.get("scan_volume_floor", 0.60) or 0.60)
+            and atr_ratio >= float(profile.get("scan_atr_floor", 0.85) or 0.85)
+            and structure_release
+        )
 
     def _apply_ai_scan_signal_overrides(self, signal: TradeSignal, review: AIScanReview, scan) -> TradeSignal:
         confidence_score = max(signal.strategy_data.get("entry_profile_score", 0.44), 0.45 + (review.confidence * 0.18))
@@ -2981,26 +3121,30 @@ class TradingEngine:
         return 45.0
 
     def _exploratory_review_confidence_floor(self, signal: TradeSignal) -> float:
+        profile = self._adaptive_ai_profile(datetime.now(KST))
+        relief = float(profile.get("review_confidence_relief", 0.0) or 0.0)
         if bool(signal.strategy_data.get("hot_mover_scout", False)):
-            return 0.35
+            return max(0.30, 0.35 - relief)
         engine_key = self._engine_key(signal)
         engine_family = self._engine_family(signal)
         if engine_key == "scout" or engine_family == "scout":
-            return 0.37
+            return max(0.32, 0.37 - relief)
         if engine_key == "reversal" or engine_family == "reversal":
-            return 0.38
-        return self.config.exploratory_ai_min_confidence
+            return max(0.33, 0.38 - relief)
+        return max(0.34, self.config.exploratory_ai_min_confidence - relief)
 
     def _exploratory_scan_confidence_floor(self, signal: TradeSignal) -> float:
+        profile = self._adaptive_ai_profile(datetime.now(KST))
+        relief = float(profile.get("scan_confidence_relief", 0.0) or 0.0)
         if bool(signal.strategy_data.get("hot_mover_scout", False)):
-            return 0.42
+            return max(0.36, 0.42 - relief)
         engine_key = self._engine_key(signal)
         engine_family = self._engine_family(signal)
         if engine_key == "scout" or engine_family == "scout":
-            return 0.44
+            return max(0.38, 0.44 - relief)
         if engine_key == "reversal" or engine_family == "reversal":
-            return 0.45
-        return max(0.48, self.config.exploratory_ai_scan_min_confidence - 0.02)
+            return max(0.39, 0.45 - relief)
+        return max(0.40, max(0.48, self.config.exploratory_ai_scan_min_confidence - 0.02) - relief)
 
     def _exploratory_sector_multiplier(self, signal: TradeSignal) -> float:
         if not self._is_exploratory_signal(signal):

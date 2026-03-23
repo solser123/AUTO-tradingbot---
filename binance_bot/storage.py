@@ -724,6 +724,28 @@ class StateStore:
         with self._connect() as conn:
             return conn.execute(query, tuple(params)).fetchall()
 
+    def get_recent_signal_stats(self, *, hours: int = 24) -> dict[str, float]:
+        anchor = datetime.now(timezone.utc) - timedelta(hours=max(hours, 1))
+        with self._connect() as conn:
+            row = conn.execute(
+                """
+                SELECT
+                    COUNT(*) AS total_signals,
+                    COALESCE(SUM(CASE WHEN approved = 1 THEN 1 ELSE 0 END), 0) AS approved_signals,
+                    COALESCE(AVG(ai_confidence), 0) AS avg_ai_confidence,
+                    COALESCE(AVG(CASE WHEN approved = 1 THEN ai_confidence END), 0) AS avg_approved_ai_confidence
+                FROM signals
+                WHERE created_at >= ?
+                """,
+                (anchor.isoformat(),),
+            ).fetchone()
+        return {
+            "total_signals": float(row["total_signals"] or 0) if row else 0.0,
+            "approved_signals": float(row["approved_signals"] or 0) if row else 0.0,
+            "avg_ai_confidence": float(row["avg_ai_confidence"] or 0.0) if row else 0.0,
+            "avg_approved_ai_confidence": float(row["avg_approved_ai_confidence"] or 0.0) if row else 0.0,
+        }
+
     def get_trade_metrics(self, mode: str | None = None) -> dict[str, float | int]:
         rows = self.get_closed_positions(mode)
         pnls = [float(row["realized_pnl"] or 0.0) for row in rows]
@@ -760,6 +782,7 @@ class StateStore:
         stage: str | None = None,
         outcome: str | None = None,
         detail_contains: str | None = None,
+        hours: int | None = None,
     ) -> int:
         query = "SELECT COUNT(*) AS count FROM decision_log WHERE 1=1"
         params: list[object] = []
@@ -775,6 +798,10 @@ class StateStore:
         if detail_contains is not None:
             query += " AND detail LIKE ?"
             params.append(f"%{detail_contains}%")
+        if hours is not None:
+            anchor = datetime.now(timezone.utc) - timedelta(hours=max(hours, 1))
+            query += " AND created_at >= ?"
+            params.append(anchor.isoformat())
         with self._connect() as conn:
             row = conn.execute(query, tuple(params)).fetchone()
         return int(row["count"] if row else 0)

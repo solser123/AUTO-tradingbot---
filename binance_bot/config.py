@@ -526,8 +526,8 @@ class BotConfig:
             raise ValueError("BOT_HOT_MOVER_LEVERAGE must be at least 1.")
         if config.hot_mover_scan_limit < 0 or config.hot_mover_max_positions < 0:
             raise ValueError("Hot mover scout limits must not be negative.")
-        if config.max_open_positions < 1 or config.max_open_positions > 3:
-            raise ValueError("BOT_MAX_OPEN_POSITIONS must be between 1 and 3.")
+        if config.max_open_positions < 1 or config.max_open_positions > 6:
+            raise ValueError("BOT_MAX_OPEN_POSITIONS must be between 1 and 6.")
         if config.overflow_scan_limit < 0:
             raise ValueError("BOT_OVERFLOW_SCAN_LIMIT must not be negative.")
         if (
