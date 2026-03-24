@@ -22,7 +22,7 @@ from .macro import adjust_sizing_for_macro, build_macro_risk_overlay, get_upcomi
 from .notifier import TelegramNotifier
 from .opportunity import analyze_pending_opportunities
 from .research import latest_universe_candidates, recent_listing_candidates
-from .risk import RiskManager
+from .risk import CORRELATION_CLUSTERS, RiskManager
 from .runtime_state import set_runtime_flag
 from .sectors import sector_for_symbol, sector_label
 from .selector import build_exit_roadmap, default_candidate_symbols, rank_scan
@@ -373,8 +373,8 @@ class TradingEngine:
         )
         return payload
 
-    def _ai_budget_limits(self, kind: str) -> tuple[int, int]:
-        profile = self._adaptive_ai_profile(datetime.now(KST))
+    def _ai_budget_limits(self, kind: str, reference_time: datetime) -> tuple[int, int]:
+        profile = self._adaptive_ai_profile(reference_time)
         regime = str(profile.get("regime", "balanced"))
         if kind == "scan":
             total_limit = self.config.ai_scan_hourly_budget_total
@@ -386,11 +386,20 @@ class TradingEngine:
                 total_limit = max(1, int(round(total_limit * 0.90)))
                 symbol_limit = max(1, symbol_limit - 1)
             return total_limit, symbol_limit
+        if kind == "manage":
+            total_limit = self.config.ai_manage_hourly_budget_total
+            symbol_limit = self.config.ai_manage_hourly_budget_per_symbol
+            if regime == "exploration":
+                total_limit = int(round(total_limit * 1.15))
+                symbol_limit += 1
+            elif regime == "strict":
+                total_limit = max(1, int(round(total_limit * 0.95)))
+            return total_limit, symbol_limit
         total_limit = self.config.ai_review_hourly_budget_total
         symbol_limit = self.config.ai_review_hourly_budget_per_symbol
         if regime == "exploration":
-            total_limit = int(round(total_limit * 1.05))
-            symbol_limit += 1
+            total_limit = max(1, int(round(total_limit * 0.92)))
+            symbol_limit = max(1, symbol_limit)
         elif regime == "strict":
             total_limit = max(1, int(round(total_limit * 0.95)))
             symbol_limit = max(1, symbol_limit - 1)
@@ -400,7 +409,7 @@ class TradingEngine:
         bucket = reference_time.astimezone(timezone.utc).strftime("%Y%m%d%H")
         total_key = f"ai_budget:{kind}:total:{bucket}"
         symbol_key = f"ai_budget:{kind}:symbol:{bucket}:{symbol}"
-        total_limit, symbol_limit = self._ai_budget_limits(kind)
+        total_limit, symbol_limit = self._ai_budget_limits(kind, reference_time)
         total_used = int(self.store.get_state(total_key) or "0")
         symbol_used = int(self.store.get_state(symbol_key) or "0")
         if total_used >= total_limit or symbol_used >= symbol_limit:
@@ -408,6 +417,20 @@ class TradingEngine:
         self.store.set_state(total_key, str(total_used + 1))
         self.store.set_state(symbol_key, str(symbol_used + 1))
         return True
+
+    def _ai_budget_snapshot(self, kind: str, symbol: str, reference_time: datetime) -> dict[str, object]:
+        bucket = reference_time.astimezone(timezone.utc).strftime("%Y%m%d%H")
+        total_key = f"ai_budget:{kind}:total:{bucket}"
+        symbol_key = f"ai_budget:{kind}:symbol:{bucket}:{symbol}"
+        total_limit, symbol_limit = self._ai_budget_limits(kind, reference_time)
+        return {
+            "kind": kind,
+            "bucket": bucket,
+            "total_used": int(self.store.get_state(total_key) or "0"),
+            "total_limit": total_limit,
+            "symbol_used": int(self.store.get_state(symbol_key) or "0"),
+            "symbol_limit": symbol_limit,
+        }
 
     def _review_scan_with_budget(
         self,
@@ -446,6 +469,21 @@ class TradingEngine:
         signal: TradeSignal,
         reference_time: datetime,
     ) -> AIReview:
+        fastpath_review = self._fastpath_ai_review(signal, reference_time)
+        if fastpath_review is not None:
+            self.store.log_decision(
+                symbol=signal.symbol,
+                mode=self.config.mode,
+                stage="ai_review",
+                outcome="fastpath",
+                detail=fastpath_review.reason,
+                payload={
+                    "signal": signal.strategy_data,
+                    "confidence": fastpath_review.confidence,
+                    "committee": fastpath_review.committee,
+                },
+            )
+            return fastpath_review
         if self._consume_ai_budget("review", signal.symbol, reference_time):
             expert_context = self._build_signal_expert_context(signal, reference_time)
             expert_context["adaptive_ai_profile"] = self._adaptive_ai_profile(reference_time)
@@ -481,6 +519,59 @@ class TradingEngine:
                 "budget_mode": True,
                 "entry_profile_score": score,
                 "expert_context_hint": "AI skipped due to budget. Deterministic fallback used.",
+            },
+        )
+
+    def _fastpath_ai_review(self, signal: TradeSignal, reference_time: datetime) -> AIReview | None:
+        if not self.config.ai_validation:
+            return None
+        if self._is_exploratory_signal(signal) or bool(signal.strategy_data.get("hot_mover_scout", False)):
+            return None
+        engine_family = self._engine_family(signal)
+        if engine_family not in {"continuation", "reversal"}:
+            return None
+        score = float(signal.strategy_data.get("entry_profile_score", 0.0) or 0.0)
+        if score < max(self.config.aggressive_entry_score, 0.68):
+            return None
+        if any(
+            bool(signal.strategy_data.get(flag, False))
+            for flag in (
+                "exploratory_horizon_soft_pass",
+                "exploratory_sector_soft_pass",
+                "exploratory_micro_soft_pass",
+            )
+        ):
+            return None
+        horizon = signal.strategy_data.get("multi_horizon", {})
+        if int(horizon.get("opposite_side_count", 0) or 0) > 0:
+            return None
+        if int(horizon.get("same_side_count", 0) or 0) < 2:
+            return None
+        sector_context = signal.strategy_data.get("sector_context", {})
+        if self._sector_blocks_signal(signal.side, sector_context):
+            return None
+        micro = signal.strategy_data.get("microstructure", {})
+        if self._microstructure_rejection(signal.symbol, signal.side, micro):
+            return None
+        external_alignment = signal.strategy_data.get("external_alignment", {})
+        if (
+            int(external_alignment.get("count", 0) or 0) >= 4
+            and float(external_alignment.get("alignment_score", 0.0) or 0.0) <= -0.20
+        ):
+            return None
+        confidence = min(0.92, max(0.72, 0.62 + (score - self.config.aggressive_entry_score)))
+        return AIReview(
+            approved=True,
+            confidence=round(confidence, 4),
+            recommended_action="full",
+            reason="규칙형 A급 신호로 판정되어 빠른 승인 경로를 사용했습니다.",
+            committee={
+                "ai_fastpath": True,
+                "engine_family": engine_family,
+                "entry_profile_score": round(score, 4),
+                "same_side_count": int(horizon.get("same_side_count", 0) or 0),
+                "opposite_side_count": int(horizon.get("opposite_side_count", 0) or 0),
+                "fastpath_reason": "상위 타임프레임, 섹터, 미시구조가 모두 우호적인 A급 신호",
             },
         )
 
@@ -568,6 +659,42 @@ class TradingEngine:
             "avg_missed_notional_pnl": round(sum(missed) / len(missed), 4) if missed else 0.0,
         }
 
+    def _summarize_engine_trade_history(
+        self,
+        *,
+        engine_family: str,
+        engine_key: str,
+        setup_type: str,
+        hours: int = 336,
+    ) -> dict[str, object]:
+        rows = self.store.get_recent_closed_trade_rows(
+            mode=self.config.mode,
+            hours=hours,
+            limit=200,
+        )
+        family = engine_family.lower()
+        key = engine_key.lower()
+        setup = setup_type.lower()
+        filtered = [
+            row
+            for row in rows
+            if (
+                (family and str(row["engine_family"] or "").lower() == family)
+                or (key and str(row["engine_key"] or "").lower() == key)
+                or (setup and str(row["setup_type"] or "").lower() == setup)
+            )
+        ]
+        pnls = [float(row["realized_pnl"] or 0.0) for row in filtered]
+        wins = sum(1 for pnl in pnls if pnl > 0)
+        exit_counts: Counter[str] = Counter(str(row["exit_reason"] or "") for row in filtered if str(row["exit_reason"] or ""))
+        return {
+            "trade_count": len(filtered),
+            "win_rate_pct": round((wins / len(filtered) * 100.0), 2) if filtered else 0.0,
+            "avg_pnl": round(sum(pnls) / len(pnls), 4) if pnls else 0.0,
+            "total_pnl": round(sum(pnls), 4) if pnls else 0.0,
+            "top_exits": [f"{name} x{count}" for name, count in exit_counts.most_common(3)],
+        }
+
     def _recent_headline_summary(self, symbol: str, *, hours: int = 72, limit: int = 4) -> list[str]:
         rows = self.store.get_recent_external_items(limit=limit, symbol=symbol, hours=hours)
         return [
@@ -592,9 +719,16 @@ class TradingEngine:
         return lines
 
     def _build_signal_expert_context(self, signal: TradeSignal, reference_time: datetime) -> dict[str, object]:
+        engine_family = self._engine_family(signal)
+        engine_key = self._engine_key(signal)
         return {
             "symbol_trade_history": self._summarize_symbol_trade_history(signal.symbol, signal.side),
             "symbol_opportunity_history": self._summarize_symbol_opportunity_history(signal.symbol, signal.side),
+            "engine_trade_history": self._summarize_engine_trade_history(
+                engine_family=engine_family,
+                engine_key=engine_key,
+                setup_type=signal.setup_type,
+            ),
             "entry_analog_history": self._summarize_recent_entry_analogs(signal),
             "recent_blockers": self._top_recent_blockers(signal.symbol),
             "recent_headlines": self._recent_headline_summary(signal.symbol),
@@ -605,6 +739,11 @@ class TradingEngine:
         return {
             "symbol_trade_history": self._summarize_symbol_trade_history(position.symbol, position.side),
             "symbol_opportunity_history": self._summarize_symbol_opportunity_history(position.symbol, position.side),
+            "engine_trade_history": self._summarize_engine_trade_history(
+                engine_family=position.engine_family,
+                engine_key=position.engine_key,
+                setup_type=position.setup_type,
+            ),
             "recent_blockers": self._top_recent_blockers(position.symbol),
             "recent_headlines": self._recent_headline_summary(position.symbol),
             "upcoming_macro": self._upcoming_macro_summary(reference_time=reference_time),
@@ -613,13 +752,16 @@ class TradingEngine:
     def _scan_symbols(self) -> list[str]:
         configured_symbols = self.exchange.resolve_symbols(self.config.active_symbols())
         managed_symbols = self.store.get_open_symbols(self.config.mode)
+        refreshed_hot_movers = self._refresh_hot_mover_candidates()
         merged = configured_symbols[:]
         for symbol in managed_symbols:
             if symbol not in merged:
                 merged.append(symbol)
-        for symbol in self._refresh_hot_mover_candidates():
+        for symbol in refreshed_hot_movers:
             if symbol not in merged:
                 merged.append(symbol)
+        ordered = [*managed_symbols, *refreshed_hot_movers, *merged]
+        merged = list(dict.fromkeys(ordered))
         self._scan_symbols_cache = merged
         return merged
 
@@ -1319,6 +1461,38 @@ class TradingEngine:
                 payload={"signal": signal.strategy_data, "confidence": review.confidence, "committee": review.committee},
             )
             return
+        portfolio_allowed, portfolio_reason, portfolio_payload = self._passes_portfolio_gate(
+            signal=signal,
+            review=review,
+            sizing=sizing,
+        )
+        if not portfolio_allowed:
+            self.store.log_decision(
+                symbol=symbol,
+                mode=self.config.mode,
+                stage="portfolio_gate",
+                outcome="rejected",
+                detail=portfolio_reason,
+                payload={
+                    "signal": signal.strategy_data,
+                    "confidence": review.confidence,
+                    "committee": review.committee,
+                    "portfolio": portfolio_payload,
+                },
+            )
+            return
+        self.store.log_decision(
+            symbol=symbol,
+            mode=self.config.mode,
+            stage="portfolio_gate",
+            outcome="selected",
+            detail=portfolio_reason,
+            payload={
+                "signal": signal.strategy_data,
+                "confidence": review.confidence,
+                "portfolio": portfolio_payload,
+            },
+        )
 
         initial_notional = sizing.notional
         quantity_estimate = initial_notional / signal.entry_price
@@ -1396,6 +1570,9 @@ class TradingEngine:
             full_defense_trigger=full_defense_trigger,
             opened_at=datetime.now(timezone.utc),
             mode=self.config.mode,
+            engine_family=str(signal.strategy_data.get("engine_family", "") or ""),
+            engine_key=str(signal.strategy_data.get("engine_key", "") or ""),
+            setup_type=signal.setup_type,
         )
         entry_opened_at = position.opened_at.astimezone(timezone.utc)
         signal_generated_at = str(signal.strategy_data.get("signal_generated_at", ""))
@@ -1553,7 +1730,17 @@ class TradingEngine:
         reference_time: datetime,
         account_equity: float,
     ) -> bool:
-        if not self._should_run_ai_position_management(position, reference_time):
+        if not self._should_run_ai_position_management(position, reference_time, current_price):
+            return False
+        if not self._consume_ai_budget("manage", position.symbol, reference_time):
+            self.store.log_decision(
+                symbol=position.symbol,
+                mode=self.config.mode,
+                stage="ai_position_budget",
+                outcome="skipped",
+                detail="AI position management budget exceeded. Deterministic hold path used.",
+                payload=self._ai_budget_snapshot("manage", position.symbol, reference_time),
+            )
             return False
 
         try:
@@ -1601,6 +1788,13 @@ class TradingEngine:
                 external_context=external_context,
                 microstructure=microstructure,
                 expert_context=expert_context,
+            )
+            decision = self._normalize_ai_position_decision(
+                position=position,
+                decision=decision,
+                progress_r=progress_r,
+                daily_realized_pnl=daily_realized_pnl,
+                practical_daily_profit_target=practical_daily_profit_target,
             )
             self.store.set_state(
                 self._position_manage_state_key(position.id or 0),
@@ -1820,7 +2014,12 @@ class TradingEngine:
             return True
         return False
 
-    def _should_run_ai_position_management(self, position: Position, reference_time: datetime) -> bool:
+    def _should_run_ai_position_management(
+        self,
+        position: Position,
+        reference_time: datetime,
+        current_price: float,
+    ) -> bool:
         if not self.config.enable_ai_position_manager:
             return False
         if not self.ai_position_manager.enabled:
@@ -1829,8 +2028,11 @@ class TradingEngine:
             return False
         age_minutes = (reference_time.astimezone(timezone.utc) - position.opened_at).total_seconds() / 60
         min_age_minutes = self.config.ai_position_manage_min_age_minutes
-        if position.profile_stage == "exploratory":
+        urgency = self._position_management_urgency(position, current_price)
+        if position.profile_stage == "exploratory" or urgency >= 0.75:
             min_age_minutes = max(5, min_age_minutes // 2)
+        elif urgency >= 0.45:
+            min_age_minutes = max(6, int(round(min_age_minutes * 0.7)))
         if age_minutes < min_age_minutes:
             return False
         last_run_text = self.store.get_state(self._position_manage_state_key(position.id))
@@ -1845,15 +2047,187 @@ class TradingEngine:
         else:
             last_run = last_run.astimezone(timezone.utc)
         interval_minutes = self.config.ai_position_manage_interval_minutes
-        if position.profile_stage == "exploratory":
+        if position.profile_stage == "exploratory" or urgency >= 0.75:
             interval_minutes = max(5, interval_minutes // 2)
+        elif urgency >= 0.45:
+            interval_minutes = max(6, int(round(interval_minutes * 0.65)))
         elapsed_minutes = (reference_time.astimezone(timezone.utc) - last_run).total_seconds() / 60
         return elapsed_minutes >= interval_minutes
+
+    def _position_management_urgency(self, position: Position, current_price: float) -> float:
+        risk_distance = abs(position.entry_price - position.stop_price)
+        progress_r = self._position_progress_r(position, current_price, risk_distance)
+        engine_family = (position.engine_family or "").lower()
+        urgency = 0.0
+        if position.profile_stage == "exploratory":
+            urgency += 0.35
+        if engine_family in {"reversal", "hot_mover", "scout"}:
+            urgency += 0.20
+        if progress_r >= 0.40:
+            urgency += 0.30
+        elif progress_r <= -0.25:
+            urgency += 0.35
+        elif abs(progress_r) >= 0.18:
+            urgency += 0.15
+        return min(1.0, urgency)
+
+    def _normalize_ai_position_decision(
+        self,
+        *,
+        position: Position,
+        decision: AIManageDecision,
+        progress_r: float,
+        daily_realized_pnl: float,
+        practical_daily_profit_target: float,
+    ) -> AIManageDecision:
+        trend_score = float(decision.committee.get("trend_score", 0.0) or 0.0)
+        risk_score = float(decision.committee.get("risk_score", 0.0) or 0.0)
+        if (
+            decision.action in {"reduce_25", "reduce_50"}
+            and progress_r >= 0.45
+            and trend_score >= 0.65
+            and risk_score <= 0.55
+            and daily_realized_pnl < practical_daily_profit_target
+        ):
+            moderated_action = "hold" if decision.action == "reduce_25" else "tighten_to_balanced"
+            return AIManageDecision(
+                action=moderated_action,
+                confidence=max(decision.confidence, 0.56),
+                reason=f"{decision.reason} 추세가 아직 살아 있어 조기 축소를 보류했습니다.",
+                committee={**decision.committee, "decision_normalized": True, "normalized_from": decision.action},
+            )
+        if (
+            decision.action == "hold"
+            and progress_r >= 0.85
+            and trend_score >= 0.72
+            and daily_realized_pnl < practical_daily_profit_target
+            and position.profile_stage != "conservative"
+        ):
+            return AIManageDecision(
+                action="raise_target_small",
+                confidence=max(decision.confidence, 0.58),
+                reason=f"{decision.reason} 추세가 충분히 유지되어 제한적 목표 상향으로 조정했습니다.",
+                committee={**decision.committee, "decision_normalized": True, "normalized_from": "hold"},
+            )
+        return decision
 
     def _ai_position_confidence_floor(self, position: Position) -> float:
         if position.profile_stage == "exploratory":
             return self.config.ai_position_exploratory_min_confidence
         return self.config.ai_position_min_confidence
+
+    def _correlation_cluster_overlap(self, symbol: str, open_symbols: list[str]) -> int:
+        target = set(open_symbols)
+        for cluster in CORRELATION_CLUSTERS:
+            if symbol in cluster:
+                return sum(1 for item in target if item in cluster)
+        return 0
+
+    def _portfolio_priority_score(
+        self,
+        *,
+        signal: TradeSignal,
+        review: AIReview,
+        sizing: SizingDecision,
+        open_positions: list[Position],
+    ) -> tuple[float, dict[str, float | int | str | bool]]:
+        micro = signal.strategy_data.get("microstructure", {})
+        horizon = signal.strategy_data.get("multi_horizon", {})
+        external_alignment = signal.strategy_data.get("external_alignment", {})
+        engine_family = self._engine_family(signal) or "unknown"
+        same_side_count = int(horizon.get("same_side_count", 0) or 0)
+        opposite_side_count = int(horizon.get("opposite_side_count", 0) or 0)
+        alignment_score = float(external_alignment.get("alignment_score", 0.0) or 0.0)
+        ai_score = review.confidence
+        if bool(review.committee.get("ai_fastpath", False)):
+            ai_score = max(ai_score, 0.78)
+        rr_score = min(max(signal.rr, 0.0) / 3.0, 1.0)
+        sizing_score = min(max(float(sizing.score or 0.0), 0.0) / 100.0, 1.0)
+        depth = max(float(micro.get("total_depth_usdt", 0.0) or 0.0), 0.0)
+        spread = max(float(micro.get("spread_pct", 0.0) or 0.0), 0.0)
+        flow = abs(float(micro.get("flow_score", 0.0) or 0.0))
+        depth_score = min(depth / max(self.config.microstructure_min_total_depth_usdt, 1.0), 1.0)
+        spread_score = max(
+            0.0,
+            min(
+                1.0 - (spread / max(self.config.microstructure_max_spread_pct, 0.0001)),
+                1.0,
+            ),
+        )
+        liquidity_score = max(0.0, min((depth_score * 0.5) + (spread_score * 0.3) + (flow * 0.2), 1.0))
+        regime_score = max(
+            0.0,
+            min(0.45 + (same_side_count * 0.18) - (opposite_side_count * 0.20) + (alignment_score * 0.20), 1.0),
+        )
+        urgent = bool(signal.strategy_data.get("hot_mover_scout", False)) or engine_family in {"reversal", "scout", "hot_mover"}
+        engine_bonus = 0.12 if urgent else 0.04 if engine_family == "continuation" else 0.0
+        same_sector_positions = sum(
+            1 for position in open_positions if sector_for_symbol(position.symbol) == sector_for_symbol(signal.symbol)
+        )
+        correlation_overlap = self._correlation_cluster_overlap(signal.symbol, [position.symbol for position in open_positions])
+        sector_crowding_penalty = min(same_sector_positions * 0.08, 0.20)
+        correlation_penalty = min(correlation_overlap * 0.06, 0.18)
+        score = (
+            (rr_score * 0.24)
+            + (sizing_score * 0.20)
+            + (ai_score * 0.18)
+            + (liquidity_score * 0.16)
+            + (regime_score * 0.12)
+            + engine_bonus
+            - sector_crowding_penalty
+            - correlation_penalty
+        )
+        score = max(0.0, min(score, 1.0))
+        return score, {
+            "engine_family": engine_family,
+            "rr_score": round(rr_score, 4),
+            "sizing_score": round(sizing_score, 4),
+            "ai_score": round(ai_score, 4),
+            "liquidity_score": round(liquidity_score, 4),
+            "regime_score": round(regime_score, 4),
+            "engine_bonus": round(engine_bonus, 4),
+            "same_sector_positions": same_sector_positions,
+            "correlation_overlap": correlation_overlap,
+            "sector_crowding_penalty": round(sector_crowding_penalty, 4),
+            "correlation_penalty": round(correlation_penalty, 4),
+            "urgent_signal": urgent,
+        }
+
+    def _passes_portfolio_gate(
+        self,
+        *,
+        signal: TradeSignal,
+        review: AIReview,
+        sizing: SizingDecision,
+    ) -> tuple[bool, str, dict[str, float | int | str | bool]]:
+        open_positions = self.store.get_open_positions(self.config.mode)
+        score, components = self._portfolio_priority_score(
+            signal=signal,
+            review=review,
+            sizing=sizing,
+            open_positions=open_positions,
+        )
+        cap_meta = signal.strategy_data.get("dynamic_open_cap", {}) or {}
+        dynamic_cap = int(cap_meta.get("dynamic_open_cap", max(self.config.max_open_positions, 2)) or max(self.config.max_open_positions, 2))
+        open_count = len(open_positions)
+        threshold = self.config.portfolio_priority_threshold
+        if open_count >= max(dynamic_cap - 1, 1):
+            threshold = max(threshold, self.config.portfolio_priority_near_cap_threshold)
+        if bool(components.get("urgent_signal", False)):
+            threshold = max(0.0, threshold - self.config.portfolio_priority_urgent_relief)
+        if int(components.get("same_sector_positions", 0) or 0) >= 2 and not bool(components.get("urgent_signal", False)):
+            threshold = min(1.0, threshold + 0.04)
+        payload = {
+            **components,
+            "score": round(score, 4),
+            "threshold": round(threshold, 4),
+            "open_positions": open_count,
+            "dynamic_open_cap": dynamic_cap,
+        }
+        signal.strategy_data["portfolio_priority"] = payload
+        if score >= threshold:
+            return True, f"Portfolio priority accepted: {score:.2f} >= {threshold:.2f}.", payload
+        return False, f"Portfolio priority too low: {score:.2f} < {threshold:.2f}.", payload
 
     def _position_unrealized_pnl(self, position: Position, current_price: float) -> float:
         if position.side == "long":

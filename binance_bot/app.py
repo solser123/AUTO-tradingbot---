@@ -121,6 +121,8 @@ def run_doctor() -> int:
     checks.append(("micro-filter", True, f"enabled={config.enable_microstructure_filter} depth={config.microstructure_orderbook_depth} spread={config.microstructure_max_spread_pct:.3%}"))
     checks.append(("sizing", True, f"risk_full={config.sizing_risk_pct_full:.2%} total_open={config.sizing_max_total_open_risk_pct:.2%} sector_cap={config.sizing_max_same_sector_open_risk_pct:.2%}"))
     checks.append(("ai-position", True, f"enabled={config.enable_ai_position_manager} interval={config.ai_position_manage_interval_minutes}m target_cap={config.ai_position_target_raise_cap_r:.2f}R"))
+    checks.append(("ai-budgets", True, f"scan={config.ai_scan_hourly_budget_total}/{config.ai_scan_hourly_budget_per_symbol} review={config.ai_review_hourly_budget_total}/{config.ai_review_hourly_budget_per_symbol} manage={config.ai_manage_hourly_budget_total}/{config.ai_manage_hourly_budget_per_symbol}"))
+    checks.append(("portfolio-gate", True, f"base={config.portfolio_priority_threshold:.2f} near_cap={config.portfolio_priority_near_cap_threshold:.2f} urgent_relief={config.portfolio_priority_urgent_relief:.2f}"))
     if config.monthly_living_cost_krw > 0 and config.usdkrw_reference_rate > 0:
         daily_target = config.monthly_living_cost_krw / config.usdkrw_reference_rate / 30.0
         checks.append(("living-target", True, f"monthly=KRW {config.monthly_living_cost_krw:,.0f} daily~{daily_target:.2f} USDT ref={config.usdkrw_reference_rate:.1f}"))

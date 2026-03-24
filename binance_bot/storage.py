@@ -65,6 +65,9 @@ class StateStore:
                     profile_stage TEXT NOT NULL DEFAULT 'conservative',
                     half_defense_trigger REAL NOT NULL DEFAULT 0,
                     full_defense_trigger REAL NOT NULL DEFAULT 0,
+                    engine_family TEXT NOT NULL DEFAULT '',
+                    engine_key TEXT NOT NULL DEFAULT '',
+                    setup_type TEXT NOT NULL DEFAULT '',
                     opened_at TEXT NOT NULL,
                     mode TEXT NOT NULL,
                     status TEXT NOT NULL,
@@ -260,10 +263,82 @@ class StateStore:
                 "profile_stage": "ALTER TABLE positions ADD COLUMN profile_stage TEXT NOT NULL DEFAULT 'conservative'",
                 "half_defense_trigger": "ALTER TABLE positions ADD COLUMN half_defense_trigger REAL NOT NULL DEFAULT 0",
                 "full_defense_trigger": "ALTER TABLE positions ADD COLUMN full_defense_trigger REAL NOT NULL DEFAULT 0",
+                "engine_family": "ALTER TABLE positions ADD COLUMN engine_family TEXT NOT NULL DEFAULT ''",
+                "engine_key": "ALTER TABLE positions ADD COLUMN engine_key TEXT NOT NULL DEFAULT ''",
+                "setup_type": "ALTER TABLE positions ADD COLUMN setup_type TEXT NOT NULL DEFAULT ''",
             }
             for column, sql in migrations.items():
                 if column not in columns:
                     conn.execute(sql)
+        self._backfill_position_engine_metadata()
+
+    def _backfill_position_engine_metadata(self) -> None:
+        with self._connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT id, symbol, mode, opened_at, engine_family, engine_key, setup_type
+                FROM positions
+                WHERE COALESCE(engine_family, '') = ''
+                   OR COALESCE(engine_key, '') = ''
+                   OR COALESCE(setup_type, '') = ''
+                ORDER BY id DESC
+                LIMIT 200
+                """
+            ).fetchall()
+
+        for row in rows:
+            position_id = int(row["id"])
+            symbol = str(row["symbol"])
+            mode = str(row["mode"])
+            opened_at = str(row["opened_at"] or "")
+            with self._connect() as conn:
+                decision_rows = conn.execute(
+                    """
+                    SELECT payload_json
+                    FROM decision_log
+                    WHERE symbol = ?
+                      AND mode = ?
+                      AND stage = 'entry'
+                      AND outcome = 'opened'
+                    ORDER BY id DESC
+                    LIMIT 20
+                    """,
+                    (symbol, mode),
+                ).fetchall()
+            engine_family = str(row["engine_family"] or "")
+            engine_key = str(row["engine_key"] or "")
+            setup_type = str(row["setup_type"] or "")
+            fallback_payload: dict | None = None
+            for decision_row in decision_rows:
+                try:
+                    payload = json.loads(str(decision_row["payload_json"] or "{}"))
+                except Exception:
+                    continue
+                if fallback_payload is None and any(payload.get(key) for key in ("engine_family", "engine_key", "setup_type")):
+                    fallback_payload = payload
+                payload_opened_at = str(payload.get("entry_opened_at", "") or "")
+                if opened_at and payload_opened_at and payload_opened_at != opened_at:
+                    continue
+                engine_family = engine_family or str(payload.get("engine_family", "") or "")
+                engine_key = engine_key or str(payload.get("engine_key", "") or "")
+                setup_type = setup_type or str(payload.get("setup_type", "") or "")
+                if engine_family or engine_key or setup_type:
+                    break
+            if not (engine_family or engine_key or setup_type) and fallback_payload is not None:
+                engine_family = engine_family or str(fallback_payload.get("engine_family", "") or "")
+                engine_key = engine_key or str(fallback_payload.get("engine_key", "") or "")
+                setup_type = setup_type or str(fallback_payload.get("setup_type", "") or "")
+            if not (engine_family or engine_key or setup_type):
+                continue
+            with self._connect() as conn:
+                conn.execute(
+                    """
+                    UPDATE positions
+                    SET engine_family = ?, engine_key = ?, setup_type = ?
+                    WHERE id = ?
+                    """,
+                    (engine_family, engine_key, setup_type, position_id),
+                )
 
     def log_signal(self, signal: TradeSignal, approved: bool, ai_confidence: float, reason: str) -> None:
         with self._connect() as conn:
@@ -379,6 +454,9 @@ class StateStore:
             full_defense_trigger=row["full_defense_trigger"],
             opened_at=datetime.fromisoformat(row["opened_at"]),
             mode=row["mode"],
+            engine_family=str(row["engine_family"] or ""),
+            engine_key=str(row["engine_key"] or ""),
+            setup_type=str(row["setup_type"] or ""),
             status=row["status"],
         )
 
@@ -406,6 +484,9 @@ class StateStore:
                 full_defense_trigger=row["full_defense_trigger"],
                 opened_at=datetime.fromisoformat(row["opened_at"]),
                 mode=row["mode"],
+                engine_family=str(row["engine_family"] or ""),
+                engine_key=str(row["engine_key"] or ""),
+                setup_type=str(row["setup_type"] or ""),
                 status=row["status"],
             )
             for row in rows
@@ -440,8 +521,9 @@ class StateStore:
                 INSERT INTO positions (
                     symbol, side, quantity, entry_price, stop_price, target_price,
                     entry_profile, profile_stage, half_defense_trigger, full_defense_trigger,
+                    engine_family, engine_key, setup_type,
                     opened_at, mode, status
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     position.symbol,
@@ -454,6 +536,9 @@ class StateStore:
                     position.profile_stage,
                     position.half_defense_trigger,
                     position.full_defense_trigger,
+                    position.engine_family,
+                    position.engine_key,
+                    position.setup_type,
                     position.opened_at.isoformat(),
                     position.mode,
                     position.status,
@@ -535,7 +620,11 @@ class StateStore:
     def close_position(self, position_id: int, exit_price: float, exit_reason: str) -> None:
         with self._connect() as conn:
             row = conn.execute(
-                "SELECT symbol, side, quantity, entry_price, mode FROM positions WHERE id = ?",
+                """
+                SELECT symbol, side, quantity, entry_price, mode, engine_family, engine_key, setup_type
+                FROM positions
+                WHERE id = ?
+                """,
                 (position_id,),
             ).fetchone()
 
@@ -547,6 +636,9 @@ class StateStore:
         side = row["side"]
         symbol = str(row["symbol"])
         mode = str(row["mode"])
+        engine_family = str(row["engine_family"] or "")
+        engine_key = str(row["engine_key"] or "")
+        setup_type = str(row["setup_type"] or "")
         if side == "long":
             realized_pnl = (exit_price - entry_price) * quantity
         else:
@@ -578,6 +670,9 @@ class StateStore:
                 "exit_price": exit_price,
                 "quantity": quantity,
                 "realized_pnl": realized_pnl,
+                "engine_family": engine_family,
+                "engine_key": engine_key,
+                "setup_type": setup_type,
             },
         )
 
@@ -673,7 +768,7 @@ class StateStore:
         anchor = datetime.now(timezone.utc) - timedelta(hours=max(hours, 1))
         query = """
                 SELECT symbol, side, entry_profile, profile_stage, entry_price, exit_price, realized_pnl,
-                       exit_reason, opened_at, closed_at
+                       exit_reason, opened_at, closed_at, engine_family, engine_key, setup_type
                 FROM positions
                 WHERE status = 'CLOSED'
                   AND mode = ?

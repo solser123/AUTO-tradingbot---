@@ -59,6 +59,9 @@ class Position:
     full_defense_trigger: float
     opened_at: datetime
     mode: str
+    engine_family: str = ""
+    engine_key: str = ""
+    setup_type: str = ""
     status: str = "OPEN"
     id: int | None = None
 

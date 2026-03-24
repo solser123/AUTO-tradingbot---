@@ -120,6 +120,8 @@ class BotConfig:
     stage4_min_ai_confidence: float
     ai_review_hourly_budget_total: int
     ai_review_hourly_budget_per_symbol: int
+    ai_manage_hourly_budget_total: int
+    ai_manage_hourly_budget_per_symbol: int
     max_daily_loss: float
     max_daily_loss_pct: float
     max_weekly_loss_pct: float
@@ -160,6 +162,9 @@ class BotConfig:
     aggressive_entry_score: float
     balanced_entry_score: float
     conservative_entry_score: float
+    portfolio_priority_threshold: float
+    portfolio_priority_near_cap_threshold: float
+    portfolio_priority_urgent_relief: float
     balanced_defense_r_multiple: float
     conservative_defense_r_multiple: float
     enable_context_recovery: bool
@@ -422,6 +427,8 @@ class BotConfig:
             stage4_min_ai_confidence=_as_float("BOT_STAGE4_MIN_AI_CONFIDENCE", 0.46),
             ai_review_hourly_budget_total=_as_int("BOT_AI_REVIEW_HOURLY_BUDGET_TOTAL", 120),
             ai_review_hourly_budget_per_symbol=_as_int("BOT_AI_REVIEW_HOURLY_BUDGET_PER_SYMBOL", 2),
+            ai_manage_hourly_budget_total=_as_int("BOT_AI_MANAGE_HOURLY_BUDGET_TOTAL", 160),
+            ai_manage_hourly_budget_per_symbol=_as_int("BOT_AI_MANAGE_HOURLY_BUDGET_PER_SYMBOL", 4),
             max_daily_loss=_as_float("BOT_MAX_DAILY_LOSS", 50.0),
             max_daily_loss_pct=_as_float("BOT_MAX_DAILY_LOSS_PCT", 0.10),
             max_weekly_loss_pct=_as_float("BOT_MAX_WEEKLY_LOSS_PCT", 0.10),
@@ -462,6 +469,9 @@ class BotConfig:
             aggressive_entry_score=_as_float("BOT_AGGRESSIVE_ENTRY_SCORE", 0.68),
             balanced_entry_score=_as_float("BOT_BALANCED_ENTRY_SCORE", 0.54),
             conservative_entry_score=_as_float("BOT_CONSERVATIVE_ENTRY_SCORE", 0.42),
+            portfolio_priority_threshold=_as_float("BOT_PORTFOLIO_PRIORITY_THRESHOLD", 0.52),
+            portfolio_priority_near_cap_threshold=_as_float("BOT_PORTFOLIO_PRIORITY_NEAR_CAP_THRESHOLD", 0.60),
+            portfolio_priority_urgent_relief=_as_float("BOT_PORTFOLIO_PRIORITY_URGENT_RELIEF", 0.05),
             balanced_defense_r_multiple=_as_float("BOT_BALANCED_DEFENSE_R_MULTIPLE", 0.50),
             conservative_defense_r_multiple=_as_float("BOT_CONSERVATIVE_DEFENSE_R_MULTIPLE", 0.85),
             enable_context_recovery=_as_bool(os.getenv("BOT_ENABLE_CONTEXT_RECOVERY"), True),
@@ -535,6 +545,8 @@ class BotConfig:
             or config.ai_scan_hourly_budget_per_symbol < 1
             or config.ai_review_hourly_budget_total < 1
             or config.ai_review_hourly_budget_per_symbol < 1
+            or config.ai_manage_hourly_budget_total < 1
+            or config.ai_manage_hourly_budget_per_symbol < 1
         ):
             raise ValueError("AI hourly budget values must be at least 1.")
         if config.signal_max_age_aggressive_seconds < 30 or config.signal_max_age_exploratory_seconds < 30:
@@ -545,4 +557,12 @@ class BotConfig:
             config.aggressive_entry_score >= config.balanced_entry_score >= config.conservative_entry_score >= 0
         ):
             raise ValueError("Entry profile scores must descend: aggressive >= balanced >= conservative >= 0.")
+        if not (
+            0.0 <= config.portfolio_priority_threshold <= 1.0
+            and 0.0 <= config.portfolio_priority_near_cap_threshold <= 1.0
+            and 0.0 <= config.portfolio_priority_urgent_relief <= 0.25
+        ):
+            raise ValueError("Portfolio priority thresholds must be between 0 and 1, and urgent relief must be reasonable.")
+        if config.portfolio_priority_near_cap_threshold < config.portfolio_priority_threshold:
+            raise ValueError("Near-cap portfolio threshold must be greater than or equal to the base threshold.")
         return config

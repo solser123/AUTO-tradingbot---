@@ -16,6 +16,7 @@ class LiveReport:
     summary: dict[str, float | int]
     by_side: dict[str, dict[str, float]]
     by_setup: dict[str, dict[str, float]]
+    by_engine: dict[str, dict[str, float]]
     by_symbol: dict[str, dict[str, float]]
     blocker_counts: dict[str, int]
     stage_counts: dict[str, int]
@@ -42,7 +43,7 @@ def build_live_report(store: StateStore, *, lookback_hours: int = 48) -> LiveRep
     with store._connect() as conn:
         closed_rows = conn.execute(
             """
-            SELECT symbol, side, realized_pnl, exit_reason
+            SELECT symbol, side, realized_pnl, exit_reason, engine_family, engine_key, setup_type
             FROM positions
             WHERE status = 'CLOSED'
               AND closed_at IS NOT NULL
@@ -86,9 +87,12 @@ def build_live_report(store: StateStore, *, lookback_hours: int = 48) -> LiveRep
 
     by_side_source: dict[str, list[dict]] = defaultdict(list)
     by_symbol_source: dict[str, list[dict]] = defaultdict(list)
+    by_engine_source: dict[str, list[dict]] = defaultdict(list)
     for row in closed:
         by_side_source[str(row["side"])].append(row)
         by_symbol_source[str(row["symbol"])].append(row)
+        engine_label = str(row.get("engine_key") or row.get("engine_family") or row.get("setup_type") or "unknown")
+        by_engine_source[engine_label].append(row)
 
     by_setup_counter: dict[str, list[float]] = defaultdict(list)
     for row in signals:
@@ -136,6 +140,10 @@ def build_live_report(store: StateStore, *, lookback_hours: int = 48) -> LiveRep
         for key, values in sorted(by_setup_counter.items(), key=lambda item: len(item[1]), reverse=True)
     }
     by_side = {side: _bucket_stats(rows) for side, rows in by_side_source.items()}
+    by_engine = {
+        engine: _bucket_stats(rows)
+        for engine, rows in sorted(by_engine_source.items(), key=lambda item: _bucket_stats(item[1])["realized_pnl"], reverse=True)
+    }
     by_symbol = {
         symbol: _bucket_stats(rows)
         for symbol, rows in sorted(by_symbol_source.items(), key=lambda item: _bucket_stats(item[1])["realized_pnl"], reverse=True)
@@ -212,6 +220,7 @@ def build_live_report(store: StateStore, *, lookback_hours: int = 48) -> LiveRep
         },
         by_side=by_side,
         by_setup=by_setup,
+        by_engine=by_engine,
         by_symbol=by_symbol,
         blocker_counts=dict(top_blockers),
         stage_counts=dict(stage_counts.most_common(10)),
@@ -250,6 +259,12 @@ def render_live_report(report: LiveReport) -> str:
     for setup, stats in list(report.by_setup.items())[:8]:
         lines.append(
             f"- {setup}: signals={int(stats['signals'])} avg_ai_confidence={stats['avg_ai_confidence']:.4f}"
+        )
+
+    lines.extend(["", "## By Engine"])
+    for engine, stats in list(report.by_engine.items())[:8]:
+        lines.append(
+            f"- {engine}: trades={int(stats['trades'])} win_rate={stats['win_rate']:.2f}% pnl={stats['realized_pnl']:.4f}"
         )
 
     lines.extend(["", "## Top Symbols"])
