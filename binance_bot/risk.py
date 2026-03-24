@@ -12,8 +12,10 @@ from .storage import StateStore, trading_day_anchor, trading_week_anchor
 
 KST = ZoneInfo("Asia/Seoul")
 CORRELATION_CLUSTERS = [
-    {"BTC/USDT:USDT", "ETH/USDT:USDT", "SOL/USDT:USDT", "DOGE/USDT:USDT"},
-    {"BNB/USDT:USDT", "LINK/USDT:USDT", "AVAX/USDT:USDT", "ADA/USDT:USDT", "XRP/USDT:USDT"},
+    {"BTC/USDT:USDT", "ETH/USDT:USDT"},
+    {"SOL/USDT:USDT", "AVAX/USDT:USDT", "BNB/USDT:USDT"},
+    {"ADA/USDT:USDT", "DOGE/USDT:USDT", "XRP/USDT:USDT"},
+    {"LINK/USDT:USDT"},
 ]
 
 
