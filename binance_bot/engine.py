@@ -444,6 +444,8 @@ class TradingEngine:
         reference_time: datetime,
         advisory: bool = False,
     ) -> AIScanReview | None:
+        if not self._entry_ai_enabled():
+            return None
         if not self._consume_ai_budget("scan", symbol, reference_time):
             self.store.log_decision(
                 symbol=symbol,
@@ -464,11 +466,65 @@ class TradingEngine:
             advisory=advisory,
         )
 
+    def _entry_ai_enabled(self) -> bool:
+        return self.config.ai_validation and self.config.ai_entry_assist and bool(self.config.openai_api_key)
+
+    def _deterministic_entry_confidence(self, signal: TradeSignal) -> float:
+        score = float(signal.strategy_data.get("entry_profile_score", 0.0) or 0.0)
+        hint = float(signal.strategy_data.get("engine_confidence_hint", 0.0) or 0.0)
+        horizon = signal.strategy_data.get("multi_horizon", {})
+        same_side_count = int(horizon.get("same_side_count", 0) or 0)
+        opposite_side_count = int(horizon.get("opposite_side_count", 0) or 0)
+        structure_release = any(
+            bool(signal.strategy_data.get(flag, False))
+            for flag in (
+                "resume_confirmed",
+                "impulse_confirmed",
+                "transition_ready",
+                "bullish_bos",
+                "bearish_bos",
+                "bullish_choch",
+                "bearish_choch",
+                "recent_bullish_fvg",
+                "recent_bearish_fvg",
+                "squeeze_off",
+            )
+        )
+        base = 0.38 + min(max(score, hint, 0.0), 1.0) * 0.28
+        base += same_side_count * 0.06
+        base -= opposite_side_count * 0.07
+        if structure_release:
+            base += 0.06
+        if bool(signal.strategy_data.get("hot_mover_scout", False)):
+            base += 0.04
+        if self._is_exploratory_signal(signal):
+            base -= 0.02
+        return max(0.30, min(base, 0.88))
+
+    def _deterministic_entry_review(self, signal: TradeSignal) -> AIReview:
+        confidence = self._deterministic_entry_confidence(signal)
+        recommended_action = "exploratory" if self._is_exploratory_signal(signal) else "full"
+        return AIReview(
+            approved=True,
+            confidence=round(confidence, 4),
+            recommended_action=recommended_action,
+            reason="진입 전 AI를 사용하지 않고 기술 신호와 리스크 규칙으로만 진입을 평가했습니다.",
+            committee={
+                "deterministic_entry": True,
+                "engine_family": self._engine_family(signal),
+                "engine_key": self._engine_key(signal),
+                "entry_profile_score": round(float(signal.strategy_data.get("entry_profile_score", 0.0) or 0.0), 4),
+                "technical_confidence": round(confidence, 4),
+            },
+        )
+
     def _review_signal_with_budget(
         self,
         signal: TradeSignal,
         reference_time: datetime,
     ) -> AIReview:
+        if not self._entry_ai_enabled():
+            return self._deterministic_entry_review(signal)
         fastpath_review = self._fastpath_ai_review(signal, reference_time)
         if fastpath_review is not None:
             self.store.log_decision(
@@ -993,11 +1049,22 @@ class TradingEngine:
             "short": self.store.get_external_alignment(symbol, "short", hours=36),
         }
         ai_scan_review: AIScanReview | None = None
+        entry_ai_enabled = self._entry_ai_enabled()
         if signal is None:
             recovered_signal = None
             if self.config.enable_context_recovery:
                 recovered_signal = self._build_context_recovery_signal(symbol, scan, horizon_context)
-            if hot_mover_candidate is not None and ai_scan_review is None and self.config.ai_scan_assist:
+            if recovered_signal is not None and not entry_ai_enabled:
+                signal = recovered_signal
+                self.store.log_decision(
+                    symbol=symbol,
+                    mode=self.config.mode,
+                    stage="context_recovery",
+                    outcome="triggered",
+                    detail=f"Deterministic context recovery promoted {signal.side} entry candidate.",
+                    payload={"signal": signal.strategy_data, "reasons": scan.reasons[:8]},
+                )
+            if hot_mover_candidate is not None and ai_scan_review is None and entry_ai_enabled and self.config.ai_scan_assist:
                 ai_scan_review = self._review_scan_with_budget(
                     symbol=symbol,
                     scan=scan,
@@ -1007,7 +1074,7 @@ class TradingEngine:
                     microstructure=microstructure,
                     reference_time=reference_time,
                 )
-            if ai_scan_review is None and self._should_run_ai_scan(scan, recovered_signal, reference_time):
+            if ai_scan_review is None and entry_ai_enabled and self._should_run_ai_scan(scan, recovered_signal, reference_time):
                 ai_scan_review = self._review_scan_with_budget(
                     symbol=symbol,
                     scan=scan,
@@ -1017,7 +1084,7 @@ class TradingEngine:
                     microstructure=microstructure,
                     reference_time=reference_time,
                 )
-            if recovered_signal is not None and ai_scan_review is not None and ai_scan_review.approved:
+            if signal is None and recovered_signal is not None and ai_scan_review is not None and ai_scan_review.approved:
                 signal = self._apply_ai_scan_signal_overrides(recovered_signal, ai_scan_review, scan)
                 self.store.log_decision(
                     symbol=symbol,
@@ -1035,10 +1102,10 @@ class TradingEngine:
                             "setup_bias": ai_scan_review.setup_bias,
                             "reason": ai_scan_review.reason,
                             "committee": ai_scan_review.committee,
+                            },
                         },
-                    },
-                )
-            elif ai_scan_review is not None and ai_scan_review.approved:
+                    )
+            elif signal is None and ai_scan_review is not None and ai_scan_review.approved:
                 signal = self._build_ai_assisted_signal(
                     symbol=symbol,
                     scan=scan,
@@ -1108,7 +1175,7 @@ class TradingEngine:
                             ),
                         },
                     )
-            else:
+            if signal is None:
                 detail = " | ".join(scan.reasons[:3]) if scan.reasons else "No rule-based setup."
                 logging.info("%s: no rule-based setup. %s", symbol, detail)
                 if not self.store.has_recent_decision(
@@ -1127,7 +1194,7 @@ class TradingEngine:
                         detail=detail,
                         payload={"metrics": scan.metrics, "reasons": scan.reasons[:8]},
                     )
-                if ai_scan_review is not None:
+                if entry_ai_enabled and ai_scan_review is not None:
                     self.store.log_decision(
                         symbol=symbol,
                         mode=self.config.mode,
@@ -1189,7 +1256,7 @@ class TradingEngine:
         signal.strategy_data["adaptive_ai_profile"] = self._adaptive_ai_profile(reference_time)
 
         signal.strategy_data["multi_horizon"] = horizon_context
-        if self.config.ai_scan_assist and ai_scan_review is None:
+        if entry_ai_enabled and self.config.ai_scan_assist and ai_scan_review is None:
             ai_scan_review = self._review_scan_with_budget(
                 symbol=symbol,
                 scan=scan,
@@ -1295,7 +1362,7 @@ class TradingEngine:
                 payload={"external_alignment": external_alignment, "signal": signal.strategy_data},
             )
             return
-        if ai_scan_review is not None and not ai_scan_review.approved:
+        if entry_ai_enabled and ai_scan_review is not None and not ai_scan_review.approved:
             self.store.log_decision(
                 symbol=symbol,
                 mode=self.config.mode,
@@ -1378,8 +1445,17 @@ class TradingEngine:
             return
 
         review = self._review_signal_with_budget(signal, reference_time)
+        if not entry_ai_enabled:
+            self.store.log_decision(
+                symbol=symbol,
+                mode=self.config.mode,
+                stage="entry_policy",
+                outcome="deterministic",
+                detail=review.reason,
+                payload={"signal": signal.strategy_data, "confidence": review.confidence, "committee": review.committee},
+            )
         self.store.log_signal(signal, review.approved, review.confidence, review.reason)
-        if review.reason.startswith("AI validation failed"):
+        if entry_ai_enabled and review.reason.startswith("AI validation failed"):
             set_runtime_flag(self.store, "last_ai_error_at", datetime.now(timezone.utc).isoformat())
             streak = self.store.increment_state_counter("ai_failure_streak")
             if streak >= self.config.ai_failure_limit:
@@ -1401,16 +1477,18 @@ class TradingEngine:
                 payload={"signal": signal.strategy_data, "committee": review.committee},
             )
             return
-        self.store.reset_state_counter("ai_failure_streak")
+        if entry_ai_enabled:
+            self.store.reset_state_counter("ai_failure_streak")
 
         exploratory_live = self._should_open_exploratory_live(signal, sizing, review, ai_scan_review)
+        review_stage = "ai_review" if entry_ai_enabled else "entry_policy"
         if not review.approved:
             if not exploratory_live:
                 logging.info("%s: AI rejected signal. %s", symbol, review.reason)
                 self.store.log_decision(
                     symbol=symbol,
                     mode=self.config.mode,
-                    stage="ai_review",
+                    stage=review_stage,
                     outcome="rejected",
                     detail=review.reason,
                     payload={"signal": signal.strategy_data, "confidence": review.confidence, "committee": review.committee},
@@ -1419,7 +1497,7 @@ class TradingEngine:
             self.store.log_decision(
                 symbol=symbol,
                 mode=self.config.mode,
-                stage="ai_review",
+                stage=review_stage,
                 outcome="exploratory_override",
                 detail=f"Exploratory live allowed despite AI rejection: {review.reason}",
                 payload={"signal": signal.strategy_data, "confidence": review.confidence, "committee": review.committee},
@@ -1428,9 +1506,13 @@ class TradingEngine:
             self.store.log_decision(
                 symbol=symbol,
                 mode=self.config.mode,
-                stage="ai_review",
+                stage=review_stage,
                 outcome="exploratory_preferred",
-                detail=f"AI preferred exploratory sizing: {review.reason}",
+                detail=(
+                    f"AI preferred exploratory sizing: {review.reason}"
+                    if entry_ai_enabled
+                    else f"Deterministic policy preferred exploratory sizing: {review.reason}"
+                ),
                 payload={"signal": signal.strategy_data, "confidence": review.confidence, "committee": review.committee},
             )
         if exploratory_live:
@@ -3186,6 +3268,8 @@ class TradingEngine:
         recovered_signal: TradeSignal | None,
         reference_time: datetime,
     ) -> bool:
+        if not self._entry_ai_enabled():
+            return False
         if not self.config.ai_scan_assist:
             return False
         profile = self._adaptive_ai_profile(reference_time)
@@ -3349,12 +3433,13 @@ class TradingEngine:
         squeeze_momentum = float(metrics.get("squeeze_momentum", 0.0) or 0.0)
         if min(close, atr) <= 0:
             return None
-        if ai_scan_review is None or not ai_scan_review.approved:
-            return None
-        if ai_scan_review.suggested_side != candidate.direction:
-            return None
-        if ai_scan_review.confidence < max(0.45, self.config.exploratory_ai_scan_min_confidence - 0.04):
-            return None
+        if self._entry_ai_enabled():
+            if ai_scan_review is None or not ai_scan_review.approved:
+                return None
+            if ai_scan_review.suggested_side != candidate.direction:
+                return None
+            if ai_scan_review.confidence < max(0.45, self.config.exploratory_ai_scan_min_confidence - 0.04):
+                return None
 
         if candidate.direction == "long":
             trigger_count = sum(
@@ -3424,7 +3509,7 @@ class TradingEngine:
             entry_profile="exploratory",
             reason=(
                 f"Hot mover scout {side}: 24h move {candidate.pct_change_24h:.2f}% "
-                f"with AI-aligned momentum and breakout context."
+                f"with technical momentum and breakout context."
             ),
             strategy_data={
                 **metrics,
@@ -3589,7 +3674,10 @@ class TradingEngine:
             return sizing
         if not self._is_exploratory_signal(signal):
             return sizing
-        if review is None or not review.approved or review.suggested_side != signal.side:
+        if self._entry_ai_enabled():
+            if review is None or not review.approved or review.suggested_side != signal.side:
+                return sizing
+        elif not self._exploratory_soft_pass_allowed(signal, review):
             return sizing
         floor = self._exploratory_override_floor(signal)
         if sizing.score < floor:
@@ -3630,6 +3718,8 @@ class TradingEngine:
             return False
         if sizing.bucket != "0.25R":
             return False
+        if not self._entry_ai_enabled():
+            return self._is_exploratory_signal(signal)
         if review.confidence < self._exploratory_review_confidence_floor(signal):
             return False
         if ai_scan_review is None or not ai_scan_review.approved:
@@ -3723,6 +3813,8 @@ class TradingEngine:
         return flow_score >= self.config.sector_opposition_gate_threshold
 
     def _ai_override_allowed(self, review: AIScanReview | None, signal: TradeSignal) -> bool:
+        if not self._entry_ai_enabled():
+            return False
         if review is None or not review.approved:
             return False
         if review.suggested_side != signal.side:
@@ -3735,6 +3827,26 @@ class TradingEngine:
     def _exploratory_soft_pass_allowed(self, signal: TradeSignal, review: AIScanReview | None) -> bool:
         if not self._is_exploratory_signal(signal):
             return False
+        if not self._entry_ai_enabled():
+            score = float(signal.strategy_data.get("entry_profile_score", 0.0) or 0.0)
+            if score < (self._exploratory_override_floor(signal) / 100.0):
+                return False
+            return any(
+                bool(signal.strategy_data.get(flag, False))
+                for flag in (
+                    "transition_ready",
+                    "resume_confirmed",
+                    "impulse_confirmed",
+                    "bullish_bos",
+                    "bearish_bos",
+                    "bullish_choch",
+                    "bearish_choch",
+                    "recent_bullish_fvg",
+                    "recent_bearish_fvg",
+                    "squeeze_off",
+                    "hot_mover_scout",
+                )
+            )
         if review is None or not review.approved:
             return False
         if review.suggested_side != signal.side:
@@ -4033,6 +4145,16 @@ class TradingEngine:
                     )
                     continue
 
+                if not self._entry_ai_enabled():
+                    self.store.log_decision(
+                        symbol=symbol,
+                        mode=self.config.mode,
+                        stage="overflow_review",
+                        outcome="watch_only",
+                        detail="Entry AI is disabled; overflow committee review skipped.",
+                        payload={"metrics": scan.metrics, "reasons": scan.reasons[:8], "score": score, "status": status},
+                    )
+                    continue
                 if not self._consume_ai_budget("review", symbol, reference_time):
                     self.store.log_decision(
                         symbol=symbol,

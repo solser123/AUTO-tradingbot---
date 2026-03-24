@@ -108,6 +108,7 @@ class BotConfig:
     allowed_entry_windows: list[str]
     symbol_cooldown_minutes: int
     ai_validation: bool
+    ai_entry_assist: bool
     ai_scan_assist: bool
     ai_scan_hourly_budget_total: int
     ai_scan_hourly_budget_per_symbol: int
@@ -415,6 +416,7 @@ class BotConfig:
             allowed_entry_windows=_as_list("BOT_ALLOWED_ENTRY_WINDOWS"),
             symbol_cooldown_minutes=_as_int("BOT_SYMBOL_COOLDOWN_MINUTES", 240),
             ai_validation=_as_bool(os.getenv("BOT_AI_VALIDATION"), True),
+            ai_entry_assist=_as_bool(os.getenv("BOT_AI_ENTRY_ASSIST"), False),
             ai_scan_assist=_as_bool(os.getenv("BOT_AI_SCAN_ASSIST"), True),
             ai_scan_hourly_budget_total=_as_int("BOT_AI_SCAN_HOURLY_BUDGET_TOTAL", 240),
             ai_scan_hourly_budget_per_symbol=_as_int("BOT_AI_SCAN_HOURLY_BUDGET_PER_SYMBOL", 2),

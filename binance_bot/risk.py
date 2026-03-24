@@ -98,20 +98,22 @@ class RiskManager:
         if atr_regime_ratio >= self.config.atr_overheat_multiplier:
             return RiskDecision(False, "ATR regime is overheated for a safe entry.")
 
-        required_ai_confidence = self.config.min_ai_confidence_for_symbol(signal.symbol)
-        if exploratory:
-            required_ai_confidence = min(required_ai_confidence, self.config.exploratory_ai_min_confidence)
-        sector_context = signal.strategy_data.get("sector_context", {})
-        sector_flow = float(sector_context.get("flow_score", 0.0) or 0.0)
-        sector_liquidity = float(sector_context.get("liquidity_usdt", 0.0) or 0.0)
-        if sector_liquidity >= self.config.sector_min_liquidity_usdt:
-            if signal.side == "long" and sector_flow >= self.config.sector_flow_positive_threshold:
-                required_ai_confidence = max(0.0, required_ai_confidence - self.config.sector_alignment_ai_relief)
-            if signal.side == "short" and sector_flow <= self.config.sector_flow_negative_threshold:
-                required_ai_confidence = max(0.0, required_ai_confidence - self.config.sector_alignment_ai_relief)
+        entry_ai_enabled = self.config.ai_validation and self.config.ai_entry_assist
+        if entry_ai_enabled:
+            required_ai_confidence = self.config.min_ai_confidence_for_symbol(signal.symbol)
+            if exploratory:
+                required_ai_confidence = min(required_ai_confidence, self.config.exploratory_ai_min_confidence)
+            sector_context = signal.strategy_data.get("sector_context", {})
+            sector_flow = float(sector_context.get("flow_score", 0.0) or 0.0)
+            sector_liquidity = float(sector_context.get("liquidity_usdt", 0.0) or 0.0)
+            if sector_liquidity >= self.config.sector_min_liquidity_usdt:
+                if signal.side == "long" and sector_flow >= self.config.sector_flow_positive_threshold:
+                    required_ai_confidence = max(0.0, required_ai_confidence - self.config.sector_alignment_ai_relief)
+                if signal.side == "short" and sector_flow <= self.config.sector_flow_negative_threshold:
+                    required_ai_confidence = max(0.0, required_ai_confidence - self.config.sector_alignment_ai_relief)
 
-        if self.config.ai_validation and review.confidence < required_ai_confidence:
-            return RiskDecision(False, "AI confidence is below the configured minimum.")
+            if review.confidence < required_ai_confidence:
+                return RiskDecision(False, "AI confidence is below the configured minimum.")
 
         if self.store.get_symbol_stoploss_streak(signal.symbol, self.config.mode) >= self.config.same_symbol_stoploss_limit:
             return RiskDecision(False, "Symbol is blocked after repeated stop-losses.")
