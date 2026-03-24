@@ -534,6 +534,30 @@ def scan_market(
     estimated_long_risk_pct = max(0.0, (close_now - estimated_long_stop) / close_now) if close_now > 0 else 0.0
     resistance_room_pct = max(0.0, (recent_resistance - close_now) / close_now) if close_now > 0 else 0.0
     long_resistance_room_ok = breakout_long or resistance_room_pct >= max(estimated_long_risk_pct * 0.35, 0.0014)
+    long_confirmation_score = sum(
+        [
+            int(long_stoch_ok),
+            int(long_resume_confirmed),
+            int(long_impulse_confirmed),
+            int(long_resistance_room_ok),
+        ]
+    )
+    long_transition_ready = (
+        higher_long_bias
+        and near_vwap_long
+        and long_rsi_ok
+        and long_setup_ready
+        and long_confirmation_score >= 2
+        and (
+            early_reversal_long
+            or smc_reversal_long
+            or recent_bullish_fvg
+            or squeeze_long_bias
+            or session_vwap_reclaim_long
+            or bullish_choch
+            or eql_sweep
+        )
+    )
     if not higher_long_bias:
         reasons.append("Long rejected: higher timeframe bias is still too weak.")
     if not near_vwap_long:
@@ -556,11 +580,18 @@ def scan_market(
         reasons.append("Long rejected: volatility is still compressed without a clean release.")
     if higher_long_bias and near_vwap_long and long_rsi_ok:
         if long_setup_ready:
-            if not long_stoch_ok:
+            if not long_stoch_ok and not long_transition_ready:
                 return MarketScan(symbol=symbol, signal=None, reasons=reasons, metrics=metrics)
-            if config.require_signal_candle_confirmation and not candle_is_bullish:
+            if config.require_signal_candle_confirmation and not candle_is_bullish and not long_transition_ready:
                 return MarketScan(symbol=symbol, signal=None, reasons=reasons, metrics=metrics)
-            if not (long_resume_confirmed or early_reversal_long or smc_reversal_long) or not (long_impulse_confirmed or early_reversal_long or squeeze_long_bias) or not long_resistance_room_ok:
+            if (
+                (
+                    not (long_resume_confirmed or early_reversal_long or smc_reversal_long)
+                    or not (long_impulse_confirmed or early_reversal_long or squeeze_long_bias)
+                    or not long_resistance_room_ok
+                )
+                and not long_transition_ready
+            ):
                 return MarketScan(symbol=symbol, signal=None, reasons=reasons, metrics=metrics)
             entry = float(current["close"])
             swing_stop = float(low_df["low"].tail(5).min())
@@ -589,7 +620,11 @@ def scan_market(
                 base_score += 0.04 if session_vwap_reclaim_long else 0.0
                 if session_vwap_zscore <= -2.0 and candle_is_bullish:
                     base_score += 0.04
-                entry_profile = classify_entry_profile(base_score)
+                if long_transition_ready and long_confirmation_score <= 2:
+                    base_score = min(base_score, 0.58)
+                    entry_profile = "exploratory"
+                else:
+                    entry_profile = classify_entry_profile(base_score)
                 if early_reversal_long and not bullish_trend:
                     setup_type = "early_reversal"
                 elif continuation_long:
@@ -619,6 +654,8 @@ def scan_market(
                         "session_vwap_zscore": round(session_vwap_zscore, 2),
                         "squeeze_long_bias": squeeze_long_bias,
                         "resistance_room_pct": round(resistance_room_pct * 100, 2),
+                        "confirmation_score": long_confirmation_score,
+                        "transition_ready": long_transition_ready,
                     },
                 )
                 return MarketScan(symbol=symbol, signal=signal, reasons=["Long setup found."], metrics=metrics)
@@ -711,6 +748,32 @@ def scan_market(
     estimated_short_stop = max(float(low_df["high"].tail(5).max()), close_now + atr_value * config.atr_stop_multiplier) if atr_value > 0 else float(low_df["high"].tail(5).max())
     estimated_short_risk_pct = max(0.0, (estimated_short_stop - close_now) / close_now) if close_now > 0 else 0.0
     support_room_pct = max(0.0, (close_now - recent_support) / close_now) if close_now > 0 else 0.0
+    short_support_room_ok = breakdown_short or support_room_pct >= max(estimated_short_risk_pct * 0.55, 0.0022)
+    short_confirmation_score = sum(
+        [
+            int(short_stoch_ok),
+            int(short_resume_confirmed),
+            int(short_impulse_confirmed),
+            int(short_support_room_ok),
+        ]
+    )
+    short_transition_ready = (
+        config.allow_short
+        and higher_short_bias
+        and near_vwap_short
+        and short_rsi_ok
+        and short_setup_ready
+        and short_confirmation_score >= 2
+        and (
+            early_reversal_short
+            or smc_reversal_short
+            or recent_bearish_fvg
+            or squeeze_short_bias
+            or session_vwap_reject_short
+            or bearish_choch
+            or eqh_sweep
+        )
+    )
 
     if config.allow_short and higher_short_bias and near_vwap_short and short_rsi_ok:
         if not short_stoch_ok:
@@ -721,18 +784,24 @@ def scan_market(
             reasons.append("Short rejected: resume candle confirmation is still weak.")
         if not short_impulse_confirmed:
             reasons.append("Short rejected: individual momentum is not strong enough yet.")
-        if not (breakdown_short or support_room_pct >= max(estimated_short_risk_pct * 0.55, 0.0022)):
+        if not short_support_room_ok:
             reasons.append("Short rejected: nearby support is too close for a clean reward path.")
         if squeeze_on and not short_setup_ready:
             reasons.append("Short rejected: volatility is still compressed without a clean release.")
         if short_setup_ready:
-            if not short_stoch_ok:
+            if not short_stoch_ok and not short_transition_ready:
                 return MarketScan(symbol=symbol, signal=None, reasons=reasons, metrics=metrics)
-            if config.require_signal_candle_confirmation and not candle_is_bearish:
+            if config.require_signal_candle_confirmation and not candle_is_bearish and not short_transition_ready:
                 return MarketScan(symbol=symbol, signal=None, reasons=reasons, metrics=metrics)
-            if not (short_resume_confirmed or early_reversal_short or smc_reversal_short) or not (short_impulse_confirmed or early_reversal_short or squeeze_short_bias):
+            if (
+                (
+                    not (short_resume_confirmed or early_reversal_short or smc_reversal_short)
+                    or not (short_impulse_confirmed or early_reversal_short or squeeze_short_bias)
+                )
+                and not short_transition_ready
+            ):
                 return MarketScan(symbol=symbol, signal=None, reasons=reasons, metrics=metrics)
-            if not (breakdown_short or support_room_pct >= max(estimated_short_risk_pct * 0.55, 0.0022)):
+            if not short_support_room_ok and not short_transition_ready:
                 return MarketScan(symbol=symbol, signal=None, reasons=reasons, metrics=metrics)
             entry = float(current["close"])
             swing_stop = float(low_df["high"].tail(5).max())
@@ -764,7 +833,11 @@ def scan_market(
                 base_score += 0.04 if session_vwap_reject_short else 0.0
                 if session_vwap_zscore >= 2.0 and candle_is_bearish:
                     base_score += 0.04
-                entry_profile = classify_entry_profile(base_score)
+                if short_transition_ready and short_confirmation_score <= 2:
+                    base_score = min(base_score, 0.58)
+                    entry_profile = "exploratory"
+                else:
+                    entry_profile = classify_entry_profile(base_score)
                 if early_reversal_short and not bearish_trend:
                     setup_type = "early_reversal"
                 elif continuation_short:
@@ -794,6 +867,8 @@ def scan_market(
                         "session_vwap_zscore": round(session_vwap_zscore, 2),
                         "squeeze_short_bias": squeeze_short_bias,
                         "support_room_pct": round(support_room_pct * 100, 2),
+                        "confirmation_score": short_confirmation_score,
+                        "transition_ready": short_transition_ready,
                     },
                 )
                 return MarketScan(symbol=symbol, signal=signal, reasons=["Short setup found."], metrics=metrics)
