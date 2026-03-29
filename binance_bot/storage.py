@@ -5,6 +5,7 @@ import sqlite3
 from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
 
+from .c_level import role_owner_for_stage
 from .models import Position, TradeSignal
 
 
@@ -45,12 +46,15 @@ class StateStore:
         self._init_schema()
 
     def _connect(self) -> sqlite3.Connection:
-        connection = sqlite3.connect(self.database_path)
+        connection = sqlite3.connect(self.database_path, timeout=30.0)
         connection.row_factory = sqlite3.Row
+        connection.execute("PRAGMA busy_timeout = 30000")
         return connection
 
     def _init_schema(self) -> None:
         with self._connect() as conn:
+            conn.execute("PRAGMA journal_mode=WAL")
+            conn.execute("PRAGMA synchronous=NORMAL")
             conn.execute(
                 """
                 CREATE TABLE IF NOT EXISTS positions (
@@ -270,41 +274,55 @@ class StateStore:
             for column, sql in migrations.items():
                 if column not in columns:
                     conn.execute(sql)
-        self._backfill_position_engine_metadata()
+        try:
+            self._backfill_position_engine_metadata()
+        except sqlite3.OperationalError as exc:
+            if "locked" not in str(exc).lower():
+                raise
 
     def _backfill_position_engine_metadata(self) -> None:
-        with self._connect() as conn:
-            rows = conn.execute(
-                """
-                SELECT id, symbol, mode, opened_at, engine_family, engine_key, setup_type
-                FROM positions
-                WHERE COALESCE(engine_family, '') = ''
-                   OR COALESCE(engine_key, '') = ''
-                   OR COALESCE(setup_type, '') = ''
-                ORDER BY id DESC
-                LIMIT 200
-                """
-            ).fetchall()
+        try:
+            with self._connect() as conn:
+                rows = conn.execute(
+                    """
+                    SELECT id, symbol, mode, opened_at, engine_family, engine_key, setup_type
+                    FROM positions
+                    WHERE COALESCE(engine_family, '') = ''
+                       OR COALESCE(engine_key, '') = ''
+                       OR COALESCE(setup_type, '') = ''
+                    ORDER BY id DESC
+                    LIMIT 200
+                    """
+                ).fetchall()
+        except sqlite3.OperationalError as exc:
+            if "locked" in str(exc).lower():
+                return
+            raise
 
         for row in rows:
             position_id = int(row["id"])
             symbol = str(row["symbol"])
             mode = str(row["mode"])
             opened_at = str(row["opened_at"] or "")
-            with self._connect() as conn:
-                decision_rows = conn.execute(
-                    """
-                    SELECT payload_json
-                    FROM decision_log
-                    WHERE symbol = ?
-                      AND mode = ?
-                      AND stage = 'entry'
-                      AND outcome = 'opened'
-                    ORDER BY id DESC
-                    LIMIT 20
-                    """,
-                    (symbol, mode),
-                ).fetchall()
+            try:
+                with self._connect() as conn:
+                    decision_rows = conn.execute(
+                        """
+                        SELECT payload_json
+                        FROM decision_log
+                        WHERE symbol = ?
+                          AND mode = ?
+                          AND stage = 'entry'
+                          AND outcome = 'opened'
+                        ORDER BY id DESC
+                        LIMIT 20
+                        """,
+                        (symbol, mode),
+                    ).fetchall()
+            except sqlite3.OperationalError as exc:
+                if "locked" in str(exc).lower():
+                    return
+                raise
             engine_family = str(row["engine_family"] or "")
             engine_key = str(row["engine_key"] or "")
             setup_type = str(row["setup_type"] or "")
@@ -330,15 +348,20 @@ class StateStore:
                 setup_type = setup_type or str(fallback_payload.get("setup_type", "") or "")
             if not (engine_family or engine_key or setup_type):
                 continue
-            with self._connect() as conn:
-                conn.execute(
-                    """
-                    UPDATE positions
-                    SET engine_family = ?, engine_key = ?, setup_type = ?
-                    WHERE id = ?
-                    """,
-                    (engine_family, engine_key, setup_type, position_id),
-                )
+            try:
+                with self._connect() as conn:
+                    conn.execute(
+                        """
+                        UPDATE positions
+                        SET engine_family = ?, engine_key = ?, setup_type = ?
+                        WHERE id = ?
+                        """,
+                        (engine_family, engine_key, setup_type, position_id),
+                    )
+            except sqlite3.OperationalError as exc:
+                if "locked" in str(exc).lower():
+                    return
+                raise
 
     def log_signal(self, signal: TradeSignal, approved: bool, ai_confidence: float, reason: str) -> None:
         with self._connect() as conn:
@@ -373,6 +396,10 @@ class StateStore:
         detail: str,
         payload: dict | None = None,
     ) -> None:
+        prepared_payload = _json_safe(payload or {})
+        if not isinstance(prepared_payload, dict):
+            prepared_payload = {"value": prepared_payload}
+        prepared_payload.setdefault("role_owner", role_owner_for_stage(stage, prepared_payload))
         with self._connect() as conn:
             conn.execute(
                 """
@@ -387,7 +414,7 @@ class StateStore:
                     stage,
                     outcome,
                     detail,
-                    json.dumps(_json_safe(payload or {}), ensure_ascii=False),
+                    json.dumps(prepared_payload, ensure_ascii=False),
                 ),
             )
 

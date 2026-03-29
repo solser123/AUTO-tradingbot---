@@ -6,6 +6,7 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
+from .c_level import role_owner_for_stage
 from .storage import StateStore
 
 
@@ -17,8 +18,10 @@ class LiveReport:
     by_side: dict[str, dict[str, float]]
     by_setup: dict[str, dict[str, float]]
     by_engine: dict[str, dict[str, float]]
+    by_role: dict[str, dict[str, float]]
     by_symbol: dict[str, dict[str, float]]
     blocker_counts: dict[str, int]
+    role_blockers: dict[str, int]
     stage_counts: dict[str, int]
     opportunity: dict[str, float | int]
     ai_efficiency: dict[str, float | int]
@@ -99,19 +102,23 @@ def build_live_report(store: StateStore, *, lookback_hours: int = 48) -> LiveRep
         by_setup_counter[str(row["setup_type"])].append(float(row["ai_confidence"] or 0.0))
 
     blocker_counts: Counter[str] = Counter()
+    role_blockers: Counter[str] = Counter()
     stage_counts: Counter[str] = Counter()
     ai_efficiency_counts: Counter[str] = Counter()
+    role_counts: Counter[str] = Counter()
     entry_lags: list[float] = []
     for row in decisions:
         stage = str(row["stage"])
         stage_counts[stage] += 1
+        try:
+            payload = json.loads(str(row["payload_json"] or "{}"))
+        except Exception:
+            payload = {}
+        role_owner = str(payload.get("role_owner") or role_owner_for_stage(stage, payload))
+        role_counts[role_owner] += 1
         if stage.startswith("ai_") or stage in {"overflow_budget", "signal_freshness"}:
             ai_efficiency_counts[f"{stage}:{row['outcome']}"] += 1
         if stage == "entry" and str(row["outcome"]) == "opened":
-            try:
-                payload = json.loads(str(row["payload_json"] or "{}"))
-            except Exception:
-                payload = {}
             try:
                 lag = float(payload.get("entry_lag_seconds", 0.0) or 0.0)
             except Exception:
@@ -121,6 +128,7 @@ def build_live_report(store: StateStore, *, lookback_hours: int = 48) -> LiveRep
         if row["outcome"] != "rejected":
             continue
         detail = str(row["detail"] or "")
+        role_blockers[role_owner] += 1
         for part in [chunk.strip() for chunk in detail.split("|") if chunk.strip()]:
             blocker_counts[part] += 1
 
@@ -143,6 +151,12 @@ def build_live_report(store: StateStore, *, lookback_hours: int = 48) -> LiveRep
     by_engine = {
         engine: _bucket_stats(rows)
         for engine, rows in sorted(by_engine_source.items(), key=lambda item: _bucket_stats(item[1])["realized_pnl"], reverse=True)
+    }
+    by_role = {
+        role: {
+            "events": float(count),
+        }
+        for role, count in role_counts.most_common()
     }
     by_symbol = {
         symbol: _bucket_stats(rows)
@@ -221,8 +235,10 @@ def build_live_report(store: StateStore, *, lookback_hours: int = 48) -> LiveRep
         by_side=by_side,
         by_setup=by_setup,
         by_engine=by_engine,
+        by_role=by_role,
         by_symbol=by_symbol,
         blocker_counts=dict(top_blockers),
+        role_blockers=dict(role_blockers.most_common(8)),
         stage_counts=dict(stage_counts.most_common(10)),
         opportunity=opportunity,
         ai_efficiency=ai_efficiency,
@@ -267,6 +283,10 @@ def render_live_report(report: LiveReport) -> str:
             f"- {engine}: trades={int(stats['trades'])} win_rate={stats['win_rate']:.2f}% pnl={stats['realized_pnl']:.4f}"
         )
 
+    lines.extend(["", "## By Role"])
+    for role, stats in list(report.by_role.items())[:8]:
+        lines.append(f"- {role}: events={int(stats['events'])}")
+
     lines.extend(["", "## Top Symbols"])
     for symbol, stats in list(report.by_symbol.items())[:8]:
         lines.append(
@@ -276,6 +296,10 @@ def render_live_report(report: LiveReport) -> str:
     lines.extend(["", "## Top Blockers"])
     for blocker, count in report.blocker_counts.items():
         lines.append(f"- {blocker}: {count}")
+
+    lines.extend(["", "## Role Blockers"])
+    for role, count in report.role_blockers.items():
+        lines.append(f"- {role}: {count}")
 
     lines.extend(["", "## Opportunity Cost"])
     lines.append(f"- reviews: {int(report.opportunity['reviews'])}")

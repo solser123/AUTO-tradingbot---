@@ -5,6 +5,7 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
+from .c_level import role_owner_for_stage
 from .storage import StateStore
 
 
@@ -14,6 +15,7 @@ class OpsReport:
     lookback_days: int
     top_blockers: list[tuple[str, int]]
     top_stage_outcomes: list[tuple[str, str, int]]
+    role_outcomes: list[tuple[str, int]]
     engine_entries: list[tuple[str, int]]
     emergency_events: list[dict[str, str]]
     summary: dict[str, int]
@@ -24,6 +26,7 @@ def build_ops_report(store: StateStore, *, lookback_days: int = 7) -> OpsReport:
     blocker_counts: Counter[str] = Counter()
     stage_counts: Counter[tuple[str, str]] = Counter()
     engine_counts: Counter[str] = Counter()
+    role_counts: Counter[str] = Counter()
 
     with store._connect() as conn:
         decisions = conn.execute(
@@ -51,6 +54,12 @@ def build_ops_report(store: StateStore, *, lookback_days: int = 7) -> OpsReport:
         stage = str(row["stage"])
         outcome = str(row["outcome"])
         detail = str(row["detail"] or "")
+        try:
+            import json
+            payload = json.loads(str(row["payload_json"] or "{}"))
+        except Exception:
+            payload = {}
+        role_counts[role_owner_for_stage(stage, payload)] += 1
         stage_counts[(stage, outcome)] += 1
         if outcome == "rejected":
             blocker_counts[detail] += 1
@@ -69,6 +78,7 @@ def build_ops_report(store: StateStore, *, lookback_days: int = 7) -> OpsReport:
         lookback_days=lookback_days,
         top_blockers=blocker_counts.most_common(12),
         top_stage_outcomes=[(stage, outcome, count) for (stage, outcome), count in stage_counts.most_common(20)],
+        role_outcomes=role_counts.most_common(),
         engine_entries=engine_counts.most_common(),
         emergency_events=[dict(row) for row in emergency_rows],
         summary={
@@ -97,6 +107,9 @@ def render_ops_report(report: OpsReport) -> str:
     lines.extend(["", "## Top Stage Outcomes"])
     for stage, outcome, count in report.top_stage_outcomes:
         lines.append(f"- {stage}/{outcome}: {count}")
+    lines.extend(["", "## Role Outcomes"])
+    for role, count in report.role_outcomes:
+        lines.append(f"- {role}: {count}")
     lines.extend(["", "## Engine Entries"])
     if report.engine_entries:
         for engine_key, count in report.engine_entries:

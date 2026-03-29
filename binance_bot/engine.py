@@ -11,6 +11,14 @@ from zoneinfo import ZoneInfo
 
 from .ai_position_manager import AIPositionManager
 from .ai_validator import AIValidator
+from .c_level import (
+    AllocationDecision,
+    ExecutionReadiness,
+    RegimeState,
+    build_allocation_decision,
+    build_execution_readiness,
+    build_regime_state,
+)
 from .coinglass_client import CoinGlassClient
 from .config import BotConfig
 from .execution_router import ExecutionRouter
@@ -73,6 +81,7 @@ class TradingEngine:
             client=self.ai_validator.client if getattr(self.ai_validator, "enabled", False) else None,
         )
         self.strategy_orchestrator = StrategyEngineOrchestrator()
+        self._current_regime_state: RegimeState | None = None
 
     def _notify_event(self, title: str, *lines: str) -> None:
         self.notifier.send_lines(title, [line for line in lines if str(line).strip()])
@@ -192,6 +201,58 @@ class TradingEngine:
 
     def _signal_window_key(self, symbol: str) -> str:
         return f"signal_window:{self.config.mode}:{symbol}"
+
+    def _build_ceo_regime_state(
+        self,
+        *,
+        reference_time: datetime,
+        account_equity: float,
+        scan_symbols: list[str],
+    ) -> RegimeState:
+        previous_payload: dict[str, object] = {}
+        previous_raw = self.store.get_state("regime_state")
+        if previous_raw:
+            try:
+                previous_payload = json.loads(previous_raw)
+            except Exception:
+                previous_payload = {}
+        trade_metrics = self.store.get_trade_metrics(self.config.mode)
+        sector_flows = self.store.get_latest_sector_flows(limit=6)
+        open_positions = self.store.get_open_positions(self.config.mode)
+        hot_mover_count = sum(1 for symbol in scan_symbols if symbol in self._hot_mover_candidates)
+        regime_state = build_regime_state(
+            reference_time=reference_time.astimezone(timezone.utc),
+            trade_metrics=trade_metrics,
+            sector_flows=sector_flows,
+            open_positions=open_positions,
+            hot_mover_count=hot_mover_count,
+            max_open_positions=max(self.config.max_open_positions, 2),
+        )
+        self._current_regime_state = regime_state
+        self.store.set_state("regime_state", json.dumps(regime_state.as_payload(), ensure_ascii=False))
+        self.store.set_state("regime_state_at", reference_time.astimezone(timezone.utc).isoformat())
+        self.store.set_state("regime_equity_snapshot", f"{account_equity:.6f}")
+        previous_regime = str(previous_payload.get("regime", "") or "")
+        if previous_regime != regime_state.regime:
+            self.store.log_decision(
+                symbol="SYSTEM",
+                mode=self.config.mode,
+                stage="regime_state",
+                outcome="active",
+                detail=regime_state.reason,
+                payload={
+                    "previous_regime": previous_regime or "none",
+                    "regime_state": regime_state.as_payload(),
+                    "account_equity": account_equity,
+                    "scan_symbol_count": len(scan_symbols),
+                },
+            )
+        return regime_state
+
+    def _attach_regime_to_signal(self, signal: TradeSignal | None) -> None:
+        if signal is None or self._current_regime_state is None:
+            return
+        signal.strategy_data["regime_state"] = self._current_regime_state.as_payload()
 
     def _signal_signature(self, signal: TradeSignal) -> str:
         engine_family = str(signal.strategy_data.get("engine_family", "") or "unknown")
@@ -985,6 +1046,12 @@ class TradingEngine:
         self._sync_sector_flows(reference_time)
         self._sync_opportunity_reviews(reference_time)
         self._reconcile_live_positions()
+        scan_symbols = self._scan_symbols()
+        self._build_ceo_regime_state(
+            reference_time=reference_time,
+            account_equity=account_equity,
+            scan_symbols=scan_symbols,
+        )
         emergency_active, emergency_reason = self.store.is_emergency_stop()
         if emergency_active:
             logging.warning("Emergency stop active: %s", emergency_reason)
@@ -1003,7 +1070,7 @@ class TradingEngine:
                     )
             return
 
-        for symbol in self._scan_symbols():
+        for symbol in scan_symbols:
             try:
                 self._process_symbol(symbol, account_equity, reference_time)
             except Exception as exc:
@@ -1271,6 +1338,7 @@ class TradingEngine:
         self.strategy_orchestrator.annotate_signal(signal, engine_assessment)
         signal = self._stamp_signal_timing(symbol, signal, reference_time)
         signal.strategy_data["adaptive_ai_profile"] = self._adaptive_ai_profile(reference_time)
+        self._attach_regime_to_signal(signal)
 
         signal.strategy_data["multi_horizon"] = horizon_context
         if entry_ai_enabled and self.config.ai_scan_assist and ai_scan_review is None:
@@ -1431,6 +1499,8 @@ class TradingEngine:
             "risk_notional_cap": round(sizing.risk_notional_cap, 4),
             "stage_cap_notional": round(sizing.stage_cap_notional, 4),
             "components": sizing.components,
+            "reason": sizing.reason,
+            "owner": "CFO",
         }
         if not sizing.allowed:
             self.store.log_decision(
@@ -1535,6 +1605,45 @@ class TradingEngine:
         if exploratory_live:
             signal = self._mark_exploratory_signal(signal, review, ai_scan_review, sizing)
 
+        session_ok = True
+        session_override = False
+        if self.config.mode == "live":
+            session_ok = self.risk_manager._is_allowed_entry_time(reference_time)
+            session_override = self.risk_manager._is_entry_time_override(signal, exploratory_live)
+        execution_readiness = build_execution_readiness(
+            signal_age_seconds=signal_age_seconds,
+            freshness_limit_seconds=freshness_limit_seconds,
+            session_ok=session_ok,
+            session_override=session_override,
+            symbol_valid=True,
+            micro_rejection=micro_rejection,
+            micro_soft_pass=micro_soft_pass,
+        )
+        signal.strategy_data["execution_readiness"] = {
+            **execution_readiness.payload,
+            "ready": execution_readiness.ready,
+            "reason": execution_readiness.reason,
+            "owner": execution_readiness.owner,
+        }
+        if not execution_readiness.ready:
+            self.store.log_decision(
+                symbol=symbol,
+                mode=self.config.mode,
+                stage="execution_readiness",
+                outcome="rejected",
+                detail=execution_readiness.reason,
+                payload={"signal": signal.strategy_data, "execution_readiness": signal.strategy_data["execution_readiness"]},
+            )
+            return
+        self.store.log_decision(
+            symbol=symbol,
+            mode=self.config.mode,
+            stage="execution_readiness",
+            outcome="ready",
+            detail=execution_readiness.reason,
+            payload={"signal": signal.strategy_data, "execution_readiness": signal.strategy_data["execution_readiness"]},
+        )
+
         dynamic_hot_mover_cap = self._dynamic_hot_mover_cap(account_equity)
         signal.strategy_data["dynamic_hot_mover_cap"] = dynamic_hot_mover_cap
         if bool(signal.strategy_data.get("hot_mover_scout", False)) and self._open_hot_mover_count() >= dynamic_hot_mover_cap:
@@ -1560,23 +1669,23 @@ class TradingEngine:
                 payload={"signal": signal.strategy_data, "confidence": review.confidence, "committee": review.committee},
             )
             return
-        portfolio_allowed, portfolio_reason, portfolio_payload = self._passes_portfolio_gate(
+        allocation = self._passes_portfolio_gate(
             signal=signal,
             review=review,
             sizing=sizing,
         )
-        if not portfolio_allowed:
+        if not allocation.allowed:
             self.store.log_decision(
                 symbol=symbol,
                 mode=self.config.mode,
                 stage="portfolio_gate",
                 outcome="rejected",
-                detail=portfolio_reason,
+                detail=allocation.reason,
                 payload={
                     "signal": signal.strategy_data,
                     "confidence": review.confidence,
                     "committee": review.committee,
-                    "portfolio": portfolio_payload,
+                    "portfolio": allocation.payload,
                 },
             )
             return
@@ -1585,11 +1694,11 @@ class TradingEngine:
             mode=self.config.mode,
             stage="portfolio_gate",
             outcome="selected",
-            detail=portfolio_reason,
+            detail=allocation.reason,
             payload={
                 "signal": signal.strategy_data,
                 "confidence": review.confidence,
-                "portfolio": portfolio_payload,
+                "portfolio": allocation.payload,
             },
         )
 
@@ -2298,7 +2407,7 @@ class TradingEngine:
         signal: TradeSignal,
         review: AIReview,
         sizing: SizingDecision,
-    ) -> tuple[bool, str, dict[str, float | int | str | bool]]:
+    ) -> AllocationDecision:
         open_positions = self.store.get_open_positions(self.config.mode)
         score, components = self._portfolio_priority_score(
             signal=signal,
@@ -2316,17 +2425,50 @@ class TradingEngine:
             threshold = max(0.0, threshold - self.config.portfolio_priority_urgent_relief)
         if int(components.get("same_sector_positions", 0) or 0) >= 2 and not bool(components.get("urgent_signal", False)):
             threshold = min(1.0, threshold + 0.04)
+
+        regime_state = self._current_regime_state
+        engine_family = str(components.get("engine_family", "") or "").lower()
+        if regime_state is not None:
+            if regime_state.regime == "continuation_led":
+                if engine_family == "continuation":
+                    threshold = max(0.0, threshold - 0.04)
+                elif engine_family in {"reversal", "hot_mover", "scout"}:
+                    threshold = min(1.0, threshold + 0.03)
+            elif regime_state.regime == "reversal_led":
+                if engine_family == "reversal":
+                    threshold = max(0.0, threshold - 0.04)
+                elif engine_family == "continuation":
+                    threshold = min(1.0, threshold + 0.02)
+            elif regime_state.regime == "hot_mover_opportunistic":
+                if engine_family in {"hot_mover", "scout", "reversal"} or bool(components.get("urgent_signal", False)):
+                    threshold = max(0.0, threshold - 0.03)
+                elif engine_family == "continuation":
+                    threshold = min(1.0, threshold + 0.01)
+            elif regime_state.regime == "defensive":
+                threshold = min(1.0, threshold + (0.03 if engine_family == "continuation" else 0.06))
+
         payload = {
             **components,
             "score": round(score, 4),
             "threshold": round(threshold, 4),
             "open_positions": open_count,
             "dynamic_open_cap": dynamic_cap,
+            "regime": regime_state.regime if regime_state is not None else "unknown",
         }
-        signal.strategy_data["portfolio_priority"] = payload
-        if score >= threshold:
-            return True, f"Portfolio priority accepted: {score:.2f} >= {threshold:.2f}.", payload
-        return False, f"Portfolio priority too low: {score:.2f} < {threshold:.2f}.", payload
+        decision = build_allocation_decision(
+            score=score,
+            threshold=threshold,
+            components=payload,
+            regime_state=regime_state,
+        )
+        signal.strategy_data["portfolio_priority"] = decision.payload
+        signal.strategy_data["allocator_summary"] = {
+            **decision.payload,
+            "allowed": decision.allowed,
+            "reason": decision.reason,
+            "owner": decision.owner,
+        }
+        return decision
 
     def _position_unrealized_pnl(self, position: Position, current_price: float) -> float:
         if position.side == "long":
