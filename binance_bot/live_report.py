@@ -25,6 +25,8 @@ class LiveReport:
     stage_counts: dict[str, int]
     opportunity: dict[str, float | int]
     ai_efficiency: dict[str, float | int]
+    ai_management: dict[str, dict[str, float]]
+    allocator: dict[str, dict[str, float]]
     entry_timing: dict[str, float | int]
     weaknesses: list[str]
 
@@ -106,7 +108,16 @@ def build_live_report(store: StateStore, *, lookback_hours: int = 48) -> LiveRep
     stage_counts: Counter[str] = Counter()
     ai_efficiency_counts: Counter[str] = Counter()
     role_counts: Counter[str] = Counter()
+    ai_manage_outcomes: Counter[str] = Counter()
+    allocator_outcomes: Counter[str] = Counter()
+    allocator_engine_outcomes: dict[str, Counter[str]] = defaultdict(Counter)
+    allocator_rejections: Counter[str] = Counter()
+    ai_exit_buckets: dict[str, list[dict]] = defaultdict(list)
     entry_lags: list[float] = []
+    for row in closed:
+        exit_reason = str(row.get("exit_reason") or "")
+        if exit_reason.startswith("ai_") or exit_reason.startswith("rebalance_"):
+            ai_exit_buckets[exit_reason].append(row)
     for row in decisions:
         stage = str(row["stage"])
         stage_counts[stage] += 1
@@ -118,6 +129,20 @@ def build_live_report(store: StateStore, *, lookback_hours: int = 48) -> LiveRep
         role_counts[role_owner] += 1
         if stage.startswith("ai_") or stage in {"overflow_budget", "signal_freshness"}:
             ai_efficiency_counts[f"{stage}:{row['outcome']}"] += 1
+        if stage == "ai_position_manage":
+            ai_manage_outcomes[str(row["outcome"])] += 1
+        if stage == "portfolio_gate":
+            outcome = str(row["outcome"])
+            allocator_outcomes[outcome] += 1
+            signal_payload = payload.get("signal", {}) if isinstance(payload, dict) else {}
+            engine_family = str(
+                (signal_payload.get("engine_family") if isinstance(signal_payload, dict) else "")
+                or payload.get("engine_family")
+                or "unknown"
+            )
+            allocator_engine_outcomes[engine_family][outcome] += 1
+            if outcome == "rejected":
+                allocator_rejections[str(row["detail"] or "")] += 1
         if stage == "entry" and str(row["outcome"]) == "opened":
             try:
                 lag = float(payload.get("entry_lag_seconds", 0.0) or 0.0)
@@ -192,6 +217,48 @@ def build_live_report(store: StateStore, *, lookback_hours: int = 48) -> LiveRep
         "entries_opened": int(stage_counts.get("entry", 0)),
         "scan_events_per_entry": (ai_scan_calls / max(int(stage_counts.get("entry", 0)), 1)),
     }
+    ai_management = {
+        action: {
+            "events": float(ai_manage_outcomes.get(action, 0)),
+            "trades": float(len(rows)),
+            "realized_pnl": sum(float(item["realized_pnl"] or 0.0) for item in rows),
+            "avg_pnl": (
+                sum(float(item["realized_pnl"] or 0.0) for item in rows) / len(rows)
+                if rows
+                else 0.0
+            ),
+        }
+        for action, rows in sorted(
+            ai_exit_buckets.items(),
+            key=lambda item: sum(float(row["realized_pnl"] or 0.0) for row in item[1]),
+            reverse=True,
+        )
+    }
+    for action, count in ai_manage_outcomes.most_common():
+        ai_management.setdefault(
+            action,
+            {"events": float(count), "trades": 0.0, "realized_pnl": 0.0, "avg_pnl": 0.0},
+        )
+        ai_management[action]["events"] = float(count)
+    allocator = {
+        "summary": {
+            "selected": float(allocator_outcomes.get("selected", 0)),
+            "rejected": float(allocator_outcomes.get("rejected", 0)),
+            "selected_rate": (
+                allocator_outcomes.get("selected", 0)
+                / max(allocator_outcomes.get("selected", 0) + allocator_outcomes.get("rejected", 0), 1)
+                * 100
+            ),
+        },
+        "top_rejections": {detail: float(count) for detail, count in allocator_rejections.most_common(5)},
+    }
+    for engine_family, outcome_counter in allocator_engine_outcomes.items():
+        total = sum(outcome_counter.values())
+        allocator[f"engine:{engine_family}"] = {
+            "selected": float(outcome_counter.get("selected", 0)),
+            "rejected": float(outcome_counter.get("rejected", 0)),
+            "selected_rate": (outcome_counter.get("selected", 0) / max(total, 1) * 100),
+        }
     entry_timing = {
         "entries_with_lag": len(entry_lags),
         "avg_entry_lag_seconds": (sum(entry_lags) / len(entry_lags)) if entry_lags else 0.0,
@@ -212,6 +279,10 @@ def build_live_report(store: StateStore, *, lookback_hours: int = 48) -> LiveRep
         weaknesses.append("Missed opportunity cost remains materially larger than realized pnl.")
     if ai_efficiency["scan_events_per_entry"] > 15:
         weaknesses.append("AI is still being spent too heavily at the scan layer relative to actual entries.")
+    if ai_management.get("reduce_50", {}).get("realized_pnl", 0.0) < 0:
+        weaknesses.append("AI reduce_50 actions are currently destructive and need tighter moderation.")
+    if allocator["summary"]["selected_rate"] < 20:
+        weaknesses.append("CFO allocator is still selecting too few candidates relative to what it reviews.")
     if entry_timing["avg_entry_lag_seconds"] > 300:
         weaknesses.append("Average entry lag is still too slow for live execution quality.")
     if blocker_counts.get("Long rejected: higher timeframe bias is still too weak.", 0) > 10:
@@ -242,6 +313,8 @@ def build_live_report(store: StateStore, *, lookback_hours: int = 48) -> LiveRep
         stage_counts=dict(stage_counts.most_common(10)),
         opportunity=opportunity,
         ai_efficiency=ai_efficiency,
+        ai_management=ai_management,
+        allocator=allocator,
         entry_timing=entry_timing,
         weaknesses=weaknesses,
     )
@@ -315,6 +388,29 @@ def render_live_report(report: LiveReport) -> str:
     lines.append(f"- ai_review_budget_hits: {int(report.ai_efficiency['ai_review_budget_hits'])}")
     lines.append(f"- signal_freshness_rejections: {int(report.ai_efficiency['signal_freshness_rejections'])}")
     lines.append(f"- scan_events_per_entry: {float(report.ai_efficiency['scan_events_per_entry']):.2f}")
+
+    lines.extend(["", "## AI Management"])
+    for action, stats in report.ai_management.items():
+        lines.append(
+            f"- {action}: events={int(stats['events'])} trades={int(stats['trades'])} pnl={float(stats['realized_pnl']):.4f} avg={float(stats['avg_pnl']):.4f}"
+        )
+
+    lines.extend(["", "## Allocator"])
+    allocator_summary = report.allocator.get("summary", {})
+    lines.append(
+        f"- summary: selected={int(allocator_summary.get('selected', 0))} rejected={int(allocator_summary.get('rejected', 0))} selected_rate={float(allocator_summary.get('selected_rate', 0.0)):.2f}%"
+    )
+    for key, stats in report.allocator.items():
+        if key in {"summary", "top_rejections"}:
+            continue
+        lines.append(
+            f"- {key}: selected={int(stats['selected'])} rejected={int(stats['rejected'])} selected_rate={float(stats['selected_rate']):.2f}%"
+        )
+    top_rejections = report.allocator.get("top_rejections", {})
+    if top_rejections:
+        lines.append("- top_rejections:")
+        for detail, count in top_rejections.items():
+            lines.append(f"  - {detail}: {int(count)}")
 
     lines.extend(["", "## Entry Timing"])
     lines.append(f"- entries_with_lag: {int(report.entry_timing['entries_with_lag'])}")

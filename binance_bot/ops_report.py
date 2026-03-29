@@ -17,6 +17,8 @@ class OpsReport:
     top_stage_outcomes: list[tuple[str, str, int]]
     role_outcomes: list[tuple[str, int]]
     engine_entries: list[tuple[str, int]]
+    allocator_outcomes: list[tuple[str, int]]
+    allocator_by_engine: list[tuple[str, str, int]]
     emergency_events: list[dict[str, str]]
     summary: dict[str, int]
 
@@ -27,6 +29,8 @@ def build_ops_report(store: StateStore, *, lookback_days: int = 7) -> OpsReport:
     stage_counts: Counter[tuple[str, str]] = Counter()
     engine_counts: Counter[str] = Counter()
     role_counts: Counter[str] = Counter()
+    allocator_counts: Counter[str] = Counter()
+    allocator_engine_counts: Counter[tuple[str, str]] = Counter()
 
     with store._connect() as conn:
         decisions = conn.execute(
@@ -61,6 +65,15 @@ def build_ops_report(store: StateStore, *, lookback_days: int = 7) -> OpsReport:
             payload = {}
         role_counts[role_owner_for_stage(stage, payload)] += 1
         stage_counts[(stage, outcome)] += 1
+        if stage == "portfolio_gate":
+            allocator_counts[outcome] += 1
+            signal_payload = payload.get("signal", {}) if isinstance(payload, dict) else {}
+            engine_family = str(
+                (signal_payload.get("engine_family") if isinstance(signal_payload, dict) else "")
+                or payload.get("engine_family")
+                or "unknown"
+            )
+            allocator_engine_counts[(engine_family, outcome)] += 1
         if outcome == "rejected":
             blocker_counts[detail] += 1
         if stage == "entry" and outcome == "opened":
@@ -80,6 +93,8 @@ def build_ops_report(store: StateStore, *, lookback_days: int = 7) -> OpsReport:
         top_stage_outcomes=[(stage, outcome, count) for (stage, outcome), count in stage_counts.most_common(20)],
         role_outcomes=role_counts.most_common(),
         engine_entries=engine_counts.most_common(),
+        allocator_outcomes=allocator_counts.most_common(),
+        allocator_by_engine=[(engine, outcome, count) for (engine, outcome), count in allocator_engine_counts.most_common()],
         emergency_events=[dict(row) for row in emergency_rows],
         summary={
             "decision_rows": len(decisions),
@@ -110,6 +125,12 @@ def render_ops_report(report: OpsReport) -> str:
     lines.extend(["", "## Role Outcomes"])
     for role, count in report.role_outcomes:
         lines.append(f"- {role}: {count}")
+    lines.extend(["", "## Allocator Outcomes"])
+    for outcome, count in report.allocator_outcomes:
+        lines.append(f"- {outcome}: {count}")
+    lines.extend(["", "## Allocator By Engine"])
+    for engine, outcome, count in report.allocator_by_engine[:12]:
+        lines.append(f"- {engine}/{outcome}: {count}")
     lines.extend(["", "## Engine Entries"])
     if report.engine_entries:
         for engine_key, count in report.engine_entries:
