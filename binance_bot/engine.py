@@ -195,12 +195,14 @@ class TradingEngine:
 
     def _signal_signature(self, signal: TradeSignal) -> str:
         engine_family = str(signal.strategy_data.get("engine_family", "") or "unknown")
+        signal_bar_time = str(signal.strategy_data.get("signal_bar_time", "") or "")
         return "|".join(
             [
                 signal.side,
                 engine_family,
                 signal.setup_type,
                 signal.entry_profile,
+                signal_bar_time,
             ]
         )
 
@@ -216,6 +218,7 @@ class TradingEngine:
         signal_time = reference_time.astimezone(timezone.utc)
         key = self._signal_window_key(symbol)
         signature = self._signal_signature(signal)
+        freshness_limit_seconds = self._signal_freshness_limit_seconds(signal)
         first_seen = signal_time
         record = self.store.get_state(key)
         if record:
@@ -232,7 +235,21 @@ class TradingEngine:
                 if raw_first_seen:
                     try:
                         parsed = datetime.fromisoformat(str(raw_first_seen))
-                        first_seen = parsed if parsed.tzinfo is not None else parsed.replace(tzinfo=timezone.utc)
+                        parsed = parsed if parsed.tzinfo is not None else parsed.replace(tzinfo=timezone.utc)
+                        age_seconds = max((signal_time - parsed.astimezone(timezone.utc)).total_seconds(), 0.0)
+                        if age_seconds <= freshness_limit_seconds:
+                            first_seen = parsed
+                        else:
+                            self.store.set_state(
+                                key,
+                                json.dumps(
+                                    {
+                                        "signature": signature,
+                                        "first_seen_at": signal_time.isoformat(),
+                                    }
+                                ),
+                            )
+                            first_seen = signal_time
                     except ValueError:
                         first_seen = signal_time
             else:
@@ -806,9 +823,9 @@ class TradingEngine:
         }
 
     def _scan_symbols(self) -> list[str]:
-        configured_symbols = self.exchange.resolve_symbols(self.config.active_symbols())
+        configured_symbols = self.exchange.filter_known_symbols(self.config.active_symbols())
         managed_symbols = self.store.get_open_symbols(self.config.mode)
-        refreshed_hot_movers = self._refresh_hot_mover_candidates()
+        refreshed_hot_movers = self.exchange.filter_known_symbols(self._refresh_hot_mover_candidates())
         merged = configured_symbols[:]
         for symbol in managed_symbols:
             if symbol not in merged:
@@ -4118,7 +4135,7 @@ class TradingEngine:
         dynamic_recent = recent_listing_candidates(self.exchange, limit=10, lookback_days=180)
         dynamic_backtest = latest_universe_candidates(Path("logs"), limit=10, min_trades=2)
         merged_overflow = list(dict.fromkeys(self.config.overflow_symbols + dynamic_recent + dynamic_backtest))
-        overflow_symbols = [symbol for symbol in self.exchange.resolve_symbols(merged_overflow) if symbol not in active_set]
+        overflow_symbols = [symbol for symbol in self.exchange.filter_known_symbols(merged_overflow) if symbol not in active_set]
         if not overflow_symbols:
             return
 

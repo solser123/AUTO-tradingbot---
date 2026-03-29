@@ -28,6 +28,30 @@ class BinanceExchange:
         if self.config.is_futures:
             self._configure_futures_risk_profile()
 
+    def normalize_symbol(self, symbol: str) -> str | None:
+        cleaned = str(symbol or "").strip()
+        if not cleaned:
+            return None
+        if cleaned in self.client.markets:
+            return cleaned
+        if ":" not in cleaned and "/" in cleaned:
+            base, quote = cleaned.split("/", 1)
+            normalized = f"{base}/{quote}:{quote}"
+            if normalized in self.client.markets:
+                return normalized
+        return None
+
+    def is_known_symbol(self, symbol: str) -> bool:
+        return self.normalize_symbol(symbol) is not None
+
+    def filter_known_symbols(self, symbols: list[str]) -> list[str]:
+        filtered: list[str] = []
+        for symbol in symbols:
+            normalized = self.normalize_symbol(symbol)
+            if normalized and normalized not in filtered:
+                filtered.append(normalized)
+        return filtered
+
     def resolve_symbols(self, symbols: list[str]) -> list[str]:
         if not self.config.is_futures:
             return symbols
@@ -55,16 +79,9 @@ class BinanceExchange:
 
         resolved: list[str] = []
         for symbol in symbols:
-            if symbol in self.client.markets:
-                resolved.append(symbol)
-                continue
-            if ":" not in symbol and "/" in symbol:
-                base, quote = symbol.split("/", 1)
-                normalized = f"{base}/{quote}:{quote}"
-                if normalized in self.client.markets:
-                    resolved.append(normalized)
-                    continue
-            resolved.append(symbol)
+            normalized = self.normalize_symbol(symbol)
+            if normalized and normalized not in resolved:
+                resolved.append(normalized)
         return resolved
 
     def _configure_futures_risk_profile(self) -> None:

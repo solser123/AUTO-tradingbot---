@@ -74,7 +74,7 @@ class RiskManager:
                 return RiskDecision(False, "Live trading is restricted to configured stage symbols only.")
 
         if self.config.mode == "live" and not self._is_allowed_entry_time(reference_time):
-            if not self._is_exploratory_time_override(signal, exploratory):
+            if not self._is_entry_time_override(signal, exploratory):
                 return RiskDecision(False, "New entries are disabled outside the configured main session windows.")
 
         cooldown_deadline = self._cooldown_deadline(signal.symbol)
@@ -82,7 +82,8 @@ class RiskManager:
             return RiskDecision(False, "Symbol cooldown is active after a stop-loss.")
 
         stop_pct = abs(signal.entry_price - signal.stop_price) / signal.entry_price
-        if stop_pct > self.config.max_stop_pct:
+        max_stop_pct = self._max_stop_pct_for_signal(signal, exploratory)
+        if stop_pct > max_stop_pct:
             return RiskDecision(False, "Stop distance exceeds configured maximum.")
 
         trade_risk_pct = self._trade_risk_pct(signal, account_equity)
@@ -135,7 +136,10 @@ class RiskManager:
         if self._loss_pct_reached("daily", account_equity, reference_time):
             return RiskDecision(False, "Daily percentage loss limit reached.")
         if self._loss_pct_reached("weekly", account_equity, reference_time):
-            return RiskDecision(False, "Weekly percentage loss limit reached.")
+            if self._weekly_loss_relief_allowed(signal, exploratory, trade_risk_pct):
+                signal.strategy_data["weekly_loss_relief"] = True
+            else:
+                return RiskDecision(False, "Weekly percentage loss limit reached.")
         if self._hard_floor_breached(account_equity, reference_time):
             return RiskDecision(False, "Account equity floor was breached.")
 
@@ -159,6 +163,7 @@ class RiskManager:
         cap = base_cap
         open_risk = self._open_risk_pct(account_equity, self.config.mode)
         remaining_risk_budget = max(self.config.sizing_max_total_open_risk_pct - open_risk, 0.0)
+        effective_risk_budget = self._effective_position_risk_budget()
         engine_family = str(signal.strategy_data.get("engine_family", "") or "").lower()
         engine_key = str(signal.strategy_data.get("engine_key", "") or "").lower()
         urgent_signal = bool(signal.strategy_data.get("hot_mover_scout", False)) or engine_family in {"reversal", "scout"} or engine_key in {"reversal", "scout"}
@@ -167,11 +172,11 @@ class RiskManager:
             and review.approved
             and review.confidence >= max(self.config.min_ai_confidence_for_symbol(signal.symbol), 0.62)
         )
-        if remaining_risk_budget >= self.config.max_trade_risk_pct * 1.5:
+        if remaining_risk_budget >= effective_risk_budget * 1.5:
             cap += 1
-        if urgent_signal and remaining_risk_budget >= self.config.max_trade_risk_pct:
+        if urgent_signal and remaining_risk_budget >= effective_risk_budget:
             cap += 1
-        if strong_signal and remaining_risk_budget >= self.config.max_trade_risk_pct * 2.0:
+        if strong_signal and remaining_risk_budget >= effective_risk_budget * 2.0:
             cap += 1
         if self._open_sector_position_count(signal.symbol, self.config.mode) >= 2 and not urgent_signal:
             cap = max(base_cap, cap - 1)
@@ -268,14 +273,66 @@ class RiskManager:
                 return True
         return False
 
-    def _is_exploratory_time_override(self, signal: TradeSignal, exploratory: bool) -> bool:
+    def _entry_score(self, signal: TradeSignal) -> float:
+        return float(signal.strategy_data.get("entry_profile_score", 0.0) or 0.0)
+
+    def _effective_position_risk_budget(self) -> float:
+        base_cap = max(self.config.max_open_positions, 1)
+        slot_budget = (
+            self.config.sizing_max_total_open_risk_pct / base_cap
+            if self.config.sizing_max_total_open_risk_pct > 0
+            else self.config.max_trade_risk_pct
+        )
+        return min(self.config.max_trade_risk_pct, max(slot_budget, self.config.max_trade_risk_pct * 0.35))
+
+    def _max_stop_pct_for_signal(self, signal: TradeSignal, exploratory: bool) -> float:
+        score = self._entry_score(signal)
+        max_stop_pct = self.config.max_stop_pct
+        if exploratory or bool(signal.strategy_data.get("hot_mover_scout", False)):
+            max_stop_pct *= 1.20
+        elif score >= max(self.config.aggressive_entry_score + 0.06, 0.74):
+            max_stop_pct *= 1.12
+        return max_stop_pct
+
+    def _is_entry_time_override(self, signal: TradeSignal, exploratory: bool) -> bool:
         if not exploratory:
-            return False
+            score = self._entry_score(signal)
+            engine_family = str(signal.strategy_data.get("engine_family", "") or "").lower()
+            engine_key = str(signal.strategy_data.get("engine_key", "") or "").lower()
+            if bool(signal.strategy_data.get("hot_mover_scout", False)) and score >= max(self.config.balanced_entry_score, 0.54):
+                return True
+            if engine_family in {"reversal", "scout"} or engine_key in {"reversal", "scout"}:
+                return score >= max(self.config.balanced_entry_score + 0.04, 0.58)
+            return score >= max(self.config.aggressive_entry_score + 0.08, 0.76)
         if bool(signal.strategy_data.get("hot_mover_scout", False)):
             return True
         engine_family = str(signal.strategy_data.get("engine_family", "") or "").lower()
         engine_key = str(signal.strategy_data.get("engine_key", "") or "").lower()
         return engine_family in {"reversal", "scout"} or engine_key in {"reversal", "scout"}
+
+    def _weekly_loss_relief_allowed(
+        self,
+        signal: TradeSignal,
+        exploratory: bool,
+        trade_risk_pct: float,
+    ) -> bool:
+        score = self._entry_score(signal)
+        engine_family = str(signal.strategy_data.get("engine_family", "") or "").lower()
+        engine_key = str(signal.strategy_data.get("engine_key", "") or "").lower()
+        hot_mover = bool(signal.strategy_data.get("hot_mover_scout", False))
+        effective_risk_budget = self._effective_position_risk_budget()
+        reduced_risk = trade_risk_pct <= effective_risk_budget
+        conservative_risk = trade_risk_pct <= (effective_risk_budget * 0.80)
+        if exploratory and conservative_risk and score >= max(self.config.conservative_entry_score, 0.42):
+            return True
+        if hot_mover and reduced_risk and score >= max(self.config.balanced_entry_score, 0.54):
+            return True
+        if engine_family in {"reversal", "scout"} or engine_key in {"reversal", "scout"}:
+            if trade_risk_pct <= (effective_risk_budget * 0.90):
+                return score >= max(self.config.aggressive_entry_score - 0.02, 0.66)
+        if trade_risk_pct <= (effective_risk_budget * 0.75) and signal.rr >= max(self.config.min_rr, 1.6):
+            return score >= max(self.config.aggressive_entry_score + 0.02, 0.70)
+        return False
 
     def _parse_minutes(self, value: str) -> int:
         hour, minute = value.split(":", 1)
