@@ -9,7 +9,7 @@ def assess_hot_mover(signal, hot_mover_candidate) -> EngineAssessment | None:
     confidence_hint = min(0.92, 0.55 + min(abs(float(hot_mover_candidate.pct_change_24h or 0.0)) / 100.0, 1.5) * 0.18)
     return EngineAssessment(
         engine_key="hot_mover",
-        engine_family="scout",
+        engine_family="hot_mover",
         priority=95,
         confidence_hint=confidence_hint,
         exploratory_preferred=True,

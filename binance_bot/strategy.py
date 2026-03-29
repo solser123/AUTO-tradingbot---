@@ -6,6 +6,8 @@ import pandas as pd
 
 from .config import BotConfig
 from .models import MarketScan, Position, TradeSignal
+from .strategy_engines.continuation import build_continuation_signal
+from .strategy_engines.reversal import build_reversal_signal
 
 
 def _ema(series: pd.Series, span: int) -> pd.Series:
@@ -602,110 +604,6 @@ def scan_market(
             or eql_sweep
         )
     )
-    if not higher_long_bias:
-        reasons.append("Long rejected: higher timeframe bias is still too weak.")
-    if not near_vwap_long:
-        reasons.append("Long rejected: price is too far below VWAP.")
-    if not long_rsi_ok:
-        reasons.append("Long rejected: RSI is outside the long trend zone.")
-    if not long_stoch_ok:
-        reasons.append("Long rejected: stochastic is not aligned for a profitable long entry.")
-    if config.require_signal_candle_confirmation and not candle_is_bullish:
-        reasons.append("Long rejected: signal candle does not confirm bullish continuation.")
-    if not long_setup_ready:
-        reasons.append("Long rejected: no recovery, continuation, or breakout confirmation.")
-    if not long_resume_confirmed:
-        reasons.append("Long rejected: resume candle confirmation is still weak.")
-    if not long_impulse_confirmed:
-        reasons.append("Long rejected: individual momentum is not strong enough yet.")
-    if not long_resistance_room_ok:
-        reasons.append("Long rejected: nearby resistance is too close for a clean reward path.")
-    if squeeze_on and not long_setup_ready:
-        reasons.append("Long rejected: volatility is still compressed without a clean release.")
-    if higher_long_bias and near_vwap_long and long_rsi_ok:
-        if long_setup_ready:
-            if not long_stoch_ok and not long_transition_ready:
-                return MarketScan(symbol=symbol, signal=None, reasons=reasons, metrics=metrics)
-            if config.require_signal_candle_confirmation and not candle_is_bullish and not long_transition_ready:
-                return MarketScan(symbol=symbol, signal=None, reasons=reasons, metrics=metrics)
-            if (
-                (
-                    not (long_resume_confirmed or early_reversal_long or smc_reversal_long)
-                    or not (long_impulse_confirmed or early_reversal_long or squeeze_long_bias)
-                    or not long_resistance_room_ok
-                )
-                and not long_transition_ready
-            ):
-                return MarketScan(symbol=symbol, signal=None, reasons=reasons, metrics=metrics)
-            entry = float(current["close"])
-            swing_stop = float(low_df["low"].tail(5).min())
-            stop = min(swing_stop, entry - atr_value * config.atr_stop_multiplier) if atr_value > 0 else swing_stop
-            risk = entry - stop
-            if risk > 0 and (risk / entry) <= config.max_stop_pct:
-                target = entry + (risk * config.min_rr)
-                base_score = 0.0
-                base_score += 0.20 if bullish_trend else 0.12 if early_reversal_long else 0.08 if higher_long_bias else 0.0
-                base_score += 0.10 if float(current["close"]) >= float(current["vwap"]) else 0.06 if near_vwap_long else 0.0
-                base_score += min(
-                    max((float(current["rsi_14"]) - max(config.long_rsi_min - 6, 42)) / max(config.long_rsi_max - config.long_rsi_min + 6, 1.0), 0.0),
-                    1.0,
-                ) * 0.15
-                base_score += min(max(volume_ratio / max(config.min_volume_ratio, 0.1), 0.0), 2.0) / 2.0 * 0.20
-                base_score += 0.15 if long_stoch_aligned else 0.08 if long_stoch_ok else 0.0
-                base_score += 0.10 if candle_is_bullish else 0.0
-                base_score += 0.10 if breakout_long or pullback_recovery_long or continuation_long or trend_reclaim_long or vwap_reclaim_long or smc_reversal_long else 0.0
-                base_score += 0.08 if long_resume_confirmed else 0.0
-                base_score += 0.07 if long_impulse_confirmed else 0.0
-                base_score += 0.05 if long_resistance_room_ok else 0.0
-                base_score += 0.08 if bullish_bos else 0.05 if bullish_choch else 0.0
-                base_score += 0.06 if eql_sweep else 0.0
-                base_score += 0.05 if recent_bullish_fvg else 0.0
-                base_score += 0.05 if squeeze_long_bias else 0.0
-                base_score += 0.04 if session_vwap_reclaim_long else 0.0
-                if session_vwap_zscore <= -2.0 and candle_is_bullish:
-                    base_score += 0.04
-                if long_transition_ready and long_confirmation_score <= 2:
-                    base_score = min(base_score, 0.58)
-                    entry_profile = "exploratory"
-                else:
-                    entry_profile = classify_entry_profile(base_score)
-                if early_reversal_long and not bullish_trend:
-                    setup_type = "early_reversal"
-                elif continuation_long:
-                    setup_type = "continuation"
-                elif smc_reversal_long:
-                    setup_type = "smc_reversal"
-                else:
-                    setup_type = "pullback_recovery" if pullback_recovery_long else "breakout_confirmation"
-                signal = TradeSignal(
-                    symbol=symbol,
-                    side="long",
-                    entry_price=entry,
-                    stop_price=stop,
-                    target_price=target,
-                    rr=config.min_rr,
-                    setup_type=setup_type,
-                    entry_profile=entry_profile,
-                    reason="Bullish trend alignment with VWAP support and momentum confirmation.",
-                    strategy_data={
-                        **metrics,
-                        "higher_trend": "bullish" if higher_long_bias else "neutral",
-                        "entry_profile_score": round(base_score, 4),
-                        "entry_profile": entry_profile,
-                        "resume_confirmed": long_resume_confirmed,
-                        "impulse_confirmed": long_impulse_confirmed,
-                        "smc_reversal_long": smc_reversal_long,
-                        "session_vwap_zscore": round(session_vwap_zscore, 2),
-                        "squeeze_long_bias": squeeze_long_bias,
-                        "resistance_room_pct": round(resistance_room_pct * 100, 2),
-                        "confirmation_score": long_confirmation_score,
-                        "transition_ready": long_transition_ready,
-                        "signal_bar_time": signal_bar_time,
-                    },
-                )
-                return MarketScan(symbol=symbol, signal=signal, reasons=["Long setup found."], metrics=metrics)
-            reasons.append("Long rejected: stop distance is too wide for configured risk.")
-
     pullback_recovery_short = (
         previous["high"] >= previous["ema_20"] * (1 - (config.pullback_tolerance * 2.5))
         and current["close"] < current["ema_20"] * 1.004
@@ -836,115 +734,214 @@ def scan_market(
             or eqh_sweep
         )
     )
+    long_continuation_ready = (
+        pullback_recovery_long
+        or breakout_long
+        or continuation_long
+        or trend_reclaim_long
+        or vwap_reclaim_long
+        or bollinger_reclaim_long
+    )
+    short_continuation_ready = (
+        pullback_recovery_short
+        or breakdown_short
+        or continuation_short
+        or trend_reclaim_short
+        or vwap_reject_short
+        or bollinger_reject_short
+    )
+    long_reversal_trigger = (
+        early_reversal_long
+        or smc_reversal_long
+        or bullish_choch
+        or eql_sweep
+        or recent_bullish_fvg
+        or session_vwap_reclaim_long
+        or squeeze_long_bias
+    )
+    short_reversal_trigger = (
+        early_reversal_short
+        or smc_reversal_short
+        or bearish_choch
+        or eqh_sweep
+        or recent_bearish_fvg
+        or session_vwap_reject_short
+        or squeeze_short_bias
+    )
+    long_reversal_rsi_ok = early_reversal_long or (
+        long_reversal_trigger and 38 <= float(current["rsi_14"]) <= 84
+    )
+    short_reversal_rsi_ok = early_reversal_short or (
+        short_reversal_trigger and 24 <= float(current["rsi_14"]) <= 78
+    )
+    long_reversal_stoch_ok = long_stoch_ok or macd_bullish or squeeze_long_bias or session_vwap_reclaim_long or bullish_choch
+    short_reversal_stoch_ok = short_stoch_ok or macd_bearish or squeeze_short_bias or session_vwap_reject_short or bearish_choch
+    long_reversal_room_ok = (
+        long_resistance_room_ok
+        or resistance_room_pct >= max(estimated_long_risk_pct * 0.25, 0.0010)
+        or session_vwap_reclaim_long
+        or bullish_choch
+        or recent_bullish_fvg
+    )
+    short_reversal_room_ok = (
+        short_support_room_ok
+        or support_room_pct >= max(estimated_short_risk_pct * 0.35, 0.0012)
+        or session_vwap_reject_short
+        or bearish_choch
+        or recent_bearish_fvg
+    )
 
-    if config.allow_short and higher_short_bias and near_vwap_short and short_rsi_ok:
-        if not short_stoch_ok:
-            reasons.append("Short rejected: stochastic is not aligned for a profitable short entry.")
-        if config.require_signal_candle_confirmation and not candle_is_bearish:
-            reasons.append("Short rejected: signal candle does not confirm bearish continuation.")
-        if not short_resume_confirmed:
-            reasons.append("Short rejected: resume candle confirmation is still weak.")
-        if not short_impulse_confirmed:
-            reasons.append("Short rejected: individual momentum is not strong enough yet.")
-        if not short_support_room_ok:
-            reasons.append("Short rejected: nearby support is too close for a clean reward path.")
-        if squeeze_on and not short_setup_ready:
-            reasons.append("Short rejected: volatility is still compressed without a clean release.")
-        if short_setup_ready:
-            if not short_stoch_ok and not short_transition_ready:
-                return MarketScan(symbol=symbol, signal=None, reasons=reasons, metrics=metrics)
-            if config.require_signal_candle_confirmation and not candle_is_bearish and not short_transition_ready:
-                return MarketScan(symbol=symbol, signal=None, reasons=reasons, metrics=metrics)
-            if (
-                (
-                    not (short_resume_confirmed or early_reversal_short or smc_reversal_short)
-                    or not (short_impulse_confirmed or early_reversal_short or squeeze_short_bias)
-                )
-                and not short_transition_ready
-            ):
-                return MarketScan(symbol=symbol, signal=None, reasons=reasons, metrics=metrics)
-            if not short_support_room_ok and not short_transition_ready:
-                return MarketScan(symbol=symbol, signal=None, reasons=reasons, metrics=metrics)
-            entry = float(current["close"])
-            swing_stop = float(low_df["high"].tail(5).max())
-            stop = max(swing_stop, entry + atr_value * config.atr_stop_multiplier) if atr_value > 0 else swing_stop
-            risk = stop - entry
-            if risk > 0 and (risk / entry) <= config.max_stop_pct:
-                target = entry - (risk * config.min_rr)
-                base_score = 0.0
-                base_score += 0.20 if bearish_trend else 0.12 if early_reversal_short else 0.08 if higher_short_bias else 0.0
-                base_score += 0.10 if float(current["close"]) <= float(current["vwap"]) else 0.06 if near_vwap_short else 0.0
-                if early_reversal_short:
-                    base_score += 0.10
-                else:
-                    base_score += min(
-                        max((min(config.short_rsi_max + 8, 76) - float(current["rsi_14"])) / max(config.short_rsi_max - config.short_rsi_min + 8, 1.0), 0.0),
-                        1.0,
-                    ) * 0.15
-                base_score += min(max(volume_ratio / max(config.min_volume_ratio, 0.1), 0.0), 2.0) / 2.0 * 0.20
-                base_score += 0.15 if short_stoch_aligned else 0.08 if short_stoch_ok else 0.0
-                base_score += 0.10 if candle_is_bearish else 0.0
-                base_score += 0.10 if breakdown_short or pullback_recovery_short or continuation_short or trend_reclaim_short or vwap_reject_short or smc_reversal_short else 0.0
-                base_score += 0.08 if short_resume_confirmed else 0.0
-                base_score += 0.07 if short_impulse_confirmed else 0.0
-                base_score += 0.05 if (breakdown_short or support_room_pct >= max(estimated_short_risk_pct * 0.55, 0.0022)) else 0.0
-                base_score += 0.08 if bearish_bos else 0.05 if bearish_choch else 0.0
-                base_score += 0.06 if eqh_sweep else 0.0
-                base_score += 0.05 if recent_bearish_fvg else 0.0
-                base_score += 0.05 if squeeze_short_bias else 0.0
-                base_score += 0.04 if session_vwap_reject_short else 0.0
-                if session_vwap_zscore >= 2.0 and candle_is_bearish:
-                    base_score += 0.04
-                if short_transition_ready and short_confirmation_score <= 2:
-                    base_score = min(base_score, 0.58)
-                    entry_profile = "exploratory"
-                else:
-                    entry_profile = classify_entry_profile(base_score)
-                if early_reversal_short and not bearish_trend:
-                    setup_type = "early_reversal"
-                elif continuation_short:
-                    setup_type = "continuation"
-                elif smc_reversal_short:
-                    setup_type = "smc_reversal"
-                else:
-                    setup_type = "pullback_recovery" if pullback_recovery_short else "breakdown_confirmation"
-                signal = TradeSignal(
+    metrics.update(
+        {
+            "long_confirmation_score": int(long_confirmation_score),
+            "short_confirmation_score": int(short_confirmation_score),
+            "long_transition_ready": long_transition_ready,
+            "short_transition_ready": short_transition_ready,
+            "long_continuation_ready": long_continuation_ready,
+            "short_continuation_ready": short_continuation_ready,
+            "long_reversal_trigger": long_reversal_trigger,
+            "short_reversal_trigger": short_reversal_trigger,
+        }
+    )
+
+    ctx: dict[str, object] = {
+        "close_now": close_now,
+        "atr_value": atr_value,
+        "volume_ratio": float(volume_ratio),
+        "body_to_atr": body_to_atr,
+        "session_vwap_zscore": session_vwap_zscore,
+        "long_trend": bullish_trend,
+        "short_trend": bearish_trend,
+        "long_higher_bias": higher_long_bias,
+        "short_higher_bias": higher_short_bias,
+        "long_near_vwap": near_vwap_long,
+        "short_near_vwap": near_vwap_short,
+        "long_rsi_ok": long_rsi_ok,
+        "short_rsi_ok": short_rsi_ok,
+        "long_reversal_rsi_ok": long_reversal_rsi_ok,
+        "short_reversal_rsi_ok": short_reversal_rsi_ok,
+        "long_stoch_ok": long_stoch_ok,
+        "short_stoch_ok": short_stoch_ok,
+        "long_stoch_aligned": long_stoch_aligned,
+        "short_stoch_aligned": short_stoch_aligned,
+        "long_reversal_stoch_ok": long_reversal_stoch_ok,
+        "short_reversal_stoch_ok": short_reversal_stoch_ok,
+        "long_candle_ok": candle_is_bullish,
+        "short_candle_ok": candle_is_bearish,
+        "long_resume_confirmed": long_resume_confirmed,
+        "short_resume_confirmed": short_resume_confirmed,
+        "long_impulse_confirmed": long_impulse_confirmed,
+        "short_impulse_confirmed": short_impulse_confirmed,
+        "long_room_ok": long_resistance_room_ok,
+        "short_room_ok": short_support_room_ok,
+        "long_reversal_room_ok": long_reversal_room_ok,
+        "short_reversal_room_ok": short_reversal_room_ok,
+        "long_pullback": pullback_recovery_long,
+        "short_pullback": pullback_recovery_short,
+        "long_breakout": breakout_long,
+        "short_breakout": breakdown_short,
+        "long_continuation": continuation_long,
+        "short_continuation": continuation_short,
+        "long_trend_reclaim": trend_reclaim_long,
+        "short_trend_reclaim": trend_reclaim_short,
+        "long_vwap_reclaim": vwap_reclaim_long,
+        "short_vwap_reclaim": vwap_reject_short,
+        "long_bollinger_reclaim": bollinger_reclaim_long,
+        "short_bollinger_reclaim": bollinger_reject_short,
+        "long_continuation_ready": long_continuation_ready,
+        "short_continuation_ready": short_continuation_ready,
+        "long_reversal_trigger": long_reversal_trigger,
+        "short_reversal_trigger": short_reversal_trigger,
+        "long_bos": bullish_bos,
+        "short_bos": bearish_bos,
+        "long_choch": bullish_choch,
+        "short_choch": bearish_choch,
+        "long_sweep": eql_sweep,
+        "short_sweep": eqh_sweep,
+        "long_recent_fvg": recent_bullish_fvg,
+        "short_recent_fvg": recent_bearish_fvg,
+        "long_smc_reversal": smc_reversal_long,
+        "short_smc_reversal": smc_reversal_short,
+        "long_early_reversal": early_reversal_long,
+        "short_early_reversal": early_reversal_short,
+        "long_session_reclaim": session_vwap_reclaim_long,
+        "short_session_reclaim": session_vwap_reject_short,
+        "long_squeeze_bias": squeeze_long_bias,
+        "short_squeeze_bias": squeeze_short_bias,
+        "long_macd": macd_bullish,
+        "short_macd": macd_bearish,
+        "long_confirmation_score": int(long_confirmation_score),
+        "short_confirmation_score": int(short_confirmation_score),
+        "long_transition_ready": long_transition_ready,
+        "short_transition_ready": short_transition_ready,
+        "long_stop": estimated_long_stop,
+        "short_stop": estimated_short_stop,
+        "long_room_pct": resistance_room_pct,
+        "short_room_pct": support_room_pct,
+        "long_estimated_risk_pct": estimated_long_risk_pct,
+        "short_estimated_risk_pct": estimated_short_risk_pct,
+    }
+
+    decisions = [
+        build_continuation_signal(
+            symbol=symbol,
+            side="long",
+            ctx=ctx,
+            metrics=metrics,
+            config=config,
+            signal_bar_time=signal_bar_time,
+        ),
+        build_reversal_signal(
+            symbol=symbol,
+            side="long",
+            ctx=ctx,
+            metrics=metrics,
+            config=config,
+            signal_bar_time=signal_bar_time,
+        ),
+    ]
+    if config.allow_short:
+        decisions.extend(
+            [
+                build_continuation_signal(
                     symbol=symbol,
                     side="short",
-                    entry_price=entry,
-                    stop_price=stop,
-                    target_price=target,
-                    rr=config.min_rr,
-                    setup_type=setup_type,
-                    entry_profile=entry_profile,
-                    reason="Bearish trend alignment with VWAP resistance and momentum confirmation.",
-                    strategy_data={
-                        **metrics,
-                        "higher_trend": "bearish" if higher_short_bias else "neutral",
-                        "entry_profile_score": round(base_score, 4),
-                        "entry_profile": entry_profile,
-                        "resume_confirmed": short_resume_confirmed,
-                        "impulse_confirmed": short_impulse_confirmed,
-                        "smc_reversal_short": smc_reversal_short,
-                        "session_vwap_zscore": round(session_vwap_zscore, 2),
-                        "squeeze_short_bias": squeeze_short_bias,
-                        "support_room_pct": round(support_room_pct * 100, 2),
-                        "confirmation_score": short_confirmation_score,
-                        "transition_ready": short_transition_ready,
-                        "signal_bar_time": signal_bar_time,
-                    },
-                )
-                return MarketScan(symbol=symbol, signal=signal, reasons=["Short setup found."], metrics=metrics)
-            reasons.append("Short rejected: stop distance is too wide for configured risk.")
-    elif config.allow_short:
-        if not higher_short_bias:
-            reasons.append("Short rejected: higher timeframe bias is still too strong for a short.")
-        if not near_vwap_short:
-            reasons.append("Short rejected: price is too far above VWAP for a clean short.")
-        if not short_rsi_ok:
-            reasons.append("Short rejected: RSI is outside the short trend zone.")
-        if not short_setup_ready:
-            reasons.append("Short rejected: no recovery, continuation, or breakdown confirmation.")
+                    ctx=ctx,
+                    metrics=metrics,
+                    config=config,
+                    signal_bar_time=signal_bar_time,
+                ),
+                build_reversal_signal(
+                    symbol=symbol,
+                    side="short",
+                    ctx=ctx,
+                    metrics=metrics,
+                    config=config,
+                    signal_bar_time=signal_bar_time,
+                ),
+            ]
+        )
+
+    candidate_decisions = [decision for decision in decisions if decision.signal is not None]
+    if candidate_decisions:
+        chosen = max(candidate_decisions, key=lambda item: (item.score, item.priority))
+        return MarketScan(
+            symbol=symbol,
+            signal=chosen.signal,
+            reasons=[f"{chosen.engine_family.title()} setup found."],
+            metrics=metrics,
+        )
+
+    seen: set[str] = set()
+    for decision in decisions:
+        for detail in decision.reasons:
+            normalized = " ".join(str(detail).split())
+            if not normalized or normalized in seen:
+                continue
+            seen.add(normalized)
+            reasons.append(normalized)
+    if not reasons:
+        reasons.append("No engine-specific technical setup matched.")
 
     return MarketScan(symbol=symbol, signal=None, reasons=reasons, metrics=metrics)
 
