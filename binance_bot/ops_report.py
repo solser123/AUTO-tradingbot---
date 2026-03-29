@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from collections import Counter
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
@@ -59,7 +60,6 @@ def build_ops_report(store: StateStore, *, lookback_days: int = 7) -> OpsReport:
         outcome = str(row["outcome"])
         detail = str(row["detail"] or "")
         try:
-            import json
             payload = json.loads(str(row["payload_json"] or "{}"))
         except Exception:
             payload = {}
