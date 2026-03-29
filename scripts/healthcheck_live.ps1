@@ -84,5 +84,5 @@ if ($result.log_path -and (Test-Path $result.log_path)) {
 
 $heartbeatHealthy = ($null -ne $result.heartbeat_age_seconds -and $result.heartbeat_age_seconds -le $heartbeatMaxAgeSeconds)
 $logHealthy = ($null -ne $result.log_age_seconds -and $result.log_age_seconds -le $logFreshSeconds)
-$result.healthy = ($result.runtime_alive -and ($result.emergency_stop -ne "1") -and ($heartbeatHealthy -or $logHealthy))
+$result.healthy = (($result.runtime_alive -or $result.wrapper_alive) -and ($result.emergency_stop -ne "1") -and ($heartbeatHealthy -or $logHealthy))
 $result | ConvertTo-Json -Depth 3

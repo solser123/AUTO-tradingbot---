@@ -53,6 +53,17 @@ $process = Start-Process `
     -RedirectStandardError $errPath `
     -PassThru
 
+$initialState = [ordered]@{
+    pid = $process.Id
+    wrapper_pid = $process.Id
+    runtime_pid = $null
+    started_at = (Get-Date).ToString("o")
+    root = $root
+    log = $logPath
+    err = $errPath
+}
+$initialState | ConvertTo-Json | Set-Content -Path $statePath -Encoding UTF8
+
 $runtimePid = $null
 for ($i = 0; $i -lt 20; $i++) {
     Start-Sleep -Seconds 1

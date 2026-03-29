@@ -19,6 +19,7 @@ $state = [ordered]@{
 $state | ConvertTo-Json | Set-Content -Path $statePath -Encoding UTF8
 
 while ($true) {
+    Start-Sleep -Seconds $intervalSeconds
     try {
         & $restartScript | Out-Null
         $state = [ordered]@{
@@ -31,5 +32,4 @@ while ($true) {
         $state | ConvertTo-Json | Set-Content -Path $statePath -Encoding UTF8
     } catch {
     }
-    Start-Sleep -Seconds $intervalSeconds
 }
